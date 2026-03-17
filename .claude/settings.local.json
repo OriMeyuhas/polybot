@@ -1,0 +1,33 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip show:*)",
+      "WebSearch",
+      "Bash(find C:UserspcAppDataLocalPython -name *clob* -o -name *polymarket*)",
+      "Bash(python -m pip list)",
+      "WebFetch(domain:docs.polymarket.com)",
+      "WebFetch(domain:gamma-api.polymarket.com)",
+      "Bash(curl -s \"https://data-api.polymarket.com/activity?address=0x63ce342161250d705dc0b16df89036c8e5f9ba9a&limit=3\")",
+      "Bash(python -m json.tool)",
+      "Bash(curl -s \"https://data-api.polymarket.com/trades?maker_address=0x63ce342161250d705dc0b16df89036c8e5f9ba9a&limit=3\")",
+      "Bash(curl -s \"https://data-api.polymarket.com/activity?user=0x63ce342161250d705dc0b16df89036c8e5f9ba9a&limit=3\")",
+      "Bash(curl -s \"https://data-api.polymarket.com/trades?maker_address=0x63ce342161250d705dc0b16df89036c8e5f9ba9a&limit=5\")",
+      "Bash(python -c \":*)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(find C:/Users/pc/Desktop/PolyBot/ -name *.md -maxdepth 3)",
+      "Bash(curl -s \"https://raw.githubusercontent.com/Polymarket/agent-skills/main/SKILL.md\")",
+      "Bash(curl -s \"https://raw.githubusercontent.com/Polymarket/agent-skills/main/order-patterns.md\")",
+      "Bash(curl -s \"https://api.github.com/repos/Polymarket/agents/git/trees/main?recursive=1\")",
+      "Bash(curl -s \"https://raw.githubusercontent.com/Polymarket/agents/main/agents/polymarket/gamma.py\")",
+      "Bash(curl -s \"https://raw.githubusercontent.com/Polymarket/agents/main/agents/utils/objects.py\")",
+      "Bash(npm --version)",
+      "Bash(npm install:*)",
+      "mcp__plugin_context7_context7__resolve-library-id",
+      "mcp__plugin_context7_context7__query-docs",
+      "Bash(git init:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)"
+    ]
+  }
+}

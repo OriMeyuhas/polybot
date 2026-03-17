@@ -1,0 +1,6 @@
+.env
+__pycache__/
+*.pyc
+data/tracker/*.csv
+data/trades/*.csv
+.venv/
