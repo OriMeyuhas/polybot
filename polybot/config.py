@@ -70,6 +70,9 @@ class BotConfig:
     # Logging
     log_level: str = "INFO"
 
+    # Safety
+    dry_run: bool = True  # Default to dry run — must explicitly disable
+
 
 def load_bot_config() -> BotConfig:
     load_dotenv()
@@ -97,6 +100,7 @@ def load_bot_config() -> BotConfig:
         max_book_depth_take_pct=float(os.getenv("MAX_BOOK_DEPTH_TAKE_PCT", "0.50")),
         poll_interval_ms=int(os.getenv("BOT_POLL_INTERVAL_MS", "500")),
         log_level=os.getenv("LOG_LEVEL", "INFO"),
+        dry_run=os.getenv("DRY_RUN", "true").lower() in ("true", "1", "yes"),
     )
 
 

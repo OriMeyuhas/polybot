@@ -38,6 +38,14 @@ class OrderExecutor:
             size=size,
             timestamp=time.time(),
         )
+        if self.cfg.dry_run:
+            logger.info(
+                "DRY RUN: would buy %s %.2f x %.1f on %s",
+                side.value, price, size, market_id,
+            )
+            record.order_id = f"dry-{int(time.time())}"
+            record.status = "dry_run"
+            return record
         try:
             order_args = OrderArgs(
                 token_id=token_id,

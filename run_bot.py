@@ -58,6 +58,17 @@ def main():
         print(f"Could not fetch balance ({e}), using default $1000")
         bankroll = 1000.0
 
+    if not cfg.dry_run:
+        print("\n!!  LIVE TRADING MODE — real orders will be placed!")
+        print(f"   Bankroll: ${bankroll:,.2f}")
+        print(f"   Max position size: ${bankroll * cfg.position_size_fraction:,.2f}")
+        confirm = input("   Type 'CONFIRM' to proceed: ")
+        if confirm != "CONFIRM":
+            print("Aborted.")
+            sys.exit(0)
+    else:
+        print("Running in DRY RUN mode — no real orders will be placed.")
+
     bot = Bot(cfg, clob_client=clob_client, initial_bankroll=bankroll)
 
     try:

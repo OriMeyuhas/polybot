@@ -12,6 +12,7 @@ def cfg():
         api_key="key",
         api_secret="secret",
         api_passphrase="pass",
+        dry_run=False,
     )
 
 
