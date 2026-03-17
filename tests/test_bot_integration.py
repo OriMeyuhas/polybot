@@ -136,6 +136,47 @@ class TestWindowOpenPriceSnapshot:
         assert bot.window_open_prices["BTC"] == 84500.0
 
 
+class TestEarlyExitIntegration:
+    def test_early_exit_books_profit(self, cfg, market):
+        mock_clob = MagicMock()
+
+        # UP price appreciated: ask was 0.40, now 0.65
+        book_up = MagicMock(
+            bids=[MagicMock(price="0.63", size="1000")],
+            asks=[MagicMock(price="0.65", size="1000")],
+        )
+        book_dn = MagicMock(
+            bids=[MagicMock(price="0.33", size="1000")],
+            asks=[MagicMock(price="0.35", size="1000")],
+        )
+        mock_clob.get_order_book.side_effect = lambda tid: (
+            book_up if tid == "tok_up" else book_dn
+        )
+
+        bot = Bot(cfg, clob_client=mock_clob, initial_bankroll=10_000.0)
+        bot.spot_prices["BTC"] = 85000.0
+        bot.window_open_prices["BTC"] = 85000.0
+
+        # Simulate existing spread position bought at 0.40 UP + 0.45 DN
+        bot.position_manager.update_position(
+            market.market_id, Side.UP, qty=100.0, cost=40.0,
+        )
+        bot.position_manager.update_position(
+            market.market_id, Side.DOWN, qty=100.0, cost=45.0,
+        )
+
+        actions = bot.evaluate_market(market, now_epoch=1200)
+        assert len(actions) == 1
+        assert actions[0]["type"] == "early_exit"
+        assert actions[0]["exit_side"] == Side.UP
+        # PnL = 100 * 0.65 - 40 = 25
+        assert actions[0]["pnl"] == pytest.approx(25.0)
+        # Position should be removed
+        assert market.market_id not in bot.position_manager.positions
+        # Bankroll should be updated
+        assert bot.position_manager.bankroll == pytest.approx(10_025.0)
+
+
 class TestSettlement:
     def test_settlement_updates_bankroll(self, cfg, market):
         mock_clob = MagicMock()

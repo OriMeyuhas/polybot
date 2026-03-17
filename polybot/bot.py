@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import time
+from collections import deque
 
 import websockets
 
@@ -50,6 +51,8 @@ class Bot:
         self._snapped_windows: set[str] = set()
         self._last_status_time: float = 0.0
         self._trade_count: int = 0
+        self._start_time: float = time.time()
+        self._activity_log: deque = deque(maxlen=20)
 
     def compute_spot_delta(self, asset: str) -> float:
         current = self.spot_prices.get(asset, 0.0)
@@ -116,6 +119,16 @@ class Bot:
             spot_str,
         )
 
+    def _record_activity(self, event_type: str, asset: str, detail: str, pnl: float | None = None):
+        from polybot.display import ActivityEvent
+        self._activity_log.append(ActivityEvent(
+            timestamp=time.time(),
+            event_type=event_type,
+            asset=asset,
+            detail=detail,
+            pnl=pnl,
+        ))
+
     def evaluate_market(
         self, market: MarketWindow, now_epoch: int
     ) -> list[dict]:
@@ -142,50 +155,35 @@ class Bot:
         has_spread = existing_pos and existing_pos.up_qty > 0 and existing_pos.dn_qty > 0
         has_directional = existing_pos and (existing_pos.up_qty > 0) != (existing_pos.dn_qty > 0)
 
-        # Priority 1: Directional (latency arb)
-        # Can fire if no position, or if only a spread position exists (adds directional on top)
-        if not has_directional:
-            dir_opp = self.signal_engine.check_directional(
-                market, spot_delta, best_asks, now_epoch
+        # Early exit check: if we hold a spread, see if one side appreciated enough to sell
+        if has_spread:
+            exit_side = self.signal_engine.check_early_exit(
+                market, existing_pos, best_asks, now_epoch
             )
-            if dir_opp is not None:
-                fee = compute_fee(dir_opp.price)
-                net_edge = dir_opp.edge - fee
-                if net_edge > 0:
-                    token_id = (
-                        market.up_token_id
-                        if dir_opp.side == Side.UP
-                        else market.dn_token_id
-                    )
-                    book_depth = self.order_executor.get_book_depth_at_price(
-                        token_id, dir_opp.price
-                    )
-                    sizing = self.position_manager.compute_order_size(dir_opp, book_depth)
-                    if sizing is not None:
-                        side, qty = sizing
-                        record = self.order_executor.place_limit_buy(
-                            token_id=token_id,
-                            price=dir_opp.price,
-                            size=qty,
-                            market_id=market.market_id,
-                            side=side,
-                        )
-                        if record.status != "error":
-                            cost = qty * dir_opp.price
-                            self.position_manager.update_position(
-                                market.market_id, side, qty, cost
-                            )
-                            actions.append({
-                                "type": "directional",
-                                "side": side,
-                                "price": dir_opp.price,
-                                "qty": qty,
-                                "order_id": record.order_id,
-                            })
-                            self._trade_count += 1
-                    return actions  # Don't also do spread if directional fires
+            if exit_side is not None:
+                # Sell the appreciated side — in practice this is a limit sell;
+                # for now we just close the position and book profit.
+                if exit_side == Side.UP:
+                    sell_price = best_asks.get("UP", 0.0)
+                    pnl = existing_pos.up_qty * sell_price - existing_pos.up_cost
+                else:
+                    sell_price = best_asks.get("DOWN", 0.0)
+                    pnl = existing_pos.dn_qty * sell_price - existing_pos.dn_cost
 
-        # Priority 2: Spread capture — only if no existing position at all
+                old_bankroll = self.position_manager.bankroll
+                self.position_manager.update_bankroll(old_bankroll + pnl)
+                self.risk_manager.update_pnl(pnl)
+                self.position_manager.remove_position(market.market_id)
+                actions.append({
+                    "type": "early_exit",
+                    "exit_side": exit_side,
+                    "sell_price": sell_price,
+                    "pnl": pnl,
+                })
+                self._trade_count += 1
+                return actions
+
+        # Priority 1: Spread capture (91% of whale's trades)
         if existing_pos is None:
             spread_opp = self.signal_engine.check_spread(market, best_asks, now_epoch)
             if spread_opp is not None:
@@ -226,6 +224,48 @@ class Bot:
                             "qty": up_qty,
                         })
                         self._trade_count += 1
+                    return actions  # Don't also do directional if spread fires
+
+        # Priority 2: Directional (latency arb)
+        if not has_directional:
+            dir_opp = self.signal_engine.check_directional(
+                market, spot_delta, best_asks, now_epoch
+            )
+            if dir_opp is not None:
+                fee = compute_fee(dir_opp.price)
+                net_edge = dir_opp.edge - fee
+                if net_edge > 0:
+                    token_id = (
+                        market.up_token_id
+                        if dir_opp.side == Side.UP
+                        else market.dn_token_id
+                    )
+                    book_depth = self.order_executor.get_book_depth_at_price(
+                        token_id, dir_opp.price
+                    )
+                    sizing = self.position_manager.compute_order_size(dir_opp, book_depth)
+                    if sizing is not None:
+                        side, qty = sizing
+                        record = self.order_executor.place_limit_buy(
+                            token_id=token_id,
+                            price=dir_opp.price,
+                            size=qty,
+                            market_id=market.market_id,
+                            side=side,
+                        )
+                        if record.status != "error":
+                            cost = qty * dir_opp.price
+                            self.position_manager.update_position(
+                                market.market_id, side, qty, cost
+                            )
+                            actions.append({
+                                "type": "directional",
+                                "side": side,
+                                "price": dir_opp.price,
+                                "qty": qty,
+                                "order_id": record.order_id,
+                            })
+                            self._trade_count += 1
 
         return actions
 
@@ -292,6 +332,23 @@ class Bot:
                     )
                     for action in actions:
                         logger.info("ACTION: %s on %s", action, market.market_id)
+                        atype = action.get("type", "").upper()
+                        if atype == "DIRECTIONAL":
+                            self._record_activity(
+                                "DIRECTIONAL", market.asset,
+                                f"{action.get('side', '?').value} {action.get('qty', 0):.0f}@${action.get('price', 0):.2f}",
+                            )
+                        elif atype == "SPREAD":
+                            self._record_activity(
+                                "SPREAD", market.asset,
+                                f"UP@${action.get('up_price', 0):.2f} DN@${action.get('dn_price', 0):.2f} qty={action.get('qty', 0):.0f}",
+                            )
+                        elif atype == "EARLY_EXIT":
+                            self._record_activity(
+                                "EARLY_EXIT", market.asset,
+                                f"sold {action.get('exit_side', '?').value}@${action.get('sell_price', 0):.2f}",
+                                pnl=action.get("pnl"),
+                            )
                 except Exception as e:
                     logger.error(
                         "Error evaluating %s: %s", market.market_id, e
@@ -328,6 +385,11 @@ class Bot:
                         pos.up_qty, pos.dn_qty, pnl,
                         old_bankroll, self.position_manager.bankroll,
                     )
+                    self._record_activity(
+                        "SETTLE", market.asset,
+                        f"winner={winner} delta={spot_delta:+.4f} bankroll=${self.position_manager.bankroll:,.2f}",
+                        pnl=pnl,
+                    )
 
             # Cleanup expired window snapshots
             self._cleanup_expired_windows(now)
@@ -352,15 +414,35 @@ class Bot:
                         "STOP LOSS: %s — holding UP but delta=%.4f, exiting",
                         market.market_id, spot_delta,
                     )
+                    self._record_activity(
+                        "STOP_LOSS", market.asset,
+                        f"held UP, delta={spot_delta:+.4f}",
+                    )
                     self.position_manager.remove_position(market.market_id)
                 elif not holding_up and spot_delta > self.cfg.stop_loss_reversal:
                     logger.warning(
                         "STOP LOSS: %s — holding DOWN but delta=+%.4f, exiting",
                         market.market_id, spot_delta,
                     )
+                    self._record_activity(
+                        "STOP_LOSS", market.asset,
+                        f"held DN, delta={spot_delta:+.4f}",
+                    )
                     self.position_manager.remove_position(market.market_id)
 
             await asyncio.sleep(self.cfg.poll_interval_ms / 1000.0)
+
+    async def run_display(self):
+        """Live Rich dashboard, refreshing at 1 Hz."""
+        from rich.console import Console
+        from rich.live import Live
+        from polybot.display import build_display
+
+        console = Console()
+        with Live(build_display(self), console=console, refresh_per_second=1) as live:
+            while True:
+                await asyncio.sleep(1)
+                live.update(build_display(self))
 
     async def run(self):
         """Start all concurrent tasks."""
@@ -372,6 +454,7 @@ class Bot:
             asyncio.create_task(self.run_binance_ws()),
             asyncio.create_task(self.run_market_discovery()),
             asyncio.create_task(self.run_trading_loop()),
+            asyncio.create_task(self.run_display()),
         ]
         try:
             await asyncio.gather(*tasks)

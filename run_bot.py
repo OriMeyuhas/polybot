@@ -26,7 +26,12 @@ from polybot.bot import Bot
 import datetime as _dt
 import random as _random
 
-_WINDOW_DURATION = 180  # 3-minute windows for faster paper testing
+# Multi-timeframe windows matching real Polymarket (5m, 15m, 1h)
+_TIMEFRAMES = [
+    (300, "5m"),    # 5-minute windows
+    (900, "15m"),   # 15-minute windows
+    (3600, "1h"),   # 1-hour windows
+]
 
 
 class _MockAsk:
@@ -44,9 +49,9 @@ class _MockOrderBook:
 class MockClobClient:
     """Simulates Polymarket CLOB API responses for dry-run testing.
 
-    Generates 3-minute windows anchored to clock time so they expire
-    naturally. Each window has a unique ID so the bot sees proper
-    open → trade → settle → new window cycles.
+    Generates multi-timeframe windows (5m, 15m, 1h) anchored to clock time
+    so they expire naturally. Each window has a unique ID so the bot sees
+    proper open → trade → settle → new window cycles.
     """
 
     def __init__(self):
@@ -55,30 +60,26 @@ class MockClobClient:
             ("ETH", "Ethereum"),
         ]
 
-    def _current_window_start(self) -> int:
-        """Round down to the nearest WINDOW_DURATION boundary."""
-        now = int(time.time())
-        return now - (now % _WINDOW_DURATION)
-
     def get_markets(self):
-        win_start = self._current_window_start()
-        win_end = win_start + _WINDOW_DURATION
-        # Window number gives each cycle a unique ID
-        win_num = win_start // _WINDOW_DURATION
-
+        now = int(time.time())
         markets = []
-        for symbol, name in self._assets:
-            sym_lower = symbol.lower()
-            markets.append({
-                "condition_id": f"0x{sym_lower}_{win_num}",
-                "question": f"Will {name} go up or down in the next 3 minutes?",
-                "tokens": [
-                    {"token_id": f"{sym_lower}_up_{win_num}", "outcome": "Up"},
-                    {"token_id": f"{sym_lower}_dn_{win_num}", "outcome": "Down"},
-                ],
-                "game_start_time": _epoch_to_iso(win_start),
-                "end_date_iso": _epoch_to_iso(win_end),
-            })
+        for duration, label in _TIMEFRAMES:
+            win_start = now - (now % duration)
+            win_end = win_start + duration
+            win_num = win_start // duration
+
+            for symbol, name in self._assets:
+                sym_lower = symbol.lower()
+                markets.append({
+                    "condition_id": f"0x{sym_lower}_{label}_{win_num}",
+                    "question": f"Will {name} go up or down in the next {label}?",
+                    "tokens": [
+                        {"token_id": f"{sym_lower}_up_{label}_{win_num}", "outcome": "Up"},
+                        {"token_id": f"{sym_lower}_dn_{label}_{win_num}", "outcome": "Down"},
+                    ],
+                    "game_start_time": _epoch_to_iso(win_start),
+                    "end_date_iso": _epoch_to_iso(win_end),
+                })
         return {"data": markets}
 
     def get_order_book(self, token_id):
@@ -138,6 +139,8 @@ def main():
     logging.basicConfig(
         level=getattr(logging, cfg.log_level, logging.INFO),
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+        filename="polybot.log",
+        filemode="a",
     )
 
     if cfg.dry_run and not cfg.private_key:

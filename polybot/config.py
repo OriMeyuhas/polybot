@@ -52,8 +52,10 @@ class BotConfig:
     max_directional_price: float = 0.93
     min_directional_price: float = 0.07
     window_min_elapsed_sec: int = 480
+    spread_min_elapsed_pct: float = 0.10  # enter spreads after 10% of window elapsed
     position_size_fraction: float = 0.10
     stop_loss_reversal: float = 0.001
+    early_exit_profit_pct: float = 0.50  # exit spread when one side worth 50%+ more than cost
 
     # Risk limits
     max_concurrent_positions: int = 8
@@ -90,8 +92,10 @@ def load_bot_config() -> BotConfig:
         max_directional_price=float(os.getenv("MAX_DIRECTIONAL_PRICE", "0.93")),
         min_directional_price=float(os.getenv("MIN_DIRECTIONAL_PRICE", "0.07")),
         window_min_elapsed_sec=int(os.getenv("WINDOW_MIN_ELAPSED_SEC", "480")),
+        spread_min_elapsed_pct=float(os.getenv("SPREAD_MIN_ELAPSED_PCT", "0.10")),
         position_size_fraction=float(os.getenv("POSITION_SIZE_FRACTION", "0.10")),
         stop_loss_reversal=float(os.getenv("STOP_LOSS_REVERSAL", "0.001")),
+        early_exit_profit_pct=float(os.getenv("EARLY_EXIT_PROFIT_PCT", "0.50")),
         max_concurrent_positions=int(os.getenv("MAX_CONCURRENT_POSITIONS", "8")),
         max_capital_per_window_pct=float(os.getenv("MAX_CAPITAL_PER_WINDOW_PCT", "0.15")),
         max_daily_drawdown_pct=float(os.getenv("MAX_DAILY_DRAWDOWN_PCT", "0.05")),
