@@ -50,7 +50,7 @@ class BotConfig:
     ladder_spacing: float = 0.01
     ladder_width: float = 0.15
     ladder_size_skew: float = 2.0
-    reprice_threshold: float = 0.02
+    reprice_threshold: float = 0.03
     max_imbalance_ratio: float = 0.60
     imbalance_timeout_sec: int = 30
 

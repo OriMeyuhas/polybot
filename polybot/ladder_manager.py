@@ -16,6 +16,9 @@ from polybot.types import MarketWindow, Side
 logger = logging.getLogger(__name__)
 
 
+MIN_REPRICE_INTERVAL = 5.0  # seconds between reprices for the same market
+
+
 @dataclass
 class LadderState:
     market_id: str
@@ -23,8 +26,10 @@ class LadderState:
     anchor_up: float
     anchor_dn: float
     posted_at: float
+    last_reprice_at: float = 0.0
     imbalance_alert_at: float | None = None
     boosted_side: Side | None = None
+    committed_capital: float = 0.0  # total capital locked in resting orders
 
 
 def build_ladder_rungs(
@@ -81,6 +86,10 @@ class LadderManager:
     def has_ladder(self, market_id: str) -> bool:
         return market_id in self.ladders
 
+    def _total_committed(self) -> float:
+        """Total capital committed across all active ladders."""
+        return sum(s.committed_capital for s in self.ladders.values())
+
     def post_ladder(self, market: MarketWindow) -> int:
         """Post a full ladder (both sides) for a market. Returns number of orders placed."""
         if self.risk.is_halted():
@@ -88,7 +97,14 @@ class LadderManager:
         if not self.risk.can_open_position(self.positions.active_position_count()):
             return 0
 
-        budget = self.positions.bankroll * self.cfg.position_size_fraction
+        # Don't commit more capital than available bankroll
+        available = self.positions.bankroll - self._total_committed()
+        budget = min(
+            self.positions.bankroll * self.cfg.position_size_fraction,
+            available,
+        )
+        if budget < 1.0:
+            return 0
         budget_per_side = budget / 2.0
 
         best_ask_up = self.executor.get_best_ask(market.up_token_id)
@@ -155,6 +171,7 @@ class LadderManager:
 
         anchor_up = up_rungs[-1][0] if up_rungs else best_ask_up
         anchor_dn = dn_rungs[-1][0] if dn_rungs else best_ask_dn
+        committed = sum(p * s for p, s in up_rungs) + sum(p * s for p, s in dn_rungs)
 
         self.ladders[market.market_id] = LadderState(
             market_id=market.market_id,
@@ -162,6 +179,7 @@ class LadderManager:
             anchor_up=anchor_up,
             anchor_dn=anchor_dn,
             posted_at=now,
+            committed_capital=committed,
         )
 
         logger.info(
@@ -187,6 +205,10 @@ class LadderManager:
                     self.positions.update_position(
                         order.market_id, order.side, fill_qty, fill_qty * order.price,
                     )
+                    # Reduce committed capital as it converts to position
+                    state = self.ladders.get(order.market_id)
+                    if state:
+                        state.committed_capital = max(0, state.committed_capital - fill_qty * order.price)
                     fills += 1
                     logger.info(
                         "FILL: %s %s %.1f @ $%.2f on %s",
@@ -198,7 +220,12 @@ class LadderManager:
     def reprice_if_needed(self, markets: dict[str, MarketWindow]) -> int:
         """Reprice ladders where the book has moved beyond threshold. Returns reprice count."""
         repriced = 0
+        now = time.time()
         for mid, state in list(self.ladders.items()):
+            # Cooldown: don't reprice the same market too often
+            if now - state.last_reprice_at < MIN_REPRICE_INTERVAL:
+                continue
+
             market = markets.get(mid)
             if market is None:
                 continue
@@ -268,6 +295,7 @@ class LadderManager:
                 state.anchor_dn = best_ask_dn
 
             repriced += 1
+            state.last_reprice_at = now
             logger.info("REPRICE: %s (UP moved=%s, DN moved=%s)", mid, up_moved, dn_moved)
 
         return repriced
@@ -290,14 +318,14 @@ class LadderManager:
                 heavy_side = Side.UP if up_qty > dn_qty else Side.DOWN
                 if state.imbalance_alert_at is None:
                     state.imbalance_alert_at = now_epoch
-                    # Cancel heavy side's resting orders
                     cancelled = self.tracker.cancel_side(mid, heavy_side)
                     for oid in cancelled:
                         self.executor.cancel_order(oid)
-                    logger.warning(
-                        "IMBALANCE >%.0f%%: %s — cancelled %d %s rungs, waiting for other side",
-                        imbalance * 100, mid, len(cancelled), heavy_side.value,
-                    )
+                    if cancelled:
+                        logger.warning(
+                            "IMBALANCE >%.0f%%: %s — cancelled %d %s rungs, waiting for other side",
+                            imbalance * 100, mid, len(cancelled), heavy_side.value,
+                        )
                     acted.append(mid)
                 elif now_epoch - state.imbalance_alert_at > self.cfg.imbalance_timeout_sec:
                     # Timeout: accept the imbalance as a directional position
