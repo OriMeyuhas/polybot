@@ -1,4 +1,5 @@
 import re
+from datetime import datetime, timezone, timedelta
 
 # ---------------------------------------------------------------------------
 # Slug Parsing
@@ -70,7 +71,30 @@ def parse_slug(slug: str) -> dict:
             # Single hour token → assume 1h window
             tf = "1h"
 
-        return {"asset": _normalize_asset(asset), "timeframe": tf, "window_start_epoch": 0}
+        # Compute window_start_epoch from date+hour in slug
+        # time_part format: "march-18-2026-4am" or "march-18-2026-10am-11am"
+        date_parts = time_part.split("-")
+        window_start = 0
+        try:
+            month_name = date_parts[0]
+            day = int(date_parts[1])
+            year = int(date_parts[2])
+            # First time token is window start
+            start_hour_raw = times[0] if times else re.findall(r"(\d+)([ap]m)", time_part)
+            if start_hour_raw:
+                h, ampm = start_hour_raw if isinstance(start_hour_raw, tuple) else start_hour_raw[0]
+                h = int(h)
+                if ampm == "pm" and h != 12:
+                    h += 12
+                elif ampm == "am" and h == 12:
+                    h = 0
+                month = _MONTH_NAMES.get(month_name.lower(), 0)
+                if month:
+                    window_start = _et_to_utc_epoch(year, month, day, h)
+        except (IndexError, ValueError):
+            window_start = 0
+
+        return {"asset": _normalize_asset(asset), "timeframe": tf, "window_start_epoch": window_start}
 
     return {"asset": "UNKNOWN", "timeframe": "?", "window_start_epoch": 0}
 
@@ -102,6 +126,30 @@ def parse_title_fallback(title: str) -> dict:
         result["timeframe"] = "1h"
 
     return result
+
+
+_MONTH_NAMES = {
+    "january": 1, "february": 2, "march": 3, "april": 4,
+    "may": 5, "june": 6, "july": 7, "august": 8,
+    "september": 9, "october": 10, "november": 11, "december": 12,
+}
+
+
+def _et_to_utc_epoch(year: int, month: int, day: int, hour: int) -> int:
+    """Convert an Eastern Time hour to UTC epoch. Handles DST automatically."""
+    # US DST: starts 2nd Sunday of March 2am, ends 1st Sunday of November 2am
+    # Find 2nd Sunday of March
+    march1 = datetime(year, 3, 1)
+    first_sun_march = march1 + timedelta(days=(6 - march1.weekday()) % 7)
+    dst_start = first_sun_march + timedelta(days=7)  # 2nd Sunday
+    # Find 1st Sunday of November
+    nov1 = datetime(year, 11, 1)
+    dst_end = nov1 + timedelta(days=(6 - nov1.weekday()) % 7)  # 1st Sunday
+
+    dt_naive = datetime(year, month, day, hour, 0, 0)
+    et_offset = timedelta(hours=-4) if dst_start <= dt_naive < dst_end else timedelta(hours=-5)
+    dt_utc = dt_naive - et_offset
+    return int(dt_utc.replace(tzinfo=timezone.utc).timestamp())
 
 
 TIMEFRAME_SECONDS = {
