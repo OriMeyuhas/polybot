@@ -22,6 +22,7 @@ class OrderExecutor:
     def __init__(self, cfg: BotConfig, clob_client):
         self.cfg = cfg
         self.client = clob_client
+        self._dry_id = 0
 
     def place_limit_buy(
         self,
@@ -43,7 +44,8 @@ class OrderExecutor:
                 "DRY RUN: would buy %s %.2f x %.1f on %s",
                 side.value, price, size, market_id,
             )
-            record.order_id = f"dry-{int(time.time() * 1000)}"
+            self._dry_id += 1
+            record.order_id = f"dry-{self._dry_id}"
             record.status = "dry_run"
             return record
         try:
@@ -90,7 +92,8 @@ class OrderExecutor:
                 "DRY RUN: would sell %s %.2f x %.1f on %s",
                 side.value, price, size, market_id,
             )
-            record.order_id = f"dry-sell-{int(time.time() * 1000)}"
+            self._dry_id += 1
+            record.order_id = f"dry-sell-{self._dry_id}"
             record.status = "dry_run"
             return record
         try:

@@ -68,7 +68,7 @@ class OrderTracker:
         return [
             self.orders[oid]
             for oid in self._by_market.get(market_id, [])
-            if self.orders[oid].status in ("resting", "partial")
+            if oid in self.orders and self.orders[oid].status in ("resting", "partial")
         ]
 
     def get_resting_side(self, market_id: str, side: Side) -> list[TrackedOrder]:
@@ -80,23 +80,24 @@ class OrderTracker:
         return [
             self.orders[oid]
             for oid in self._by_market.get(market_id, [])
-            if self.orders[oid].status in ("partial", "filled")
+            if oid in self.orders
+            and self.orders[oid].status in ("partial", "filled")
             and self.orders[oid].filled > 0
         ]
 
     def filled_qty(self, market_id: str, side: Side) -> float:
         total = 0.0
         for oid in self._by_market.get(market_id, []):
-            o = self.orders[oid]
-            if o.side == side and o.filled > 0:
+            o = self.orders.get(oid)
+            if o and o.side == side and o.filled > 0:
                 total += o.filled
         return total
 
     def filled_cost(self, market_id: str, side: Side) -> float:
         total = 0.0
         for oid in self._by_market.get(market_id, []):
-            o = self.orders[oid]
-            if o.side == side and o.filled > 0:
+            o = self.orders.get(oid)
+            if o and o.side == side and o.filled > 0:
                 total += o.filled * o.price
         return total
 

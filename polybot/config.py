@@ -28,6 +28,14 @@ class TrackerConfig:
     # Polygonscan (optional)
     polygonscan_api_key: str = ""
 
+    # Enhanced tracker pipeline settings
+    trade_poll_interval_sec: int = 2
+    spot_record_interval_sec: int = 2
+    book_snapshot_interval_sec: int = 5
+    settlement_retry_max: int = 5
+    settlement_retry_backoff_sec: float = 2.0
+    clob_book_poll_url: str = "https://clob.polymarket.com/book"
+
 
 @dataclass(frozen=True)
 class BotConfig:
@@ -122,4 +130,10 @@ def load_config() -> TrackerConfig:
         poll_interval_sec=int(os.getenv("POLL_INTERVAL_SEC", "5")),
         log_level=os.getenv("LOG_LEVEL", "INFO"),
         polygonscan_api_key=os.getenv("POLYGONSCAN_API_KEY", ""),
+        trade_poll_interval_sec=int(os.getenv("TRADE_POLL_INTERVAL_SEC", "2")),
+        spot_record_interval_sec=int(os.getenv("SPOT_RECORD_INTERVAL_SEC", "2")),
+        book_snapshot_interval_sec=int(os.getenv("BOOK_SNAPSHOT_INTERVAL_SEC", "5")),
+        settlement_retry_max=int(os.getenv("SETTLEMENT_RETRY_MAX", "5")),
+        settlement_retry_backoff_sec=float(os.getenv("SETTLEMENT_RETRY_BACKOFF_SEC", "2.0")),
+        clob_book_poll_url=os.getenv("CLOB_BOOK_POLL_URL", "https://clob.polymarket.com/book"),
     )

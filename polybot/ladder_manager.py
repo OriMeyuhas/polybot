@@ -239,59 +239,84 @@ class LadderManager:
             if not up_moved and not dn_moved:
                 continue
 
-            budget = self.positions.bankroll * self.cfg.position_size_fraction
-            budget_per_side = budget / 2.0
-            now = time.time()
+            # Budget for reprice: only the REMAINING unfilled portion
+            total_budget = self.positions.bankroll * self.cfg.position_size_fraction
+            available = self.positions.bankroll - self._total_committed()
+            budget_per_side = min(total_budget / 2.0, max(0, available / 2.0))
+            if budget_per_side < 1.0:
+                continue
 
             if up_moved:
-                # Cancel unfilled UP rungs and repost
+                # Cancel unfilled UP rungs (returns capital) and repost
                 cancelled = self.tracker.cancel_side(mid, Side.UP)
                 for oid in cancelled:
                     self.executor.cancel_order(oid)
+                # Reclaim committed capital from cancelled orders
+                for oid in cancelled:
+                    o = self.tracker.orders.get(oid)
+                    if o:
+                        state.committed_capital = max(0, state.committed_capital - (o.size - o.filled) * o.price)
 
-                up_rungs = build_ladder_rungs(
-                    best_ask_up, budget_per_side,
-                    self.cfg.ladder_rungs, self.cfg.ladder_spacing,
-                    self.cfg.ladder_width, self.cfg.ladder_size_skew,
-                )
-                for price, size in up_rungs:
-                    record = self.executor.place_limit_buy(
-                        token_id=market.up_token_id,
-                        price=price, size=size,
-                        market_id=mid, side=Side.UP,
+                # Only budget for unfilled portion of this side
+                already_filled_cost = self.tracker.filled_cost(mid, Side.UP)
+                side_budget = max(0, budget_per_side - already_filled_cost)
+                if side_budget >= 1.0:
+                    up_rungs = build_ladder_rungs(
+                        best_ask_up, side_budget,
+                        self.cfg.ladder_rungs, self.cfg.ladder_spacing,
+                        self.cfg.ladder_width, self.cfg.ladder_size_skew,
                     )
-                    if record.status != "error":
-                        self.tracker.add(TrackedOrder(
-                            order_id=record.order_id,
-                            market_id=mid, token_id=market.up_token_id,
-                            side=Side.UP, price=price, size=size,
-                            placed_at=now,
-                        ))
+                    new_committed = 0.0
+                    for price, size in up_rungs:
+                        record = self.executor.place_limit_buy(
+                            token_id=market.up_token_id,
+                            price=price, size=size,
+                            market_id=mid, side=Side.UP,
+                        )
+                        if record.status != "error":
+                            self.tracker.add(TrackedOrder(
+                                order_id=record.order_id,
+                                market_id=mid, token_id=market.up_token_id,
+                                side=Side.UP, price=price, size=size,
+                                placed_at=now,
+                            ))
+                            new_committed += price * size
+                    state.committed_capital += new_committed
                 state.anchor_up = best_ask_up
 
             if dn_moved:
                 cancelled = self.tracker.cancel_side(mid, Side.DOWN)
                 for oid in cancelled:
                     self.executor.cancel_order(oid)
+                for oid in cancelled:
+                    o = self.tracker.orders.get(oid)
+                    if o:
+                        state.committed_capital = max(0, state.committed_capital - (o.size - o.filled) * o.price)
 
-                dn_rungs = build_ladder_rungs(
-                    best_ask_dn, budget_per_side,
-                    self.cfg.ladder_rungs, self.cfg.ladder_spacing,
-                    self.cfg.ladder_width, self.cfg.ladder_size_skew,
-                )
-                for price, size in dn_rungs:
-                    record = self.executor.place_limit_buy(
-                        token_id=market.dn_token_id,
-                        price=price, size=size,
-                        market_id=mid, side=Side.DOWN,
+                already_filled_cost = self.tracker.filled_cost(mid, Side.DOWN)
+                side_budget = max(0, budget_per_side - already_filled_cost)
+                if side_budget >= 1.0:
+                    dn_rungs = build_ladder_rungs(
+                        best_ask_dn, side_budget,
+                        self.cfg.ladder_rungs, self.cfg.ladder_spacing,
+                        self.cfg.ladder_width, self.cfg.ladder_size_skew,
                     )
-                    if record.status != "error":
-                        self.tracker.add(TrackedOrder(
-                            order_id=record.order_id,
-                            market_id=mid, token_id=market.dn_token_id,
-                            side=Side.DOWN, price=price, size=size,
-                            placed_at=now,
-                        ))
+                    new_committed = 0.0
+                    for price, size in dn_rungs:
+                        record = self.executor.place_limit_buy(
+                            token_id=market.dn_token_id,
+                            price=price, size=size,
+                            market_id=mid, side=Side.DOWN,
+                        )
+                        if record.status != "error":
+                            self.tracker.add(TrackedOrder(
+                                order_id=record.order_id,
+                                market_id=mid, token_id=market.dn_token_id,
+                                side=Side.DOWN, price=price, size=size,
+                                placed_at=now,
+                            ))
+                            new_committed += price * size
+                    state.committed_capital += new_committed
                 state.anchor_dn = best_ask_dn
 
             repriced += 1

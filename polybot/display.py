@@ -86,7 +86,7 @@ def build_display(bot) -> Layout:
     ladder_table.add_column("Combined", justify="right", width=9)
     ladder_table.add_column("Imbal", justify="right", width=7)
 
-    for mid in bot.ladder_manager.ladders:
+    for mid in list(bot.ladder_manager.ladders):
         stats = bot.ladder_manager.get_ladder_stats(mid)
         short_id = mid.split("_")[-1] if "_" in mid else mid[-8:]
 
