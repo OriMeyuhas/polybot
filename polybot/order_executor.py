@@ -39,11 +39,11 @@ class OrderExecutor:
             timestamp=time.time(),
         )
         if self.cfg.dry_run:
-            logger.info(
+            logger.debug(
                 "DRY RUN: would buy %s %.2f x %.1f on %s",
                 side.value, price, size, market_id,
             )
-            record.order_id = f"dry-{int(time.time())}"
+            record.order_id = f"dry-{int(time.time() * 1000)}"
             record.status = "dry_run"
             return record
         try:
@@ -69,10 +69,66 @@ class OrderExecutor:
 
         return record
 
+    def place_limit_sell(
+        self,
+        token_id: str,
+        price: float,
+        size: float,
+        market_id: str,
+        side: Side,
+    ) -> OrderRecord:
+        """Place a limit sell order (for early exit of appreciated positions)."""
+        record = OrderRecord(
+            market_id=market_id,
+            side=side,
+            price=price,
+            size=size,
+            timestamp=time.time(),
+        )
+        if self.cfg.dry_run:
+            logger.debug(
+                "DRY RUN: would sell %s %.2f x %.1f on %s",
+                side.value, price, size, market_id,
+            )
+            record.order_id = f"dry-sell-{int(time.time() * 1000)}"
+            record.status = "dry_run"
+            return record
+        try:
+            from py_clob_client.order_builder.constants import SELL
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=price,
+                size=size,
+                side=SELL,
+            )
+            signed = self.client.create_order(order_args)
+            resp = self.client.post_order(signed, OrderType.GTC)
+
+            record.order_id = resp.get("orderID", "")
+            record.status = resp.get("status", "unknown")
+
+            logger.info(
+                "SELL ORDER: %s %s %.2f x %.1f on %s -> %s",
+                side.value, token_id[:16], price, size, market_id, record.status,
+            )
+        except Exception as e:
+            record.status = "error"
+            logger.error("Sell order failed: %s", e)
+
+        return record
+
+    def get_open_orders(self) -> list[dict]:
+        """Return list of open orders from the CLOB. Each has 'id', 'price', 'size'."""
+        try:
+            return self.client.get_open_orders()
+        except Exception as e:
+            logger.error("Get open orders failed: %s", e)
+            return []
+
     def cancel_order(self, order_id: str) -> bool:
         try:
             self.client.cancel(order_id)
-            logger.info("ORDER CANCELLED: %s", order_id)
+            logger.debug("ORDER CANCELLED: %s", order_id)
             return True
         except Exception as e:
             logger.error("Cancel failed for %s: %s", order_id, e)

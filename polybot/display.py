@@ -16,7 +16,7 @@ from polybot.utils.time_utils import format_duration, format_elapsed
 @dataclass
 class ActivityEvent:
     timestamp: float
-    event_type: str  # SPREAD, DIRECTIONAL, SETTLE, STOP_LOSS
+    event_type: str  # LADDER, FILL, SETTLE, STOP_LOSS, EARLY_EXIT, CANCEL
     asset: str
     detail: str
     pnl: float | None = None
@@ -28,7 +28,7 @@ def build_display(bot) -> Layout:
     layout.split_column(
         Layout(name="header", size=3),
         Layout(name="spot", size=3),
-        Layout(name="positions", ratio=2),
+        Layout(name="ladders", ratio=2),
         Layout(name="activity", ratio=2),
         Layout(name="risk", size=3),
     )
@@ -41,14 +41,16 @@ def build_display(bot) -> Layout:
     pnl_pct = (daily_pnl / bot.risk_manager.starting_bankroll * 100) if bot.risk_manager.starting_bankroll > 0 else 0.0
     pnl_color = "green" if daily_pnl >= 0 else "red"
     pos_count = bot.position_manager.active_position_count()
+    ladder_count = len(bot.ladder_manager.ladders)
     status = "[red]HALTED[/]" if bot.risk_manager.is_halted() else "[green]ACTIVE[/]"
 
     header_text = Text.from_markup(
-        f"[bold cyan]POLYBOT TRADING ENGINE[/] {mode_badge}  "
+        f"[bold cyan]POLYBOT LADDER ENGINE[/] {mode_badge}  "
         f"Uptime: {uptime}  |  "
         f"Bankroll: [bold]${bankroll:,.2f}[/]  |  "
         f"PnL: [{pnl_color}]${daily_pnl:+,.2f} ({pnl_pct:+.2f}%)[/{pnl_color}]  |  "
-        f"Trades: {bot._trade_count}  |  "
+        f"Fills: {bot._trade_count}  |  "
+        f"Ladders: {ladder_count}  |  "
         f"Positions: {pos_count}/{bot.cfg.max_concurrent_positions}  |  "
         f"Status: {status}"
     )
@@ -71,49 +73,45 @@ def build_display(bot) -> Layout:
         Panel(Text.from_markup(f"[bold]SPOT PRICES[/]  {spot_text}"), style="blue")
     )
 
-    # -- Active Positions --
-    pos_table = Table(
-        title="ACTIVE POSITIONS", expand=True, show_lines=False,
+    # -- Active Ladders --
+    ladder_table = Table(
+        title="ACTIVE LADDERS", expand=True, show_lines=False,
         title_style="bold white",
     )
-    pos_table.add_column("Market", style="dim", width=20)
-    pos_table.add_column("Side", width=6)
-    pos_table.add_column("Qty", justify="right", width=8)
-    pos_table.add_column("Avg", justify="right", width=8)
-    pos_table.add_column("PnL", justify="right", width=10)
-    pos_table.add_column("Strategy", width=12)
+    ladder_table.add_column("Market", style="dim", width=16)
+    ladder_table.add_column("Side", width=4)
+    ladder_table.add_column("Resting", justify="right", width=7)
+    ladder_table.add_column("Filled", justify="right", width=7)
+    ladder_table.add_column("VWAP", justify="right", width=7)
+    ladder_table.add_column("Combined", justify="right", width=9)
+    ladder_table.add_column("Imbal", justify="right", width=7)
 
-    for mid, pos in bot.position_manager.positions.items():
+    for mid in bot.ladder_manager.ladders:
+        stats = bot.ladder_manager.get_ladder_stats(mid)
         short_id = mid.split("_")[-1] if "_" in mid else mid[-8:]
-        has_up = pos.up_qty > 0
-        has_dn = pos.dn_qty > 0
-        is_spread = has_up and has_dn
 
-        if has_up:
-            avg_up = pos.up_cost / pos.up_qty if pos.up_qty > 0 else 0
-            pnl_up = pos.profit_if_up()
-            pnl_color = "green" if pnl_up >= 0 else "red"
-            strategy = "SPREAD" if is_spread else "DIRECTIONAL"
-            pos_table.add_row(
-                short_id, Text("UP", style="green"),
-                f"{pos.up_qty:.0f}", f"${avg_up:.2f}",
-                Text(f"${pnl_up:+.2f}", style=pnl_color),
-                Text(strategy, style="magenta" if is_spread else "cyan"),
-            )
-        if has_dn:
-            avg_dn = pos.dn_cost / pos.dn_qty if pos.dn_qty > 0 else 0
-            pnl_dn = pos.profit_if_down()
-            pnl_color = "green" if pnl_dn >= 0 else "red"
-            strategy = "SPREAD" if is_spread else "DIRECTIONAL"
-            pos_table.add_row(
-                short_id if not has_up else "",
-                Text("DN", style="red"),
-                f"{pos.dn_qty:.0f}", f"${avg_dn:.2f}",
-                Text(f"${pnl_dn:+.2f}", style=pnl_color),
-                Text(strategy, style="magenta" if is_spread else "cyan"),
-            )
+        combined = stats["combined_vwap"]
+        combined_color = "green" if 0 < combined < 1.0 else "red" if combined > 0 else "dim"
+        imbal = stats["imbalance"]
+        imbal_color = "green" if imbal < 0.30 else "yellow" if imbal < 0.60 else "red"
 
-    layout["positions"].update(Panel(pos_table))
+        ladder_table.add_row(
+            short_id, Text("UP", style="green"),
+            str(stats["up_resting"]),
+            f"{stats['up_filled']:.0f}",
+            f"${stats['up_vwap']:.2f}" if stats["up_vwap"] > 0 else "--",
+            Text(f"${combined:.3f}" if combined > 0 else "--", style=combined_color),
+            Text(f"{imbal:.0%}", style=imbal_color),
+        )
+        ladder_table.add_row(
+            "", Text("DN", style="red"),
+            str(stats["dn_resting"]),
+            f"{stats['dn_filled']:.0f}",
+            f"${stats['dn_vwap']:.2f}" if stats["dn_vwap"] > 0 else "--",
+            "", "",
+        )
+
+    layout["ladders"].update(Panel(ladder_table))
 
     # -- Recent Activity --
     activity_table = Table(
@@ -127,11 +125,13 @@ def build_display(bot) -> Layout:
     activity_table.add_column("PnL", justify="right", width=10)
 
     type_styles = {
-        "SPREAD": "magenta",
-        "DIRECTIONAL": "cyan",
+        "LADDER": "blue",
+        "FILL": "magenta",
         "SETTLE": "yellow",
         "STOP_LOSS": "red",
         "EARLY_EXIT": "green",
+        "CANCEL": "dim",
+        "IMBALANCE": "red",
     }
 
     for event in list(bot._activity_log)[-8:]:
@@ -159,13 +159,13 @@ def build_display(bot) -> Layout:
     drawdown_pct = (abs(daily_pnl) / bot.risk_manager.starting_bankroll * 100) if daily_pnl < 0 else 0.0
     max_dd_pct = bot.cfg.max_daily_drawdown_pct * 100
 
-    # Active windows with remaining time
     now = int(time.time())
     window_parts = []
     for m in bot.active_markets:
         if m.is_active(now):
             remaining = m.remaining(now)
-            window_parts.append(f"{m.asset} {format_elapsed(remaining)}")
+            tf = f"{m.timeframe_sec // 60}m" if m.timeframe_sec < 3600 else f"{m.timeframe_sec // 3600}h"
+            window_parts.append(f"{m.asset}/{tf} {format_elapsed(remaining)}")
     windows_str = " | ".join(window_parts) if window_parts else "none"
 
     risk_text = Text.from_markup(

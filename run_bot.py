@@ -21,7 +21,7 @@ from polybot.bot import Bot
 
 # ---------------------------------------------------------------------------
 # Mock CLOB client — used in dry-run mode when no credentials are provided.
-# Simulates realistic 3-minute window cycles with rotating markets.
+# Probability-based fill simulation for realistic ladder testing.
 # ---------------------------------------------------------------------------
 import datetime as _dt
 import random as _random
@@ -47,18 +47,20 @@ class _MockOrderBook:
 
 
 class MockClobClient:
-    """Simulates Polymarket CLOB API responses for dry-run testing.
+    """Simulates Polymarket CLOB API with probability-based fill simulation.
 
-    Generates multi-timeframe windows (5m, 15m, 1h) anchored to clock time
-    so they expire naturally. Each window has a unique ID so the bot sees
-    proper open → trade → settle → new window cycles.
+    Resting orders fill probabilistically each tick based on distance from
+    mid-market. Closer orders fill more often with larger partial fills.
     """
 
-    def __init__(self):
+    def __init__(self, base_fill_rate: float = 0.15):
         self._assets = [
             ("BTC", "Bitcoin"),
             ("ETH", "Ethereum"),
         ]
+        self._resting: dict[str, dict] = {}  # order_id -> order info
+        self._next_id = 1
+        self._base_fill_rate = base_fill_rate
 
     def get_markets(self):
         now = int(time.time())
@@ -83,7 +85,6 @@ class MockClobClient:
         return {"data": markets}
 
     def get_order_book(self, token_id):
-        # Add small random noise to prices each call to simulate real market
         noise = _random.uniform(-0.02, 0.02)
         if "up" in token_id:
             ask = round(0.46 + noise, 2)
@@ -95,15 +96,53 @@ class MockClobClient:
             return _MockOrderBook(bid_price=round(ask - 0.02, 2), ask_price=ask)
 
     def create_order(self, order_args):
-        return {"signed": True}
+        return {"signed": True, "_args": order_args}
 
     def post_order(self, signed, order_type):
-        return {"orderID": f"dry-mock-{int(time.time())}", "status": "dry_run"}
+        order_id = f"mock-{self._next_id}"
+        self._next_id += 1
+        args = signed.get("_args")
+        if args is not None:
+            self._resting[order_id] = {
+                "token_id": getattr(args, "token_id", ""),
+                "price": float(getattr(args, "price", 0)),
+                "size": float(getattr(args, "size", 0)),
+                "remaining": float(getattr(args, "size", 0)),
+            }
+        return {"orderID": order_id, "status": "resting"}
+
+    def get_open_orders(self) -> list[dict]:
+        return [
+            {"id": oid, **info}
+            for oid, info in self._resting.items()
+        ]
+
+    def tick(self):
+        """Simulate fills on resting orders. Called each bot tick."""
+        for oid in list(self._resting.keys()):
+            order = self._resting.get(oid)
+            if order is None:
+                continue
+
+            mid = 0.50  # neutral mid for binary markets
+            distance = abs(order["price"] - mid)
+            max_dist = 0.50
+            fill_prob = self._base_fill_rate * (1.0 - distance / max_dist)
+            fill_prob = max(0.01, fill_prob)
+
+            if _random.random() < fill_prob:
+                fill_pct = _random.uniform(0.20, 1.00)
+                fill_qty = order["remaining"] * fill_pct
+                order["remaining"] -= fill_qty
+                if order["remaining"] < 0.1:
+                    del self._resting[oid]
 
     def cancel(self, order_id):
+        self._resting.pop(order_id, None)
         return {"cancelled": True}
 
     def cancel_all(self):
+        self._resting.clear()
         return {"cancelled": True}
 
     def get_balance_allowance(self, params=None):
@@ -145,7 +184,7 @@ def main():
 
     if cfg.dry_run and not cfg.private_key:
         print("DRY RUN mode — no credentials found, using mock CLOB client.")
-        clob_client = MockClobClient()
+        clob_client = MockClobClient(base_fill_rate=cfg.mock_base_fill_rate)
         import os
         bankroll = float(os.getenv("DRY_RUN_BANKROLL", "1000"))
     elif not cfg.private_key:

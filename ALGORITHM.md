@@ -8,85 +8,79 @@ Simple overview of how the bot makes money. Keep this file updated when the algo
 
 The bot trades on **Polymarket crypto prediction markets** — short windows (5 min, 15 min, 1 hour) where you bet whether a coin (BTC, ETH, SOL, XRP) goes UP or DOWN. Each window has two tokens you can buy: an UP token and a DOWN token. The winning token pays $1, the losing one pays $0.
 
-## Three Strategies (in priority order)
+## Core Strategy: Passive Limit Order Ladders
 
-### 0. Early Exit (active position management)
+Instead of hitting the market with single orders, the bot acts as a **market maker**. It posts resting limit orders at multiple price levels on both sides of every market and waits for other traders to fill them.
 
-**Idea:** Don't wait for settlement. If one side of a spread appreciated 50%+ above our entry cost, sell it early and lock in profit.
+### How the Ladder Works
 
-**Example:**
-- Bought UP at $0.40, now trading at $0.65 → gain = 62.5% > 50% threshold
-- Sell the UP side early, book $25 profit on 100 shares
-- Don't wait for the window to expire
+When a new market window opens, the bot posts **16 buy orders per side** (32 total), spread $0.01 apart:
 
-**When it fires:**
-- We hold a spread position (both UP and DN)
-- One side's current price is 50%+ above our average entry
-- Checked every tick before looking for new trades
+```
+DOWN ladder:     UP ladder:
+$0.33 × 4 qty    $0.37 × 4 qty   ← cheapest, smallest, rarely fill
+$0.34 × 4 qty    $0.38 × 4 qty
+$0.35 × 5 qty    $0.39 × 5 qty
+  ...               ...
+$0.47 × 8 qty    $0.51 × 8 qty
+$0.48 × 9 qty    $0.52 × 9 qty   ← most expensive, largest, fill first
+```
 
-### 1. Spread Capture (Primary — 91% of whale's trades)
+**Why this works:** Expensive rungs (near market) fill first and often. Cheap rungs fill later and rarely. The volume-weighted average cost ends up well below $1 combined, locking in spread profit.
 
-**Idea:** Sometimes UP + DOWN tokens are priced below $1 total. Buy both, guarantee profit.
+### Example
 
-**Example:**
-- UP token: $0.46, DOWN token: $0.48 → total = $0.94
-- Buy both → one will pay $1 → profit = $1 - $0.94 = **$0.06 per share**
+- DOWN fills average at $0.42, UP fills average at $0.50
+- Combined VWAP: $0.92
+- **Guaranteed profit: $0.08 per share** (one side always pays $1)
 
-**When it fires:**
-- Combined price is at least 2.5% below $1.00
-- No existing position on that market
-- At least 10% of window elapsed (30s on 5m, 90s on 15m, 6m on 1h)
-- At least 60 seconds left in the window
+## Ladder Lifecycle
 
-### 2. Directional (Momentum — secondary)
+```
+Window opens (5m / 15m / 1h)
+    |
+    v
+Wait for 10% of window elapsed
+    |
+    v
+Post ladder: 16 UP rungs + 16 DN rungs ($0.01 spacing)
+    |
+    v
+Every 500ms:
+    |
+    +-- Check fills (orders that disappeared from book)
+    |       --> Update positions with actual filled qty/price
+    |
+    +-- Reprice if book moved > $0.02
+    |       --> Cancel unfilled rungs, rebuild at new levels
+    |
+    +-- Imbalance guard:
+    |       - < 30%: normal
+    |       - 30-60%: monitor
+    |       - > 60%: cancel heavy side, wait 30s for other side
+    |
+    +-- Early exit: if one side up 50%+ from entry, sell it
+    |
+    v
+60 seconds before expiry: cancel all unfilled rungs
+    |
+    v
+Window expires --> settle filled positions, update bankroll
+```
 
-**Idea:** If the real coin price has moved since the window opened, bet on that direction continuing.
+## Imbalance Guard
 
-**Example:**
-- BTC up 0.3% since window opened → buy the UP token at $0.46
-- If UP wins → payout $1, profit = $1 - $0.46 = **$0.54 per share**
+The main risk: filling one side but not the other.
 
-**When it fires:**
-- Spot price moved at least 0.2% from window open
-- At least 8 minutes into the window (let the price drift settle)
-- At least 60 seconds left before close
-- Token price between $0.07 and $0.93 (avoid extremes)
-- No directional position already open on that market
-- Only fires if spread didn't fire first
+| Imbalance | Action |
+|-----------|--------|
+| < 30% | Normal — both sides filling |
+| 30-60% | Monitor |
+| > 60% | Cancel the heavy side's unfilled orders. Wait 30s. If lagging side doesn't catch up, accept as directional — stop-loss manages it |
 
-## Multi-Timeframe Trading
+## Early Exit
 
-The bot trades across all available timeframes simultaneously:
-
-| Timeframe | Spread Entry After | Notes |
-|-----------|-------------------|-------|
-| **5 min** | 30 seconds | Fastest cycle, most opportunities |
-| **15 min** | 90 seconds | Medium cycle |
-| **1 hour** | 6 minutes | Larger sizes per trade |
-
-Market discovery scans Polymarket every 60 seconds and picks up all active windows across all timeframes.
-
-## Fees
-
-Polymarket charges: `2% x min(price, 1-price)`. The closer to $0.50, the higher the fee. The bot only enters if profit > fee.
-
-## Position Sizing
-
-- Each trade uses up to **10% of bankroll**
-- For spreads: split 50/50 between UP and DOWN
-- For directional: capped at 50% of available book depth (don't eat too much liquidity)
-
-## Settlement
-
-When a window expires (and no early exit happened):
-1. Check which direction the coin actually moved
-2. Calculate profit/loss based on held tokens
-3. Update bankroll
-4. Remove the position
-
-**Profit math:**
-- Holding UP and UP wins: `up_qty x (1 - avg_price) - down_cost`
-- Holding DOWN and DOWN wins: `dn_qty x (1 - avg_price) - up_cost`
+If one side of a spread appreciates 50%+ above our entry price, sell it and book profit early. Don't wait for settlement.
 
 ## Risk Controls
 
@@ -94,58 +88,34 @@ When a window expires (and no early exit happened):
 |---------|------|---------|
 | **Daily drawdown halt** | Stop all trading if daily loss > 5% of starting bankroll | 5% |
 | **Max positions** | No more than 8 open positions at once | 8 |
-| **Stop-loss** | Exit directional if spot reverses 0.1% against you | 0.1% |
-| **Early exit** | Sell appreciated spread side when gain > 50% of entry | 50% |
-| **No-trade zone** | Don't trade in the final 60 seconds of a window | 60s |
-| **Spread min elapsed** | Don't enter spreads until 10% of window has passed | 10% |
-| **Directional min elapsed** | Don't take directional trades until 8 min into window | 480s |
+| **Pair cost guard** | Don't post ladder if combined VWAP would exceed $0.985 | $0.985 |
+| **Stop-loss** | Exit one-sided position if spot reverses 0.1% | 0.1% |
+| **Early exit** | Sell appreciated side when gain > 50% of entry | 50% |
+| **No-trade zone** | Cancel unfilled rungs 60s before window close | 60s |
+| **Reprice threshold** | Only reprice when book moves > $0.02 | $0.02 |
 | **Dry run** | Default ON — no real orders placed | true |
+
+## Configuration
+
+| Param | Default | Purpose |
+|-------|---------|---------|
+| `ladder_rungs` | 16 | Orders per side |
+| `ladder_spacing` | $0.01 | Gap between rungs |
+| `ladder_width` | $0.15 | Distance from best ask to cheapest rung |
+| `ladder_size_skew` | 2.0 | Expensive rung gets 2x the size of cheapest |
+| `position_size_fraction` | 10% | Bankroll fraction per ladder |
 
 ## How the Bot Runs
 
-Four async tasks run in parallel:
+Four async tasks in parallel:
 
-1. **Binance WebSocket** — streams real-time spot prices
+1. **Binance WebSocket** — real-time spot prices
 2. **Market Discovery** — scans Polymarket every 60s for active windows (5m, 15m, 1h)
-3. **Trading Loop** — evaluates all markets every 500ms: early exit → spread → directional → settlement → stop-loss
-4. **Dashboard** — Rich terminal display refreshing at 1 Hz
+3. **Trading Loop** — manages ladders: post → fill detection → reprice → imbalance → early exit → settle
+4. **Dashboard** — Rich terminal display at 1 Hz
 
-All logging goes to `polybot.log` so the dashboard stays clean.
-
-## Decision Flow
-
-```
-Window opens (5m / 15m / 1h)
-    |
-    v
-Every 500ms:
-    |
-    +-- Risk checks pass? (not halted, positions < 8, time OK)
-    |       |
-    |       v
-    |   Check EARLY EXIT first (existing spread positions):
-    |       - One side up 50%+ from entry?
-    |       --> YES: sell that side, book profit, done
-    |       |
-    |       v
-    |   Check SPREAD (priority 1):
-    |       - 10% of window elapsed?
-    |       - UP + DOWN < $0.975?
-    |       - Edge > fee?
-    |       --> YES: buy both sides, done for this market
-    |       |
-    |       v
-    |   Check DIRECTIONAL (priority 2):
-    |       - 8+ min elapsed?
-    |       - Spot moved > 0.2%?
-    |       - Price in [0.07, 0.93]?
-    |       - Edge > fee?
-    |       --> YES: place order
-    |
-    v
-Window expires --> settle remaining positions, update bankroll
-```
+Logging goes to `polybot.log`. Dashboard shows ladder status (rungs resting/filled, VWAP, imbalance).
 
 ---
 
-*Last updated: 2026-03-17 — multi-timeframe (5m/15m/1h), spread-first priority, early exit logic, based on 0x8dxd whale data analysis*
+*Last updated: 2026-03-18 — replaced signal-based single-order approach with passive limit order ladder system based on 0x8dxd whale analysis*
