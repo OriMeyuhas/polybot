@@ -182,7 +182,7 @@ class TrackerState:
 ```
 
 - **SpotBuffer:** Per-asset `deque(maxlen=300)` storing `(timestamp, price)` tuples — 5 minutes of history at ~1 update/sec. Exposes `record(asset, price)` and `get_price_at(asset, seconds_ago)`.
-- **active_markets:** Written by trade_poller when it sees a new market slug. Read by book_recorder (to know what to track) and settlement_tracker (to know what to watch).
+- **active_markets:** Written by trade_poller when it sees a new market slug. Read by book_recorder (to know what to track) and settlement_tracker (to know what to watch). Each entry contains: `{ condition_id, token_id_up, token_id_down, asset, timeframe, window_start_epoch, window_end_epoch }`.
 - **whale_trades:** Accumulated by trade_poller. Read by settlement_tracker to compute PnL at settlement time.
 - **spot_at_discovery:** Records the spot price when a market first enters `active_markets`. Used by settlement_tracker for `spot_at_open` (this is "spot at first whale trade", not necessarily window open — close enough and avoids the SpotBuffer lookback problem for long-window markets).
 - **seen_trade_keys:** Bounded `deque(maxlen=200)` for dedup. The activity API returns at most 50 trades, so 200 keys is more than sufficient. Older keys are automatically evicted.
