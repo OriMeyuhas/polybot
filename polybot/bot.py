@@ -302,20 +302,46 @@ class Bot:
 
             await asyncio.sleep(self.cfg.poll_interval_ms / 1000.0)
 
-    async def run_display(self):
-        """Live Rich dashboard, refreshing at 1 Hz."""
-        try:
-            from rich.console import Console
-            from rich.live import Live
-            from polybot.display import build_display
+    async def run_web_server(self):
+        """Start the FastAPI web dashboard."""
+        import uvicorn
+        from polybot.web.server import create_app
 
-            console = Console()
-            with Live(build_display(self), console=console, refresh_per_second=1) as live:
-                while True:
-                    await asyncio.sleep(1)
-                    live.update(build_display(self))
+        app = create_app(self)
+        config = uvicorn.Config(
+            app,
+            host="127.0.0.1",
+            port=self.cfg.web_port,
+            log_level="warning",
+        )
+        self._uvicorn_server = uvicorn.Server(config)
+        self._uvicorn_server.install_signal_handlers = lambda: None
+
+        broadcast_task = asyncio.create_task(app._broadcast_loop())
+        balance_task = asyncio.create_task(self._poll_wallet_balance())
+        try:
+            logger.info("Web dashboard at http://127.0.0.1:%d", self.cfg.web_port)
+            await self._uvicorn_server.serve()
         except Exception as e:
-            logger.warning("Display task disabled: %s", e)
+            logger.warning("Web server stopped: %s", e)
+        finally:
+            broadcast_task.cancel()
+            balance_task.cancel()
+
+    async def _poll_wallet_balance(self):
+        """Poll wallet USDC balance every 60s. Stores in _wallet_balance."""
+        while True:
+            try:
+                if not self.cfg.dry_run:
+                    result = await asyncio.to_thread(
+                        self.clob_client.get_balance_allowance
+                    )
+                    self._wallet_balance = float(result.get("balance", 0)) / 1e6
+                else:
+                    self._wallet_balance = self.position_manager.bankroll
+            except Exception as e:
+                logger.debug("Balance poll failed: %s", e)
+            await asyncio.sleep(60)
 
     def _settle_position(self, mid: str, market: MarketWindow, outcome: str):
         """Settle a single position: compute PnL, update risk, queue redemption."""
@@ -416,7 +442,7 @@ class Bot:
             asyncio.create_task(self.run_binance_ws()),
             asyncio.create_task(self.run_market_discovery()),
             asyncio.create_task(self.run_trading_loop()),
-            asyncio.create_task(self.run_display()),
+            asyncio.create_task(self.run_web_server()),
             asyncio.create_task(self.heartbeat.run(self.clob_client, self._on_connection_lost)),
             asyncio.create_task(self.run_settlement_poller()),
             asyncio.create_task(self.redeemer.run(self._redeem_tokens)),
@@ -427,6 +453,8 @@ class Bot:
         except asyncio.CancelledError:
             logger.info("Bot shutting down")
         finally:
+            if hasattr(self, '_uvicorn_server'):
+                self._uvicorn_server.should_exit = True
             self.order_executor.cancel_all()
             for t in tasks:
                 t.cancel()
