@@ -552,6 +552,16 @@ body {
 
 .font-data { font-family: var(--font-data); }
 
+.market-link {
+  color: var(--accent-light);
+  text-decoration: none;
+  border-bottom: 1px dotted var(--accent);
+}
+.market-link:hover {
+  color: var(--accent);
+  border-bottom-style: solid;
+}
+
 /* ---- Responsive ---- */
 
 @media (max-width: 900px) {

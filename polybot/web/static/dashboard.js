@@ -322,7 +322,7 @@
       html +=
         '<div class="spot-card">' +
           '<div class="spot-asset">' + esc(asset) + '</div>' +
-          '<div class="spot-price">$' + fmt(info.price, 0) + '</div>' +
+          '<div class="spot-price">$' + fmt(info.price, 2) + '</div>' +
           '<div class="spot-delta ' + deltaClass + '">' + esc(deltaStr) + '</div>' +
         '</div>';
     }
@@ -345,10 +345,13 @@
     var html = '';
     for (var i = 0; i < ladders.length; i++) {
       var l = ladders[i];
-      var marketLabel = esc(l.asset) + ' ' + esc(l.market_id.split('_').pop());
+      var marketText = esc(l.asset) + ' ' + esc(l.market_id.split('_').pop());
+      var marketLabel = l.condition_id && l.condition_id.startsWith('0x') && l.condition_id.length > 10
+        ? '<a href="https://polymarket.com/event/' + esc(l.condition_id) + '" target="_blank" class="market-link">' + marketText + '</a>'
+        : marketText;
       var tf          = esc(tfLabel(l.timeframe_sec));
-      var askUp       = '<span class="text-green">$' + fmt(l.ask_up, 3) + '</span>';
-      var askDn       = '<span class="text-red">$'   + fmt(l.ask_dn, 3) + '</span>';
+      var askUp       = '<span class="text-green">$' + fmt(l.ask_up, 2) + '</span>';
+      var askDn       = '<span class="text-red">$'   + fmt(l.ask_dn, 2) + '</span>';
       var fillUp      = esc(l.up_filled_count) + '/' + esc(l.up_total_rungs);
       var fillDn      = esc(l.dn_filled_count) + '/' + esc(l.dn_total_rungs);
       var pairCls     = pairClass(l.pair_cost);

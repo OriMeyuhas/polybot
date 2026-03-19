@@ -46,8 +46,10 @@ def build_state_snapshot(bot: Bot) -> dict:
         asset = market.asset if market else ""
         tf = market.timeframe_sec if market else 0
         time_left = market.remaining(now_epoch) if market else 0
+        condition_id = market.condition_id if market else ""
         ladders.append({
             "market_id": mid, "asset": asset, "timeframe_sec": tf,
+            "condition_id": condition_id,
             "up_resting": stats["up_resting"], "dn_resting": stats["dn_resting"],
             "up_filled": stats["up_filled"], "dn_filled": stats["dn_filled"],
             "up_vwap": round(stats["up_vwap"], 4), "dn_vwap": round(stats["dn_vwap"], 4),

@@ -44,6 +44,7 @@ class _MockOrderBook:
     def __init__(self, bid_price, ask_price, size=5000):
         self.bids = [_MockAsk(bid_price, size)]
         self.asks = [_MockAsk(ask_price, size)]
+        self.tick_size = "0.01"
 
 
 class MockClobClient:
@@ -57,6 +58,8 @@ class MockClobClient:
         self._assets = [
             ("BTC", "Bitcoin"),
             ("ETH", "Ethereum"),
+            ("SOL", "Solana"),
+            ("XRP", "XRP"),
         ]
         self._resting: dict[str, dict] = {}  # order_id -> order info
         self._next_id = 1
@@ -98,7 +101,7 @@ class MockClobClient:
     def create_order(self, order_args):
         return {"signed": True, "_args": order_args}
 
-    def post_order(self, signed, order_type):
+    def post_order(self, signed, orderType=None):
         order_id = f"mock-{self._next_id}"
         self._next_id += 1
         args = signed.get("_args")
@@ -128,10 +131,10 @@ class MockClobClient:
             distance = abs(order["price"] - mid)
             max_dist = 0.50
             fill_prob = self._base_fill_rate * (1.0 - distance / max_dist)
-            fill_prob = max(0.01, fill_prob)
+            fill_prob = max(0.005, fill_prob)
 
             if _random.random() < fill_prob:
-                fill_pct = _random.uniform(0.20, 1.00)
+                fill_pct = _random.uniform(0.05, 0.40)
                 fill_qty = order["remaining"] * fill_pct
                 order["remaining"] -= fill_qty
                 if order["remaining"] < 0.1:
@@ -161,6 +164,14 @@ class MockClobClient:
         for oid in order_ids:
             self.cancel(oid)
         return {"cancelled": True}
+
+    def post_heartbeat(self, heartbeat_id=None):
+        """Mock heartbeat — always succeeds."""
+        return {"heartbeat_id": heartbeat_id or "mock-heartbeat"}
+
+    def get_orders(self, params=None):
+        """Alias for get_open_orders (real API name)."""
+        return self.get_open_orders()
 
     def get_balance_allowance(self, params=None):
         return {"balance": 1_000_000_000}  # $1000 USDC (6 decimals)
