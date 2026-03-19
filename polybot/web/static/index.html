@@ -1,4 +1,67 @@
 <!DOCTYPE html>
-<html><head><title>PolyBot</title></head>
-<body><h1>PolyBot Dashboard</h1><p>Loading...</p></body>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PolyBot Dashboard</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div id="disconnect-banner">DISCONNECTED — reconnecting...</div>
+
+    <div class="header" id="header">
+        <h1>POLYBOT</h1>
+        <span class="badge" id="mode-badge">--</span>
+        <span class="badge badge-cancel" id="cancel-badge" style="display:none">CANCEL ONLY</span>
+        <span class="badge badge-halted" id="halted-badge" style="display:none">HALTED</span>
+        <div class="stat"><div class="stat-label">Uptime</div><div class="stat-value" id="uptime">--</div></div>
+        <div class="stat"><div class="stat-label">Bankroll</div><div class="stat-value" id="bankroll">--</div></div>
+        <div class="stat"><div class="stat-label">Daily PnL</div><div class="stat-value" id="pnl">--</div></div>
+        <div class="stat"><div class="stat-label">Heartbeat</div><div class="stat-value"><span class="dot" id="hb-dot"></span></div></div>
+        <div class="stat"><div class="stat-label">Wallet</div><div class="stat-value" id="wallet-balance">--</div></div>
+    </div>
+
+    <div class="spots" id="spots"></div>
+
+    <div class="grid-2">
+        <div class="panel">
+            <div class="panel-title">Active Ladders</div>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Market</th><th>TF</th><th>Resting</th><th>Filled</th>
+                        <th>VWAP UP</th><th>VWAP DN</th><th>Pair Cost</th><th>Imbal</th><th>Time</th>
+                    </tr>
+                </thead>
+                <tbody id="ladders-body"></tbody>
+            </table>
+        </div>
+
+        <div>
+            <div class="panel">
+                <div class="panel-title">Positions</div>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Market</th><th>UP Qty</th><th>DN Qty</th>
+                            <th>PnL if UP</th><th>PnL if DN</th><th>Worst</th>
+                        </tr>
+                    </thead>
+                    <tbody id="positions-body"></tbody>
+                </table>
+            </div>
+            <div class="panel">
+                <div class="panel-title">Wallet</div>
+                <div id="wallet-detail" class="text-muted">--</div>
+            </div>
+        </div>
+    </div>
+
+    <div class="panel">
+        <div class="panel-title">Activity</div>
+        <div id="activity-feed"></div>
+    </div>
+
+    <script src="/static/dashboard.js"></script>
+</body>
 </html>
