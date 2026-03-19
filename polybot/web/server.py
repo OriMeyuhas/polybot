@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -70,6 +70,7 @@ def build_state_snapshot(bot: Bot) -> dict:
         pnl_dn = pos.profit_if_down()
         positions.append({
             "market_id": mid, "asset": asset,
+            "timeframe_sec": market.timeframe_sec if market else 0,
             "up_qty": round(pos.up_qty, 2), "up_cost": round(pos.up_cost, 2),
             "dn_qty": round(pos.dn_qty, 2), "dn_cost": round(pos.dn_cost, 2),
             "pnl_if_up": round(pnl_up, 2), "pnl_if_down": round(pnl_dn, 2),
@@ -81,6 +82,8 @@ def build_state_snapshot(bot: Bot) -> dict:
         activity.append({"ts": ev.timestamp, "type": ev.event_type, "asset": ev.asset, "detail": ev.detail, "pnl": ev.pnl})
 
     deployed = bot.ladder_manager.total_committed()
+    in_positions = bot.position_manager.total_position_cost()
+    on_orders = max(0.0, deployed - in_positions)
     balance = getattr(bot, "_wallet_balance", None)
     if balance is None:
         balance = bot.position_manager.bankroll if cfg.dry_run else 0.0
@@ -94,7 +97,13 @@ def build_state_snapshot(bot: Bot) -> dict:
         except Exception:
             address = "unknown"
 
-    wallet = {"address": address, "usdc_balance": round(balance, 2), "deployed": round(deployed, 2), "available": round(balance - deployed, 2)}
+    wallet = {
+        "address": address,
+        "usdc_balance": round(balance, 2),
+        "on_orders": round(on_orders, 2),
+        "in_positions": round(in_positions, 2),
+        "available": round(balance - deployed, 2),
+    }
 
     return {
         "mode": "dry_run" if cfg.dry_run else "live",
@@ -104,6 +113,7 @@ def build_state_snapshot(bot: Bot) -> dict:
         "heartbeat_healthy": bot.heartbeat.is_healthy() if bot.heartbeat else True,
         "cancel_only_mode": bot._cancel_only_mode,
         "risk_halted": bot.risk_manager.is_halted(),
+        "trade_count": bot._trade_count,
         "wallet": wallet, "spots": spots, "ladders": ladders, "positions": positions,
         "pending_settlements": list(bot.position_manager.get_pending_settlements()),
         "failed_settlements": list(bot.position_manager.get_failed_settlements()),
@@ -127,6 +137,29 @@ def create_app(bot: Bot) -> FastAPI:
     async def api_balance():
         snapshot = build_state_snapshot(bot)
         return JSONResponse(snapshot["wallet"])
+
+    @app.post("/api/start")
+    async def api_start():
+        bot._cancel_only_mode = False
+        return JSONResponse({"status": "running"})
+
+    @app.post("/api/stop")
+    async def api_stop():
+        bot._cancel_only_mode = True
+        bot._pending_cancel_all = True
+        return JSONResponse({"status": "stopped"})
+
+    @app.post("/api/set-bankroll")
+    async def api_set_bankroll(request: Request):
+        if not bot.cfg.dry_run:
+            return JSONResponse({"error": "Cannot set bankroll in live mode"}, status_code=403)
+        body = await request.json()
+        bankroll = float(body.get("bankroll", 0))
+        if bankroll <= 0:
+            return JSONResponse({"error": "Bankroll must be positive"}, status_code=400)
+        bot.position_manager.bankroll = bankroll
+        bot.risk_manager.starting_bankroll = bankroll
+        return JSONResponse({"status": "ok", "bankroll": bankroll})
 
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 

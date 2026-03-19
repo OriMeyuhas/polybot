@@ -141,7 +141,7 @@ async def test_api_balance_endpoint():
         assert resp.status_code == 200
         data = resp.json()
         assert "usdc_balance" in data
-        assert "deployed" in data
+        assert "on_orders" in data
 
 
 @pytest.mark.asyncio
@@ -153,3 +153,83 @@ async def test_index_serves_html():
         resp = await client.get("/")
         assert resp.status_code == 200
         assert "text/html" in resp.headers["content-type"]
+
+
+def test_snapshot_wallet_split():
+    bot = _make_bot()
+    bot.position_manager.update_position("m1", Side.UP, 50.0, 20.0)
+    bot.ladder_manager.total_committed.return_value = 30.0
+    snap = build_state_snapshot(bot)
+    w = snap["wallet"]
+    assert "on_orders" in w
+    assert "in_positions" in w
+    assert w["in_positions"] == 20.0
+    assert w["on_orders"] == 10.0
+    assert "deployed" not in w
+
+
+def test_snapshot_trade_count():
+    bot = _make_bot()
+    bot._trade_count = 42
+    snap = build_state_snapshot(bot)
+    assert snap["trade_count"] == 42
+
+
+def test_snapshot_position_has_timeframe():
+    bot = _make_bot()
+    bot.position_manager.update_position("m1", Side.UP, 50.0, 20.0)
+    now = int(time.time())
+    bot.active_markets = [
+        MarketWindow("m1", "0xcond", "BTC", 900, "up", "dn", now - 300, now + 600)
+    ]
+    snap = build_state_snapshot(bot)
+    assert snap["positions"][0]["timeframe_sec"] == 900
+
+
+@pytest.mark.asyncio
+async def test_api_start_endpoint():
+    bot = _make_bot()
+    bot._cancel_only_mode = True
+    app = create_app(bot)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post("/api/start")
+        assert resp.status_code == 200
+        assert bot._cancel_only_mode is False
+
+
+@pytest.mark.asyncio
+async def test_api_stop_endpoint():
+    bot = _make_bot()
+    bot._cancel_only_mode = False
+    bot._pending_cancel_all = False
+    app = create_app(bot)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post("/api/stop")
+        assert resp.status_code == 200
+        assert bot._cancel_only_mode is True
+        assert bot._pending_cancel_all is True
+
+
+@pytest.mark.asyncio
+async def test_api_set_bankroll_dry_run():
+    bot = _make_bot()
+    app = create_app(bot)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post("/api/set-bankroll", json={"bankroll": 5000.0})
+        assert resp.status_code == 200
+        assert bot.position_manager.bankroll == 5000.0
+        assert bot.risk_manager.starting_bankroll == 5000.0
+
+
+@pytest.mark.asyncio
+async def test_api_set_bankroll_live_rejected():
+    bot = _make_bot()
+    bot.cfg = BotConfig(dry_run=False, private_key="0xfake")
+    app = create_app(bot)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post("/api/set-bankroll", json={"bankroll": 5000.0})
+        assert resp.status_code == 403
