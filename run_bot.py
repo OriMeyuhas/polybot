@@ -145,6 +145,23 @@ class MockClobClient:
         self._resting.clear()
         return {"cancelled": True}
 
+    def get_tick_size(self, condition_id):
+        """Return default tick size for any market."""
+        return 0.01
+
+    def post_orders(self, signed_orders):
+        """Batch-post orders by delegating to post_order for each."""
+        results = []
+        for signed in signed_orders:
+            results.append(self.post_order(signed, order_type="GTC"))
+        return results
+
+    def cancel_orders(self, order_ids):
+        """Batch-cancel orders by delegating to cancel for each."""
+        for oid in order_ids:
+            self.cancel(oid)
+        return {"cancelled": True}
+
     def get_balance_allowance(self, params=None):
         return {"balance": 1_000_000_000}  # $1000 USDC (6 decimals)
 
