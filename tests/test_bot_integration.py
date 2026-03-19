@@ -17,6 +17,7 @@ def cfg():
         ladder_spacing=0.02,
         ladder_width=0.06,
         ladder_size_skew=1.5,
+        start_paused=False,
     )
 
 
@@ -141,7 +142,8 @@ class TestConnectionLost:
 
         bot.ladder_manager.cleanup_ladder.assert_called_once_with("m1")
         bot.order_tracker.mark_all_unknown.assert_called_once()
-        assert bot._cancel_only_mode is False
+        # _cancel_only_mode is preserved (user's stop intent not overridden)
+        assert bot._cancel_only_mode is True
 
 
 class TestFindMarket:

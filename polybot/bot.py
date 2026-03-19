@@ -55,7 +55,9 @@ class Bot:
         self.window_open_prices: dict[str, float] = {}
         self.active_markets: list[MarketWindow] = []
         self._snapped_windows: set[str] = set()
-        self._cancel_only_mode = False
+        self._cancel_only_mode = cfg.start_paused
+        self._prev_cancel_only = cfg.start_paused
+        self._pending_cancel_all = False
         self.heartbeat = None  # set in run()
         self._last_status_time: float = 0.0
         self._trade_count: int = 0
@@ -172,7 +174,6 @@ class Bot:
         for mid in list(self.ladder_manager.ladders.keys()):
             self.ladder_manager.cleanup_ladder(mid)
         self.order_tracker.mark_all_unknown()
-        self._cancel_only_mode = False
 
     async def run_binance_ws(self):
         """Connect to Binance combined stream for real-time spot prices."""
@@ -224,6 +225,16 @@ class Bot:
                 await asyncio.sleep(self.cfg.poll_interval_ms / 1000.0)
                 continue
 
+            # Handle pending cancel-all from /api/stop
+            if self._pending_cancel_all:
+                self.ladder_manager.cancel_all_ladders()
+                self._pending_cancel_all = False
+
+            # Detect resume transition (stopped -> running)
+            if self._prev_cancel_only and not self._cancel_only_mode:
+                self.ladder_manager.clear_cancelled_ladders()
+            self._prev_cancel_only = self._cancel_only_mode
+
             now = int(time.time())
 
             # Snapshot open prices for new windows
@@ -263,22 +274,29 @@ class Bot:
                 )
 
             # 3. Check fills on all active ladders
-            fills = await asyncio.to_thread(self.ladder_manager.check_fills)
-            if fills > 0:
-                self._trade_count += fills
-                # Record fill activity for the most recent fills
-                for market in self.active_markets:
-                    mid = market.market_id
-                    stats = self.ladder_manager.get_ladder_stats(mid)
-                    if stats["up_filled"] > 0 or stats["dn_filled"] > 0:
-                        combined = stats["combined_vwap"]
-                        if combined > 0:
-                            self._record_activity(
-                                "FILL", market.asset,
-                                f"UP:{stats['up_filled']:.0f}@${stats['up_vwap']:.2f} "
-                                f"DN:{stats['dn_filled']:.0f}@${stats['dn_vwap']:.2f} "
-                                f"combined=${combined:.3f}",
-                            )
+            filled_orders = await asyncio.to_thread(self.ladder_manager.check_fills)
+            if filled_orders:
+                self._trade_count += len(filled_orders)
+                # Group new fills by market for activity log
+                fills_by_market: dict[str, list] = {}
+                for order in filled_orders:
+                    fills_by_market.setdefault(order.market_id, []).append(order)
+                for mid, orders in fills_by_market.items():
+                    market = market_map.get(mid)
+                    if not market:
+                        continue
+                    up_qty = sum(o.size for o in orders if o.side == Side.UP)
+                    dn_qty = sum(o.size for o in orders if o.side == Side.DOWN)
+                    up_cost = sum(o.size * o.price for o in orders if o.side == Side.UP)
+                    dn_cost = sum(o.size * o.price for o in orders if o.side == Side.DOWN)
+                    parts = []
+                    if up_qty > 0:
+                        parts.append(f"UP:{up_qty:.0f}@${up_cost/up_qty:.2f}")
+                    if dn_qty > 0:
+                        parts.append(f"DN:{dn_qty:.0f}@${dn_cost/dn_qty:.2f}")
+                    if up_qty > 0 and dn_qty > 0:
+                        parts.append(f"combined=${up_cost/up_qty + dn_cost/dn_qty:.3f}")
+                    self._record_activity("FILL", market.asset, " ".join(parts))
 
             # 4. Imbalance guard
             self.ladder_manager.check_imbalance(now)
@@ -322,6 +340,8 @@ class Bot:
         try:
             logger.info("Web dashboard at http://127.0.0.1:%d", self.cfg.web_port)
             await self._uvicorn_server.serve()
+        except SystemExit:
+            logger.warning("Web server failed to start (port %d likely in use)", self.cfg.web_port)
         except Exception as e:
             logger.warning("Web server stopped: %s", e)
         finally:
@@ -344,7 +364,7 @@ class Bot:
             await asyncio.sleep(60)
 
     def _settle_position(self, mid: str, market: MarketWindow, outcome: str):
-        """Settle a single position: compute PnL, update risk, queue redemption."""
+        """Settle a single position: compute PnL, update risk/bankroll, queue redemption."""
         pos = self.position_manager.positions.get(mid)
         if pos:
             if outcome in ("UP", "YES"):
@@ -354,6 +374,8 @@ class Bot:
 
             logger.info("Settled %s: %s, PnL=$%.2f", mid, outcome, pnl)
             self.risk_manager.update_pnl(pnl)
+            # Credit realized PnL back to bankroll so capital is available for new trades
+            self.position_manager.bankroll += pnl
             self._record_activity("SETTLE", market.asset, f"{outcome} PnL=${pnl:.2f}", pnl=pnl)
 
             self.redeemer.queue_redemption(
