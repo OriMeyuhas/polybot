@@ -194,3 +194,39 @@ class TestCleanup:
         assert "o1" not in tracker.orders
         assert "o2" not in tracker.orders
         assert "m1" not in tracker._by_market
+
+
+class TestFilledCount:
+    def test_filled_count_only_fully_filled(self):
+        tracker = OrderTracker()
+        tracker.add(TrackedOrder(order_id="o1", market_id="m1", token_id="t", side=Side.UP, price=0.45, size=10.0))
+        tracker.add(TrackedOrder(order_id="o2", market_id="m1", token_id="t", side=Side.UP, price=0.46, size=10.0))
+        tracker.update_fill("o1", 10.0)  # fully filled
+        tracker.update_fill("o2", 3.0)   # partial
+        assert tracker.filled_count("m1", Side.UP) == 1  # only o1
+
+    def test_filled_count_excludes_other_side(self):
+        tracker = OrderTracker()
+        tracker.add(TrackedOrder(order_id="o1", market_id="m1", token_id="t", side=Side.UP, price=0.45, size=10.0))
+        tracker.add(TrackedOrder(order_id="o2", market_id="m1", token_id="t", side=Side.DOWN, price=0.48, size=10.0))
+        tracker.update_fill("o1", 10.0)
+        tracker.update_fill("o2", 10.0)
+        assert tracker.filled_count("m1", Side.UP) == 1
+        assert tracker.filled_count("m1", Side.DOWN) == 1
+
+
+class TestTotalCount:
+    def test_total_count_excludes_cancelled(self):
+        tracker = OrderTracker()
+        tracker.add(TrackedOrder(order_id="o1", market_id="m1", token_id="t", side=Side.UP, price=0.45, size=10.0))
+        tracker.add(TrackedOrder(order_id="o2", market_id="m1", token_id="t", side=Side.UP, price=0.46, size=10.0))
+        tracker.add(TrackedOrder(order_id="o3", market_id="m1", token_id="t", side=Side.UP, price=0.47, size=10.0))
+        tracker.cancel("o3")
+        assert tracker.total_count("m1", Side.UP) == 2
+
+    def test_total_count_includes_filled_and_resting(self):
+        tracker = OrderTracker()
+        tracker.add(TrackedOrder(order_id="o1", market_id="m1", token_id="t", side=Side.UP, price=0.45, size=10.0))
+        tracker.add(TrackedOrder(order_id="o2", market_id="m1", token_id="t", side=Side.UP, price=0.46, size=10.0))
+        tracker.update_fill("o1", 10.0)  # filled
+        assert tracker.total_count("m1", Side.UP) == 2

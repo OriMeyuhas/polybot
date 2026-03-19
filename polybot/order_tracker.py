@@ -101,6 +101,24 @@ class OrderTracker:
                 total += o.filled * o.price
         return total
 
+    def filled_count(self, market_id: str, side: Side) -> int:
+        """Count of fully filled orders for a side."""
+        count = 0
+        for oid in self._by_market.get(market_id, []):
+            o = self.orders.get(oid)
+            if o and o.side == side and o.status == "filled":
+                count += 1
+        return count
+
+    def total_count(self, market_id: str, side: Side) -> int:
+        """Count of active orders (resting + partial + filled, excl. cancelled)."""
+        count = 0
+        for oid in self._by_market.get(market_id, []):
+            o = self.orders.get(oid)
+            if o and o.side == side and o.status in ("resting", "partial", "filled"):
+                count += 1
+        return count
+
     def has_orders(self, market_id: str) -> bool:
         return len(self.get_resting(market_id)) > 0
 
