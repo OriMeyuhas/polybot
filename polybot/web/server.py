@@ -2,11 +2,23 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
+import logging
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 if TYPE_CHECKING:
     from polybot.bot import Bot
+
+log = logging.getLogger(__name__)
+
+STATIC_DIR = Path(__file__).parent / "static"
 
 
 def build_state_snapshot(bot: Bot) -> dict:
@@ -91,3 +103,60 @@ def build_state_snapshot(bot: Bot) -> dict:
         "failed_settlements": list(bot.position_manager.get_failed_settlements()),
         "activity": activity,
     }
+
+
+def create_app(bot: Bot) -> FastAPI:
+    """Create the FastAPI application with REST and WebSocket endpoints."""
+    app = FastAPI(title="PolyBot Dashboard")
+
+    @app.get("/")
+    async def index():
+        return FileResponse(str(STATIC_DIR / "index.html"))
+
+    @app.get("/api/state")
+    async def api_state():
+        return JSONResponse(build_state_snapshot(bot))
+
+    @app.get("/api/balance")
+    async def api_balance():
+        snapshot = build_state_snapshot(bot)
+        return JSONResponse(snapshot["wallet"])
+
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+    connected: list[WebSocket] = []
+
+    @app.websocket("/ws")
+    async def ws_endpoint(websocket: WebSocket):
+        await websocket.accept()
+        connected.append(websocket)
+        try:
+            while True:
+                await websocket.receive_text()
+        except WebSocketDisconnect:
+            pass
+        finally:
+            if websocket in connected:
+                connected.remove(websocket)
+
+    async def broadcast_loop():
+        """Push state to all connected WebSocket clients at 1Hz."""
+        while True:
+            if connected:
+                snapshot = build_state_snapshot(bot)
+                payload = json.dumps(snapshot)
+                dead = []
+                for ws in list(connected):
+                    try:
+                        await ws.send_text(payload)
+                    except Exception:
+                        dead.append(ws)
+                for ws in dead:
+                    try:
+                        connected.remove(ws)
+                    except ValueError:
+                        pass
+            await asyncio.sleep(1.0)
+
+    app._broadcast_loop = broadcast_loop  # type: ignore[attr-defined]
+    return app

@@ -3,12 +3,15 @@ import time
 from collections import deque
 from unittest.mock import MagicMock
 
+import pytest
+from httpx import AsyncClient, ASGITransport
+
 from polybot.config import BotConfig
 from polybot.types import ActivityEvent, Position, MarketWindow, Side
 from polybot.position_manager import PositionManager
 from polybot.risk_manager import RiskManager
 from polybot.order_tracker import OrderTracker
-from polybot.web.server import build_state_snapshot
+from polybot.web.server import build_state_snapshot, create_app
 
 
 def _make_bot(cfg=None, bankroll=10000.0):
@@ -109,3 +112,41 @@ def test_snapshot_ladders_with_time_left():
     assert lad["asset"] == "BTC"
     assert lad["pair_cost"] == 0.85
     assert lad["time_left_sec"] > 500
+
+
+@pytest.mark.asyncio
+async def test_api_state_endpoint():
+    bot = _make_bot()
+    app = create_app(bot)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/api/state")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["mode"] == "dry_run"
+        assert "spots" in data
+        assert "ladders" in data
+
+
+@pytest.mark.asyncio
+async def test_api_balance_endpoint():
+    bot = _make_bot()
+    app = create_app(bot)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/api/balance")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "usdc_balance" in data
+        assert "deployed" in data
+
+
+@pytest.mark.asyncio
+async def test_index_serves_html():
+    bot = _make_bot()
+    app = create_app(bot)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/")
+        assert resp.status_code == 200
+        assert "text/html" in resp.headers["content-type"]
