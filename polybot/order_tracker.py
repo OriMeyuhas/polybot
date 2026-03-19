@@ -33,7 +33,7 @@ class OrderTracker:
         if order is None:
             return
         order.filled += filled_qty
-        if order.filled >= order.size - 0.001:
+        if order.filled >= order.size * 0.999:
             order.filled = order.size
             order.status = "filled"
         else:
@@ -109,6 +109,31 @@ class OrderTracker:
             oid for oid, o in self.orders.items()
             if o.status in ("resting", "partial")
         }
+
+    def mark_all_unknown(self) -> None:
+        for order in self.orders.values():
+            if order.status not in ("filled",):
+                order.status = "unknown"
+
+    def reconcile(self, open_orders: list[dict]) -> dict:
+        exchange_ids = {o.get("id", o.get("orderID", "")) for o in open_orders}
+        filled = []
+        reverted = []
+        for order in list(self.orders.values()):
+            if order.status == "filled":
+                continue
+            on_exchange = order.order_id in exchange_ids
+            if not on_exchange and order.status in ("resting", "unknown", "partial"):
+                fill_qty = order.size - order.filled
+                if fill_qty > 0:
+                    self.update_fill(order.order_id, fill_qty)
+                    filled.append(order)
+            elif on_exchange and order.status in ("cancelled", "unknown"):
+                order.status = "resting"
+                reverted.append(order.order_id)
+        our_ids = set(self.orders.keys())
+        orphaned = [oid for oid in exchange_ids if oid and oid not in our_ids]
+        return {"filled": filled, "reverted": reverted, "orphaned": orphaned}
 
     def cleanup_market(self, market_id: str) -> None:
         """Remove all orders for a settled/expired market."""

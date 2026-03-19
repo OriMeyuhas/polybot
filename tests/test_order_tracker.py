@@ -105,6 +105,87 @@ class TestCancel:
         assert len(cancelled) == 0  # already filled, not cancelled
 
 
+class TestMarkAllUnknown:
+    def test_filled_stays_filled(self, tracker):
+        tracker.add(_make_order("o1", size=10.0))
+        tracker.update_fill("o1", 10.0)
+        tracker.mark_all_unknown()
+        assert tracker.orders["o1"].status == "filled"
+
+    def test_resting_becomes_unknown(self, tracker):
+        tracker.add(_make_order("o1"))
+        tracker.mark_all_unknown()
+        assert tracker.orders["o1"].status == "unknown"
+
+    def test_cancelled_becomes_unknown(self, tracker):
+        tracker.add(_make_order("o1"))
+        tracker.cancel("o1")
+        tracker.mark_all_unknown()
+        assert tracker.orders["o1"].status == "unknown"
+
+
+class TestReconcile:
+    def test_filled_detection(self, tracker):
+        """Order not on exchange and resting -> filled."""
+        tracker.add(_make_order("o1", size=10.0))
+        result = tracker.reconcile([])  # no open orders on exchange
+        assert len(result["filled"]) == 1
+        assert tracker.orders["o1"].status == "filled"
+        assert tracker.orders["o1"].filled == 10.0
+
+    def test_reverted_detection(self, tracker):
+        """Order on exchange but cancelled locally -> reverted to resting."""
+        tracker.add(_make_order("o1"))
+        tracker.cancel("o1")
+        result = tracker.reconcile([{"id": "o1"}])
+        assert "o1" in result["reverted"]
+        assert tracker.orders["o1"].status == "resting"
+
+    def test_orphan_detection(self, tracker):
+        """Order on exchange but not in our tracker -> orphaned."""
+        tracker.add(_make_order("o1"))
+        result = tracker.reconcile([{"id": "o1"}, {"id": "o_orphan"}])
+        assert "o_orphan" in result["orphaned"]
+
+    def test_unknown_order_not_on_exchange_filled(self, tracker):
+        """Unknown order not on exchange -> filled."""
+        tracker.add(_make_order("o1", size=10.0))
+        tracker.mark_all_unknown()
+        result = tracker.reconcile([])
+        assert len(result["filled"]) == 1
+        assert tracker.orders["o1"].status == "filled"
+
+    def test_unknown_order_on_exchange_reverted(self, tracker):
+        """Unknown order still on exchange -> reverted to resting."""
+        tracker.add(_make_order("o1"))
+        tracker.mark_all_unknown()
+        result = tracker.reconcile([{"id": "o1"}])
+        assert "o1" in result["reverted"]
+        assert tracker.orders["o1"].status == "resting"
+
+
+class TestFillThreshold:
+    def test_relative_threshold_large_order(self, tracker):
+        """For a 1000-size order, filling 999.5 should count as filled (>= 999.0)."""
+        tracker.add(_make_order("o1", size=1000.0))
+        tracker.update_fill("o1", 999.5)
+        assert tracker.orders["o1"].status == "filled"
+        assert tracker.orders["o1"].filled == 1000.0
+
+    def test_relative_threshold_small_order(self, tracker):
+        """For a 5-size order, filling 4.996 should count as filled (>= 4.995)."""
+        tracker.add(_make_order("o1", size=5.0))
+        tracker.update_fill("o1", 4.996)
+        assert tracker.orders["o1"].status == "filled"
+        assert tracker.orders["o1"].filled == 5.0
+
+    def test_below_threshold_not_filled(self, tracker):
+        """For a 1000-size order, filling 998 should NOT count as filled (< 999.0)."""
+        tracker.add(_make_order("o1", size=1000.0))
+        tracker.update_fill("o1", 998.0)
+        assert tracker.orders["o1"].status == "partial"
+
+
 class TestCleanup:
     def test_cleanup_removes_all(self, tracker):
         tracker.add(_make_order("o1"))
