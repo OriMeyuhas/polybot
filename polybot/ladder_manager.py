@@ -97,10 +97,13 @@ class LadderManager:
         if not self.risk.can_open_position(self.positions.active_position_count()):
             return 0
 
+        # Select timeframe-specific ladder parameters
+        lp = self.cfg.get_ladder_params(market.timeframe_sec)
+
         # Don't commit more capital than available bankroll
         available = self.positions.bankroll - self._total_committed()
         budget = min(
-            self.positions.bankroll * self.cfg.position_size_fraction,
+            self.positions.bankroll * lp.position_size_fraction,
             available,
         )
         if budget < 1.0:
@@ -112,23 +115,21 @@ class LadderManager:
 
         up_rungs = build_ladder_rungs(
             best_ask_up, budget_per_side,
-            self.cfg.ladder_rungs, self.cfg.ladder_spacing,
-            self.cfg.ladder_width, self.cfg.ladder_size_skew,
+            lp.rungs, lp.spacing, lp.width, lp.size_skew,
         )
         dn_rungs = build_ladder_rungs(
             best_ask_dn, budget_per_side,
-            self.cfg.ladder_rungs, self.cfg.ladder_spacing,
-            self.cfg.ladder_width, self.cfg.ladder_size_skew,
+            lp.rungs, lp.spacing, lp.width, lp.size_skew,
         )
 
         # Pair cost guard: check if worst-case combined VWAP exceeds max_pair_cost
         if up_rungs and dn_rungs:
             up_vwap = sum(p * s for p, s in up_rungs) / sum(s for _, s in up_rungs)
             dn_vwap = sum(p * s for p, s in dn_rungs) / sum(s for _, s in dn_rungs)
-            if up_vwap + dn_vwap > self.cfg.max_pair_cost:
+            if up_vwap + dn_vwap > lp.max_pair_cost:
                 logger.info(
                     "Pair cost guard: %s combined VWAP %.4f > %.4f, skipping",
-                    market.market_id, up_vwap + dn_vwap, self.cfg.max_pair_cost,
+                    market.market_id, up_vwap + dn_vwap, lp.max_pair_cost,
                 )
                 return 0
 
@@ -239,8 +240,11 @@ class LadderManager:
             if not up_moved and not dn_moved:
                 continue
 
+            # Select timeframe-specific ladder parameters
+            lp = self.cfg.get_ladder_params(market.timeframe_sec)
+
             # Budget for reprice: only the REMAINING unfilled portion
-            total_budget = self.positions.bankroll * self.cfg.position_size_fraction
+            total_budget = self.positions.bankroll * lp.position_size_fraction
             available = self.positions.bankroll - self._total_committed()
             budget_per_side = min(total_budget / 2.0, max(0, available / 2.0))
             if budget_per_side < 1.0:
@@ -263,8 +267,7 @@ class LadderManager:
                 if side_budget >= 1.0:
                     up_rungs = build_ladder_rungs(
                         best_ask_up, side_budget,
-                        self.cfg.ladder_rungs, self.cfg.ladder_spacing,
-                        self.cfg.ladder_width, self.cfg.ladder_size_skew,
+                        lp.rungs, lp.spacing, lp.width, lp.size_skew,
                     )
                     new_committed = 0.0
                     for price, size in up_rungs:
@@ -298,8 +301,7 @@ class LadderManager:
                 if side_budget >= 1.0:
                     dn_rungs = build_ladder_rungs(
                         best_ask_dn, side_budget,
-                        self.cfg.ladder_rungs, self.cfg.ladder_spacing,
-                        self.cfg.ladder_width, self.cfg.ladder_size_skew,
+                        lp.rungs, lp.spacing, lp.width, lp.size_skew,
                     )
                     new_committed = 0.0
                     for price, size in dn_rungs:
@@ -371,67 +373,8 @@ class LadderManager:
         return acted
 
     def check_early_exits(self, markets: dict[str, MarketWindow]) -> list[dict]:
-        """Check if any spread positions should be exited early. Returns list of exit actions."""
-        exits = []
-        for mid, state in list(self.ladders.items()):
-            pos = self.positions.positions.get(mid)
-            if pos is None or not (pos.up_qty > 0 and pos.dn_qty > 0):
-                continue
-
-            market = markets.get(mid)
-            if market is None:
-                continue
-
-            best_ask_up = self.executor.get_best_ask(market.up_token_id)
-            best_ask_dn = self.executor.get_best_ask(market.dn_token_id)
-
-            avg_up = pos.up_cost / pos.up_qty if pos.up_qty > 0 else 1.0
-            avg_dn = pos.dn_cost / pos.dn_qty if pos.dn_qty > 0 else 1.0
-
-            up_gain = (best_ask_up - avg_up) / avg_up if avg_up > 0 else 0.0
-            dn_gain = (best_ask_dn - avg_dn) / avg_dn if avg_dn > 0 else 0.0
-
-            threshold = self.cfg.early_exit_profit_pct
-            exit_side = None
-
-            if up_gain >= threshold and up_gain > dn_gain:
-                exit_side = Side.UP
-                sell_price = best_ask_up
-                pnl = pos.up_qty * sell_price - pos.up_cost
-            elif dn_gain >= threshold and dn_gain > up_gain:
-                exit_side = Side.DOWN
-                sell_price = best_ask_dn
-                pnl = pos.dn_qty * sell_price - pos.dn_cost
-            else:
-                continue
-
-            # Cancel remaining resting orders for this market
-            cancelled = self.tracker.cancel_market(mid)
-            for oid in cancelled:
-                self.executor.cancel_order(oid)
-
-            # Book profit
-            old_bankroll = self.positions.bankroll
-            self.positions.update_bankroll(old_bankroll + pnl)
-            self.risk.update_pnl(pnl)
-            self.positions.remove_position(mid)
-            self.ladders.pop(mid, None)
-            self.tracker.cleanup_market(mid)
-
-            exits.append({
-                "type": "early_exit",
-                "market_id": mid,
-                "asset": state.asset,
-                "exit_side": exit_side,
-                "sell_price": sell_price,
-                "pnl": pnl,
-            })
-            logger.info(
-                "EARLY EXIT: %s — sold %s @ $%.2f, pnl=$%.2f",
-                mid, exit_side.value, sell_price, pnl,
-            )
-
-        return exits
+        """Early exit removed — settlement handles position closure."""
+        return []
 
     def cancel_ladder(self, market_id: str) -> int:
         """Cancel all unfilled orders for a market. Returns count cancelled."""

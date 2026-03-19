@@ -49,6 +49,7 @@ class Bot:
         self.window_open_prices: dict[str, float] = {}
         self.active_markets: list[MarketWindow] = []
         self._snapped_windows: set[str] = set()
+        self._exited_markets: set[str] = set()  # markets we already exited — don't re-enter
         self._last_status_time: float = 0.0
         self._trade_count: int = 0
         self._start_time: float = time.time()
@@ -80,6 +81,7 @@ class Bot:
         stale = self._snapped_windows - active_ids
         for mid in stale:
             self._snapped_windows.discard(mid)
+        self._exited_markets -= stale  # allow re-entry on future windows
 
     def _log_status(self, now_epoch: int):
         """Print a periodic status summary."""
@@ -168,40 +170,8 @@ class Bot:
             self._snapped_windows.discard(mid)
 
     def _check_stop_losses(self, now_epoch: int):
-        """Stop-loss check for one-sided (directional) positions."""
-        for market in self.active_markets:
-            if not market.is_active(now_epoch):
-                continue
-            if market.market_id not in self.position_manager.positions:
-                continue
-            pos = self.position_manager.positions[market.market_id]
-            is_directional = (pos.up_qty > 0) != (pos.dn_qty > 0)
-            if not is_directional:
-                continue
-            spot_delta = self.compute_spot_delta(market.asset)
-            holding_up = pos.up_qty > 0
-            if holding_up and spot_delta < -self.cfg.stop_loss_reversal:
-                logger.warning(
-                    "STOP LOSS: %s — holding UP but delta=%.4f, exiting",
-                    market.market_id, spot_delta,
-                )
-                self._record_activity(
-                    "STOP_LOSS", market.asset,
-                    f"held UP, delta={spot_delta:+.4f}",
-                )
-                self.position_manager.remove_position(market.market_id)
-                self.ladder_manager.cleanup_ladder(market.market_id)
-            elif not holding_up and spot_delta > self.cfg.stop_loss_reversal:
-                logger.warning(
-                    "STOP LOSS: %s — holding DOWN but delta=+%.4f, exiting",
-                    market.market_id, spot_delta,
-                )
-                self._record_activity(
-                    "STOP_LOSS", market.asset,
-                    f"held DN, delta={spot_delta:+.4f}",
-                )
-                self.position_manager.remove_position(market.market_id)
-                self.ladder_manager.cleanup_ladder(market.market_id)
+        """Stop-loss check — removed, will be replaced by settlement-aware logic."""
+        pass
 
     async def run_binance_ws(self):
         """Connect to Binance combined stream for real-time spot prices."""
@@ -263,11 +233,13 @@ class Bot:
             # Build market lookup
             market_map = {m.market_id: m for m in self.active_markets}
 
-            # 1. Post ladders on new markets (no existing ladder)
+            # 1. Post ladders on new markets (no existing ladder, not already exited)
             for market in self.active_markets:
                 if not market.is_active(now):
                     continue
                 if self.ladder_manager.has_ladder(market.market_id):
+                    continue
+                if market.market_id in self._exited_markets:
                     continue
                 elapsed_pct = market.elapsed(now) / market.timeframe_sec
                 if elapsed_pct >= 0.10:
@@ -311,6 +283,7 @@ class Bot:
                 self.ladder_manager.check_early_exits, market_map
             )
             for ex in exits:
+                self._exited_markets.add(ex["market_id"])
                 self._record_activity(
                     "EARLY_EXIT", ex["asset"],
                     f"sold {ex['exit_side'].value}@${ex['sell_price']:.2f}",

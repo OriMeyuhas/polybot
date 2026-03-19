@@ -110,20 +110,20 @@ class TestSettlement:
 
 
 class TestStopLoss:
-    def test_stop_loss_on_up_reversal(self, cfg, market, mock_clob):
+    def test_stop_loss_is_noop(self, cfg, market, mock_clob):
+        """Stop-loss was removed; _check_stop_losses is now a no-op."""
         bot = Bot(cfg, clob_client=mock_clob, initial_bankroll=10_000.0)
-        # Holding UP only (directional)
         bot.position_manager.update_position(
             market.market_id, Side.UP, qty=100.0, cost=45.0,
         )
         bot.active_markets = [market]
         bot.spot_prices["BTC"] = 84800.0
-        bot.window_open_prices["BTC"] = 85000.0  # negative delta
+        bot.window_open_prices["BTC"] = 85000.0
 
         bot._check_stop_losses(now_epoch=1100)
 
-        # Position should be removed
-        assert market.market_id not in bot.position_manager.positions
+        # Position should still be there (no-op)
+        assert market.market_id in bot.position_manager.positions
 
 
 class TestPositionLimit:

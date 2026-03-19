@@ -23,7 +23,6 @@ def cfg():
         reprice_threshold=0.02,
         max_imbalance_ratio=0.60,
         imbalance_timeout_sec=30,
-        early_exit_profit_pct=0.50,
     )
 
 
@@ -139,6 +138,8 @@ class TestPostLadder:
             api_secret="secret", api_passphrase="pass",
             ladder_rungs=4, ladder_spacing=0.01,
             ladder_width=0.02, max_pair_cost=0.90,
+            ladder_rungs_5m=4, ladder_spacing_5m=0.01,
+            ladder_width_5m=0.02, max_pair_cost_5m=0.90,
         )
         mgr = _make_manager(cfg_strict, mock_clob)
         count = mgr.post_ladder(market)
@@ -229,38 +230,12 @@ class TestImbalance:
 
 
 class TestEarlyExit:
-    def test_exit_when_appreciated(self, cfg, market, mock_clob):
+    def test_early_exit_returns_empty(self, cfg, market, mock_clob):
+        """Early exit was removed; check_early_exits always returns []."""
         mgr = _make_manager(cfg, mock_clob)
-        from polybot.ladder_manager import LadderState
-        mgr.ladders[market.market_id] = LadderState(
-            market_id=market.market_id, asset="BTC",
-            anchor_up=0.45, anchor_dn=0.45, posted_at=1000.0,
-        )
-        # Position: bought UP at avg 0.40, now ask is 0.65 -> 62.5% gain
-        mgr.positions.update_position(market.market_id, Side.UP, 100.0, 40.0)
-        mgr.positions.update_position(market.market_id, Side.DOWN, 100.0, 45.0)
-
-        # Mock book: UP ask at 0.65
-        book_up = MagicMock(
-            bids=[MagicMock(price="0.63", size="1000")],
-            asks=[MagicMock(price="0.65", size="1000")],
-        )
-        book_dn = MagicMock(
-            bids=[MagicMock(price="0.33", size="1000")],
-            asks=[MagicMock(price="0.35", size="1000")],
-        )
-        mock_clob.get_order_book.side_effect = lambda tid: (
-            book_up if tid == "tok_up" else book_dn
-        )
-
         market_map = {market.market_id: market}
         exits = mgr.check_early_exits(market_map)
-        assert len(exits) == 1
-        assert exits[0]["exit_side"] == Side.UP
-        # PnL = 100 * 0.65 - 40 = 25
-        assert exits[0]["pnl"] == pytest.approx(25.0)
-        # Position should be removed
-        assert market.market_id not in mgr.positions.positions
+        assert exits == []
 
 
 class TestCancelLadder:
