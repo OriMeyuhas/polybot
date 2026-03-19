@@ -94,3 +94,12 @@ class OrderRecord:
     filled: float = 0.0
     status: str = "pending"  # pending, open, filled, cancelled
     timestamp: float = 0.0
+
+
+@dataclass
+class ActivityEvent:
+    timestamp: float
+    event_type: str  # LADDER, FILL, SETTLE, CANCEL, HEARTBEAT_LOST
+    asset: str
+    detail: str
+    pnl: float | None = None

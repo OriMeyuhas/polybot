@@ -91,7 +91,7 @@ class LadderManager:
     def has_ladder(self, market_id: str) -> bool:
         return market_id in self.ladders
 
-    def _total_committed(self) -> float:
+    def total_committed(self) -> float:
         """Total capital committed across all active ladders."""
         total = 0.0
         for mid in self.ladders:
@@ -111,27 +111,40 @@ class LadderManager:
             lp = self.cfg.get_ladder_params(market.timeframe_sec)
 
             # Don't commit more capital than available bankroll
-            available = self.positions.bankroll - self._total_committed()
+            available = self.positions.bankroll - self.total_committed()
             budget = min(
                 self.positions.bankroll * lp.position_size_fraction,
                 available,
             )
             if budget < 1.0:
                 return 0
-            budget_per_side = budget / 2.0
 
-            tick_size = self.tick_cache.get_tick_size(market.condition_id) if self.tick_cache else 0.01
+            tick_size = self.tick_cache.get_tick_size(market.condition_id, token_id=market.up_token_id) if self.tick_cache else 0.01
 
             best_ask_up = self.executor.get_best_ask(market.up_token_id)
             best_ask_dn = self.executor.get_best_ask(market.dn_token_id)
 
+            # Dynamic budget skew: allocate more to the cheaper side
+            # Data shows whale puts ~60% on cheaper side, with higher skew at lower pair costs
+            if best_ask_up > 0 and best_ask_dn > 0:
+                total_ask = best_ask_up + best_ask_dn
+                # Invert: cheaper side gets larger share
+                up_weight = (1.0 - best_ask_up / total_ask)
+                dn_weight = (1.0 - best_ask_dn / total_ask)
+                total_weight = up_weight + dn_weight
+                budget_up = budget * (up_weight / total_weight)
+                budget_dn = budget * (dn_weight / total_weight)
+            else:
+                budget_up = budget / 2.0
+                budget_dn = budget / 2.0
+
             up_rungs = build_ladder_rungs(
-                best_ask_up, budget_per_side,
+                best_ask_up, budget_up,
                 lp.rungs, lp.spacing, lp.width, lp.size_skew,
                 tick_size=tick_size,
             )
             dn_rungs = build_ladder_rungs(
-                best_ask_dn, budget_per_side,
+                best_ask_dn, budget_dn,
                 lp.rungs, lp.spacing, lp.width, lp.size_skew,
                 tick_size=tick_size,
             )
@@ -198,9 +211,17 @@ class LadderManager:
                 posted_at=now,
             )
 
+            # Log pair cost for monitoring
+            if up_rungs and dn_rungs:
+                up_vwap = sum(p * s for p, s in up_rungs) / sum(s for _, s in up_rungs)
+                dn_vwap = sum(p * s for p, s in dn_rungs) / sum(s for _, s in dn_rungs)
+                pair_cost = up_vwap + dn_vwap
+            else:
+                pair_cost = 0.0
             logger.info(
-                "LADDER POSTED: %s | %d UP rungs + %d DN rungs | budget=$%.2f",
+                "LADDER POSTED: %s | %d UP rungs + %d DN rungs | budget=$%.2f (UP=$%.0f DN=$%.0f) | pair_cost=%.3f",
                 market.market_id, len(up_rungs), len(dn_rungs), budget,
+                budget_up, budget_dn, pair_cost,
             )
             return count
         except ClobApiError:
@@ -257,11 +278,11 @@ class LadderManager:
             # Select timeframe-specific ladder parameters
             lp = self.cfg.get_ladder_params(market.timeframe_sec)
 
-            tick_size = self.tick_cache.get_tick_size(market.condition_id) if self.tick_cache else 0.01
+            tick_size = self.tick_cache.get_tick_size(market.condition_id, token_id=market.up_token_id) if self.tick_cache else 0.01
 
             # Budget for reprice: only the REMAINING unfilled portion
             total_budget = self.positions.bankroll * lp.position_size_fraction
-            available = self.positions.bankroll - self._total_committed()
+            available = self.positions.bankroll - self.total_committed()
             budget_per_side = min(total_budget / 2.0, max(0, available / 2.0))
             if budget_per_side < 1.0:
                 continue

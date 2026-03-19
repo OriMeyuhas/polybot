@@ -65,12 +65,12 @@ class BotConfig:
     # Assets
     assets: tuple = ("BTC", "ETH", "SOL", "XRP")
 
-    # Ladder parameters — 15m default (calibrated from 0x8dxd tracker data 2026-03-18)
+    # Ladder parameters — 15m default (calibrated from 0x8dxd tracker 22.5h data)
     ladder_rungs: int = 36
     ladder_spacing: float = 0.02
     ladder_width: float = 0.70
     ladder_size_skew: float = 4.0
-    max_pair_cost: float = 0.995
+    max_pair_cost: float = 0.95   # data: >0.95 loses money (-$600/trade at 0.97-1.0)
     position_size_fraction: float = 0.10
 
     # Ladder parameters — 5m overrides (tighter spread capture profile)
@@ -78,7 +78,7 @@ class BotConfig:
     ladder_spacing_5m: float = 0.02
     ladder_width_5m: float = 0.52
     ladder_size_skew_5m: float = 2.0
-    max_pair_cost_5m: float = 0.92
+    max_pair_cost_5m: float = 0.95  # data: 0.92-0.97 still profitable (+$53/trade)
     position_size_fraction_5m: float = 0.033
 
     # Shared ladder / risk parameters
@@ -119,6 +119,7 @@ class BotConfig:
 
     # Mock client tuning
     mock_base_fill_rate: float = 0.15
+    web_port: int = 8080
 
     def get_ladder_params(self, timeframe_sec: int) -> LadderParams:
         """Return ladder parameters tuned for the given timeframe."""
@@ -181,6 +182,7 @@ def load_bot_config() -> BotConfig:
         log_level=os.getenv("LOG_LEVEL", "INFO"),
         dry_run=os.getenv("DRY_RUN", "true").lower() in ("true", "1", "yes"),
         mock_base_fill_rate=float(os.getenv("MOCK_BASE_FILL_RATE", "0.15")),
+        web_port=int(os.getenv("WEB_PORT", "8080")),
     )
 
 

@@ -83,12 +83,17 @@ class Bot:
                     )
 
     def _cleanup_expired_windows(self, now_epoch: int):
-        """Remove window IDs no longer in the active market list."""
+        """Remove window IDs and stale ladders no longer in the active market list."""
         active_ids = {m.market_id for m in self.active_markets}
         stale = self._snapped_windows - active_ids
         for mid in stale:
             self._snapped_windows.discard(mid)
-        # (stale windows already cleaned up)
+
+        # Clean up ladders for markets that are no longer active
+        stale_ladders = set(self.ladder_manager.ladders.keys()) - active_ids
+        for mid in stale_ladders:
+            if mid not in self.position_manager.get_pending_settlements():
+                self.ladder_manager.cleanup_ladder(mid)
 
     def _find_market(self, market_id: str) -> MarketWindow | None:
         for m in self.active_markets:
@@ -130,7 +135,7 @@ class Bot:
         )
 
     def _record_activity(self, event_type: str, asset: str, detail: str, pnl: float | None = None):
-        from polybot.display import ActivityEvent
+        from polybot.types import ActivityEvent
         self._activity_log.append(ActivityEvent(
             timestamp=time.time(),
             event_type=event_type,
@@ -299,15 +304,51 @@ class Bot:
 
     async def run_display(self):
         """Live Rich dashboard, refreshing at 1 Hz."""
-        from rich.console import Console
-        from rich.live import Live
-        from polybot.display import build_display
+        try:
+            from rich.console import Console
+            from rich.live import Live
+            from polybot.display import build_display
 
-        console = Console()
-        with Live(build_display(self), console=console, refresh_per_second=1) as live:
-            while True:
-                await asyncio.sleep(1)
-                live.update(build_display(self))
+            console = Console()
+            with Live(build_display(self), console=console, refresh_per_second=1) as live:
+                while True:
+                    await asyncio.sleep(1)
+                    live.update(build_display(self))
+        except Exception as e:
+            logger.warning("Display task disabled: %s", e)
+
+    def _settle_position(self, mid: str, market: MarketWindow, outcome: str):
+        """Settle a single position: compute PnL, update risk, queue redemption."""
+        pos = self.position_manager.positions.get(mid)
+        if pos:
+            if outcome in ("UP", "YES"):
+                pnl = pos.profit_if_up()
+            else:
+                pnl = pos.profit_if_down()
+
+            logger.info("Settled %s: %s, PnL=$%.2f", mid, outcome, pnl)
+            self.risk_manager.update_pnl(pnl)
+            self._record_activity("SETTLE", market.asset, f"{outcome} PnL=${pnl:.2f}", pnl=pnl)
+
+            self.redeemer.queue_redemption(
+                market.condition_id,
+                [market.up_token_id, market.dn_token_id],
+            )
+
+        self.position_manager.complete_settlement(mid)
+        self.position_manager.remove_position(mid)
+        self._expired_market_cache.pop(mid, None)
+
+    def _dry_run_resolve(self, market: MarketWindow) -> str | None:
+        """In dry-run mode, resolve using the last known spot delta."""
+        delta = self.compute_spot_delta(market.asset)
+        if delta > 0:
+            return "UP"
+        elif delta < 0:
+            return "DOWN"
+        # If delta is exactly 0, flip a coin
+        import random
+        return random.choice(["UP", "DOWN"])
 
     async def run_settlement_poller(self):
         """Poll pending settlements for resolution."""
@@ -321,9 +362,15 @@ class Bot:
                     if market is None:
                         continue
 
-                    # Check timeout
-                    import time as _time
-                    now = _time.time()
+                    # Dry-run: resolve immediately using spot delta
+                    if self.cfg.dry_run:
+                        outcome = self._dry_run_resolve(market)
+                        if outcome:
+                            self._settle_position(mid, market, outcome)
+                        continue
+
+                    # Live mode: poll Polymarket for resolution
+                    now = time.time()
                     elapsed = now - market.close_epoch
                     if elapsed > self.cfg.bot_settlement_give_up_sec:
                         logger.error("Settlement timeout for %s after %.0fs", mid, elapsed)
@@ -336,27 +383,19 @@ class Bot:
                     )
 
                     if result is not None:
-                        pos = self.position_manager.positions.get(mid)
-                        if pos:
-                            outcome = result["outcome"]
-                            if outcome in ("UP", "YES"):
-                                pnl = pos.profit_if_up()
-                            else:
-                                pnl = pos.profit_if_down()
-
-                            logger.info("Settled %s: %s, PnL=$%.2f", mid, outcome, pnl)
-                            self.risk_manager.update_pnl(pnl)
-
-                            self.redeemer.queue_redemption(
-                                market.condition_id,
-                                [market.up_token_id, market.dn_token_id],
-                            )
-
-                        self.position_manager.complete_settlement(mid)
-                        self.position_manager.remove_position(mid)
-                        self._expired_market_cache.pop(mid, None)
+                        self._settle_position(mid, market, result["outcome"])
 
                 await asyncio.sleep(30)
+
+    async def run_daily_reset(self):
+        """Reset daily PnL at midnight UTC."""
+        from datetime import datetime, timezone, timedelta
+        while True:
+            now = datetime.now(timezone.utc)
+            tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+            seconds_until_midnight = (tomorrow - now).total_seconds()
+            await asyncio.sleep(seconds_until_midnight)
+            self.risk_manager.reset_daily()
 
     async def run(self):
         """Start all concurrent tasks."""
@@ -381,6 +420,7 @@ class Bot:
             asyncio.create_task(self.heartbeat.run(self.clob_client, self._on_connection_lost)),
             asyncio.create_task(self.run_settlement_poller()),
             asyncio.create_task(self.redeemer.run(self._redeem_tokens)),
+            asyncio.create_task(self.run_daily_reset()),
         ]
         try:
             await asyncio.gather(*tasks)
