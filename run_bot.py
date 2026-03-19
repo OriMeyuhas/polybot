@@ -21,17 +21,18 @@ from polybot.bot import Bot
 
 # ---------------------------------------------------------------------------
 # Mock CLOB client — used in dry-run mode when no credentials are provided.
-# Probability-based fill simulation for realistic ladder testing.
+# Fetches REAL markets and order books from Polymarket APIs (no auth needed
+# for reads), but simulates order placement and fills locally.
 # ---------------------------------------------------------------------------
-import datetime as _dt
 import random as _random
 
-# Multi-timeframe windows matching real Polymarket (5m, 15m, 1h)
-_TIMEFRAMES = [
-    (300, "5m"),    # 5-minute windows
-    (900, "15m"),   # 15-minute windows
-    (3600, "1h"),   # 1-hour windows
-]
+import httpx as _httpx
+
+_GAMMA_API = "https://gamma-api.polymarket.com"
+_CLOB_API = "https://clob.polymarket.com"
+
+# Cache TTL for order book fetches (seconds)
+_BOOK_CACHE_TTL = 5.0
 
 
 class _MockAsk:
@@ -41,62 +42,92 @@ class _MockAsk:
 
 
 class _MockOrderBook:
-    def __init__(self, bid_price, ask_price, size=5000):
+    def __init__(self, bid_price, ask_price, tick_size="0.01", size=5000):
         self.bids = [_MockAsk(bid_price, size)]
         self.asks = [_MockAsk(ask_price, size)]
-        self.tick_size = "0.01"
+        self.tick_size = tick_size
 
 
 class MockClobClient:
-    """Simulates Polymarket CLOB API with probability-based fill simulation.
+    """Dry-run CLOB client: real Polymarket market data, simulated fills.
 
-    Resting orders fill probabilistically each tick based on distance from
-    mid-market. Closer orders fill more often with larger partial fills.
+    - get_markets(): fetches real active crypto up/down markets from the Gamma API
+    - get_order_book(): fetches real order books from the CLOB API (cached 5s)
+    - post_order/cancel/tick: local simulation (no real orders placed)
     """
 
     def __init__(self, base_fill_rate: float = 0.15):
-        self._assets = [
-            ("BTC", "Bitcoin"),
-            ("ETH", "Ethereum"),
-            ("SOL", "Solana"),
-            ("XRP", "XRP"),
-        ]
+        self._http = _httpx.Client(timeout=10.0)
         self._resting: dict[str, dict] = {}  # order_id -> order info
         self._next_id = 1
         self._base_fill_rate = base_fill_rate
+        self._book_cache: dict[str, tuple[float, object]] = {}  # token_id -> (timestamp, book)
+        self._markets_cache: tuple[float, list] | None = None  # (timestamp, markets)
 
     def get_markets(self):
-        now = int(time.time())
-        markets = []
-        for duration, label in _TIMEFRAMES:
-            win_start = now - (now % duration)
-            win_end = win_start + duration
-            win_num = win_start // duration
+        """Fetch real active crypto up/down markets from Polymarket Gamma API."""
+        now = time.time()
+        # Cache markets for 30 seconds
+        if self._markets_cache and now - self._markets_cache[0] < 30:
+            return {"data": self._markets_cache[1]}
 
-            for symbol, name in self._assets:
-                sym_lower = symbol.lower()
-                markets.append({
-                    "condition_id": f"0x{sym_lower}_{label}_{win_num}",
-                    "question": f"Will {name} go up or down in the next {label}?",
-                    "tokens": [
-                        {"token_id": f"{sym_lower}_up_{label}_{win_num}", "outcome": "Up"},
-                        {"token_id": f"{sym_lower}_dn_{label}_{win_num}", "outcome": "Down"},
-                    ],
-                    "game_start_time": _epoch_to_iso(win_start),
-                    "end_date_iso": _epoch_to_iso(win_end),
-                })
-        return {"data": markets}
+        try:
+            resp = self._http.get(
+                f"{_GAMMA_API}/markets",
+                params={"active": "true", "closed": "false", "limit": "100"},
+            )
+            resp.raise_for_status()
+            markets = resp.json()
+            # Gamma API returns a list directly
+            if isinstance(markets, list):
+                self._markets_cache = (now, markets)
+                return {"data": markets}
+            # Or it might return {"data": [...]}
+            data = markets.get("data", markets) if isinstance(markets, dict) else []
+            self._markets_cache = (now, data if isinstance(data, list) else [])
+            return {"data": self._markets_cache[1]}
+        except Exception as e:
+            print(f"[MockClobClient] Gamma API fetch failed: {e}")
+            # Return cached data if available, else empty
+            if self._markets_cache:
+                return {"data": self._markets_cache[1]}
+            return {"data": []}
 
     def get_order_book(self, token_id):
-        noise = _random.uniform(-0.02, 0.02)
-        if "up" in token_id:
-            ask = round(0.46 + noise, 2)
+        """Fetch real order book from Polymarket CLOB API (cached 5s)."""
+        now = time.time()
+        cached = self._book_cache.get(token_id)
+        if cached and now - cached[0] < _BOOK_CACHE_TTL:
+            return cached[1]
+
+        try:
+            resp = self._http.get(
+                f"{_CLOB_API}/book",
+                params={"token_id": token_id},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            bids = data.get("bids", [])
+            asks = data.get("asks", [])
+            tick_size = data.get("tick_size", "0.01")
+
+            # Build a book object matching the py-clob-client interface
+            book = type("OrderBook", (), {
+                "bids": [_MockAsk(b["price"], b["size"]) for b in bids[:10]],
+                "asks": [_MockAsk(a["price"], a["size"]) for a in asks[:10]],
+                "tick_size": str(tick_size),
+            })()
+
+            self._book_cache[token_id] = (now, book)
+            return book
+        except Exception:
+            # Fallback: return a synthetic book near 0.50
+            noise = _random.uniform(-0.02, 0.02)
+            ask = round(0.50 + noise, 2)
             ask = max(0.10, min(0.90, ask))
-            return _MockOrderBook(bid_price=round(ask - 0.02, 2), ask_price=ask)
-        else:
-            ask = round(0.48 + noise, 2)
-            ask = max(0.10, min(0.90, ask))
-            return _MockOrderBook(bid_price=round(ask - 0.02, 2), ask_price=ask)
+            book = _MockOrderBook(bid_price=round(ask - 0.02, 2), ask_price=ask)
+            return book
 
     def create_order(self, order_args):
         return {"signed": True, "_args": order_args}
@@ -175,12 +206,6 @@ class MockClobClient:
 
     def get_balance_allowance(self, params=None):
         return {"balance": 1_000_000_000}  # $1000 USDC (6 decimals)
-
-
-def _epoch_to_iso(epoch: int) -> str:
-    return _dt.datetime.fromtimestamp(epoch, tz=_dt.timezone.utc).strftime(
-        "%Y-%m-%dT%H:%M:%SZ"
-    )
 
 
 # ---------------------------------------------------------------------------

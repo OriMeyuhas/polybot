@@ -38,6 +38,9 @@ class LadderState:
     current_ask_dn: float = 0.0
 
 
+MIN_ORDER_SIZE = 5.0  # Polymarket minimum for GTC orders
+
+
 def build_ladder_rungs(
     best_ask: float,
     budget: float,
@@ -50,14 +53,27 @@ def build_ladder_rungs(
     """Build ladder rungs as (price, size) pairs.
 
     Returns rungs from cheapest (farthest from market) to most expensive (near market).
+    Automatically reduces rung count if budget is too small for the configured amount.
     """
+    if best_ask <= 0 or budget <= 0:
+        return []
+
+    # Estimate max affordable rungs: ensure the cheapest rung (weight=1.0)
+    # gets at least MIN_ORDER_SIZE shares.
+    avg_price = max(0.01, best_ask - width / 2)
+    min_cost_per_rung = MIN_ORDER_SIZE * avg_price
+    max_affordable = max(1, int(budget / min_cost_per_rung))
+    effective_rungs = min(rungs, max_affordable)
+
     anchor = max(0.01, best_ask - width)
-    prices = [round_to_tick(anchor + i * spacing, tick_size) for i in range(rungs)]
+    # Spread rungs evenly across the width with the effective count
+    effective_spacing = spacing if effective_rungs == rungs else width / max(effective_rungs, 1)
+    prices = [round_to_tick(anchor + i * effective_spacing, tick_size) for i in range(effective_rungs)]
     # Clamp prices to valid range
     prices = [max(0.01, min(0.99, p)) for p in prices]
 
     # Linear size skew: cheapest gets weight 1.0, most expensive gets weight size_skew
-    weights = [1.0 + (size_skew - 1.0) * (i / max(rungs - 1, 1)) for i in range(rungs)]
+    weights = [1.0 + (size_skew - 1.0) * (i / max(effective_rungs - 1, 1)) for i in range(effective_rungs)]
 
     # Compute sizes so total cost = budget
     total_weighted_cost = sum(w * p for w, p in zip(weights, prices))
@@ -68,7 +84,7 @@ def build_ladder_rungs(
     result = []
     for price, weight in zip(prices, weights):
         size = scale * weight
-        if size >= 5.0:  # Polymarket minimum for GTC orders
+        if size >= MIN_ORDER_SIZE:
             result.append((price, round(size, 1)))
 
     return result
