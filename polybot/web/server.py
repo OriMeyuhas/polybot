@@ -161,6 +161,7 @@ def create_app(bot: Bot) -> FastAPI:
             return JSONResponse({"error": "Bankroll must be positive"}, status_code=400)
         bot.position_manager.bankroll = bankroll
         bot.risk_manager.starting_bankroll = bankroll
+        bot._wallet_balance = bankroll
         return JSONResponse({"status": "ok", "bankroll": bankroll})
 
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")

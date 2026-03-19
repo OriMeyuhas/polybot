@@ -346,7 +346,8 @@
     for (var i = 0; i < ladders.length; i++) {
       var l = ladders[i];
       var marketText = esc(l.asset) + ' ' + esc(l.market_id.split('_').pop());
-      var marketLabel = l.condition_id && l.condition_id.startsWith('0x') && l.condition_id.length > 10
+      var isRealCondition = l.condition_id && /^0x[0-9a-fA-F]{40,}$/.test(l.condition_id);
+      var marketLabel = isRealCondition
         ? '<a href="https://polymarket.com/event/' + esc(l.condition_id) + '" target="_blank" class="market-link">' + marketText + '</a>'
         : marketText;
       var tf          = esc(tfLabel(l.timeframe_sec));
