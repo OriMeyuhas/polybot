@@ -8,111 +8,11 @@ from datetime import datetime, timezone
 import httpx
 
 from polybot.config import TrackerConfig
+from polybot.settlement import resolve_via_clob, resolve_via_gamma, fetch_condition_id, try_resolve_once
 from polybot.tracker.state import TrackerState
 from polybot.tracker.csv_writer import TrackerCSVWriter
 
 log = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Settlement resolution helpers
-# ---------------------------------------------------------------------------
-
-async def _resolve_via_clob(
-    client: httpx.AsyncClient,
-    cfg: TrackerConfig,
-    condition_id: str,
-) -> dict | None:
-    """Try the CLOB API: GET /markets/{condition_id}.
-
-    Returns a dict with ``outcome`` ("UP" or "DOWN") and ``settlement_price``
-    if the market is resolved, otherwise *None*.
-    """
-    url = f"{cfg.polymarket_host}/markets/{condition_id}"
-    resp = await client.get(url, timeout=10)
-    resp.raise_for_status()
-    data = resp.json()
-
-    # The CLOB response typically has a `tokens` array and a boolean
-    # `resolved` (or the tokens carry a `winner` flag).
-    if data.get("resolved") or data.get("closed"):
-        tokens = data.get("tokens", [])
-        for tok in tokens:
-            if tok.get("winner") is True or str(tok.get("winner")).lower() == "true":
-                outcome = tok.get("outcome", "").upper()
-                if outcome in ("UP", "DOWN", "YES", "NO"):
-                    return {"outcome": outcome, "settlement_price": 1.0}
-
-        # Fallback: look for a top-level `winner` field
-        winner = data.get("winner")
-        if winner:
-            return {"outcome": str(winner).upper(), "settlement_price": 1.0}
-
-    return None
-
-
-async def _resolve_via_data_api(
-    client: httpx.AsyncClient,
-    cfg: TrackerConfig,
-    slug: str,
-) -> dict | None:
-    """Fallback: query the data-api events endpoint by slug."""
-    url = f"{cfg.polymarket_data_api}/events?slug={slug}"
-    resp = await client.get(url, timeout=10)
-    resp.raise_for_status()
-    payload = resp.json()
-
-    # payload may be a list or a single object
-    events = payload if isinstance(payload, list) else [payload]
-    for event in events:
-        markets = event.get("markets", [event])
-        for mkt in markets:
-            if mkt.get("resolved") or mkt.get("closed"):
-                outcome = mkt.get("outcome", mkt.get("winner", ""))
-                if outcome:
-                    return {"outcome": str(outcome).upper(), "settlement_price": 1.0}
-
-    return None
-
-
-async def _resolve_settlement(
-    client: httpx.AsyncClient,
-    cfg: TrackerConfig,
-    slug: str,
-    condition_id: str,
-) -> dict | None:
-    """Attempt to resolve a market with retries + exponential backoff.
-
-    Returns ``{"outcome": "UP"/"DOWN", "settlement_price": 1.0}`` on success
-    or *None* if all retries are exhausted.
-    """
-    for attempt in range(cfg.settlement_retry_max):
-        try:
-            # --- primary: CLOB API ---
-            result = await _resolve_via_clob(client, cfg, condition_id)
-            if result is not None:
-                return result
-
-            # --- fallback: data API ---
-            result = await _resolve_via_data_api(client, cfg, slug)
-            if result is not None:
-                return result
-
-        except Exception as exc:
-            log.warning(
-                "Settlement resolve attempt %d/%d for %s failed: %s",
-                attempt + 1, cfg.settlement_retry_max, slug, exc,
-            )
-
-        backoff = cfg.settlement_retry_backoff_sec * (2 ** attempt)
-        log.debug("Retrying settlement for %s in %.1fs …", slug, backoff)
-        await asyncio.sleep(backoff)
-
-    log.error(
-        "Failed to resolve settlement for %s after %d attempts — removing from active markets",
-        slug, cfg.settlement_retry_max,
-    )
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -185,7 +85,13 @@ async def run_settlement_tracker(
     state: TrackerState,
     writer: TrackerCSVWriter,
 ) -> None:
-    """Continuously poll active markets and settle those whose windows have closed."""
+    """Continuously poll active markets and settle those whose windows have closed.
+
+    Non-blocking: each loop tries to resolve expired markets once.  If not yet
+    resolved on Polymarket's side, the market stays in active_markets and is
+    retried next iteration (~30s).  Gives up after ``settlement_give_up_sec``
+    (default 30 min) and records UNKNOWN.
+    """
 
     log.info("Settlement tracker started")
 
@@ -200,17 +106,29 @@ async def run_settlement_tracker(
                     if current_time <= window_end:
                         continue  # window still open
 
-                    log.info("Window closed for %s — attempting settlement", slug)
-
+                    elapsed_since_end = current_time - window_end
                     condition_id = market_info.get("condition_id", slug)
-                    resolution = await _resolve_settlement(client, cfg, slug, condition_id)
 
-                    settled_outcome = None
+                    # --- try to resolve (single non-blocking attempt) ---
+                    resolution = await try_resolve_once(client, cfg.polymarket_host, slug, condition_id)
+
                     if resolution is not None:
                         settled_outcome = resolution["outcome"]
-                        log.info("Market %s resolved: %s", slug, settled_outcome)
+                        log.info("Market %s resolved: %s (%.0fs after window end)",
+                                 slug, settled_outcome, elapsed_since_end)
+                    elif elapsed_since_end < cfg.settlement_give_up_sec:
+                        # Not resolved yet — wait and retry next loop
+                        log.debug(
+                            "Market %s not resolved yet (%.0fs / %.0fs) — will retry",
+                            slug, elapsed_since_end, cfg.settlement_give_up_sec,
+                        )
+                        continue
                     else:
-                        log.warning("Market %s could not be resolved — recording as UNKNOWN", slug)
+                        # Timed out waiting for resolution
+                        log.warning(
+                            "Market %s not resolved after %.0fs — recording as UNKNOWN",
+                            slug, elapsed_since_end,
+                        )
                         settled_outcome = "UNKNOWN"
 
                     # --- PnL computation ---
@@ -258,4 +176,4 @@ async def run_settlement_tracker(
             except Exception:
                 log.exception("Error in settlement tracker loop")
 
-            await asyncio.sleep(5)
+            await asyncio.sleep(30)
