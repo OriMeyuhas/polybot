@@ -1,67 +1,163 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PolyBot Dashboard</title>
-    <link rel="stylesheet" href="/static/style.css">
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PolyBot Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
-    <div id="disconnect-banner">DISCONNECTED — reconnecting...</div>
 
-    <div class="header" id="header">
-        <h1>POLYBOT</h1>
-        <span class="badge" id="mode-badge">--</span>
-        <span class="badge badge-cancel" id="cancel-badge" style="display:none">CANCEL ONLY</span>
-        <span class="badge badge-halted" id="halted-badge" style="display:none">HALTED</span>
-        <div class="stat"><div class="stat-label">Uptime</div><div class="stat-value" id="uptime">--</div></div>
-        <div class="stat"><div class="stat-label">Bankroll</div><div class="stat-value" id="bankroll">--</div></div>
-        <div class="stat"><div class="stat-label">Daily PnL</div><div class="stat-value" id="pnl">--</div></div>
-        <div class="stat"><div class="stat-label">Heartbeat</div><div class="stat-value"><span class="dot" id="hb-dot"></span></div></div>
-        <div class="stat"><div class="stat-label">Wallet</div><div class="stat-value" id="wallet-balance">--</div></div>
+  <!-- Disconnect Banner -->
+  <div id="disconnect-banner">
+    &#9888; WebSocket disconnected &mdash; reconnecting&hellip;
+  </div>
+
+  <!-- Top Bar -->
+  <header class="glass top-bar">
+    <div class="top-bar-left">
+      <span class="logo">POLYBOT</span>
+      <span id="mode-badge" class="badge badge-dry">DRY RUN</span>
+      <span id="cancel-badge" class="badge badge-cancel" style="display:none">CANCEL ONLY</span>
+      <span id="halted-badge" class="badge badge-halted" style="display:none">RISK HALTED</span>
+    </div>
+    <div class="top-bar-right">
+      <span id="uptime" class="uptime-text">—</span>
+      <span id="hb-dot" class="dot dot-red"></span>
+      <button id="btn-start" class="btn-start" style="display:none">&#9654; Start</button>
+      <button id="btn-stop" class="btn-stop">&#9646;&#9646; Stop</button>
+    </div>
+  </header>
+
+  <!-- KPI Row -->
+  <div id="kpi-row">
+    <div class="kpi-card">
+      <div class="kpi-label">Bankroll</div>
+      <div class="kpi-value" id="bankroll">—</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Daily PnL</div>
+      <div class="kpi-value" id="pnl">—</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Deployed</div>
+      <div class="kpi-value" id="kpi-deployed">—</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Available</div>
+      <div class="kpi-value" id="kpi-available">—</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Trades</div>
+      <div class="kpi-value" id="kpi-trades">—</div>
+    </div>
+  </div>
+
+  <!-- Spots Row -->
+  <div id="spots"></div>
+
+  <!-- Main Grid -->
+  <div class="main-grid">
+
+    <!-- Left: Active Ladders -->
+    <div class="panel glass">
+      <div class="panel-header">
+        <span class="panel-title">Active Ladders</span>
+      </div>
+      <div class="table-wrap">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>Market</th>
+              <th>TF</th>
+              <th>ASK &#8593;</th>
+              <th>ASK &#8595;</th>
+              <th>FILL &#8593;</th>
+              <th>FILL &#8595;</th>
+              <th>PAIR$</th>
+              <th>IMBAL</th>
+              <th>TIME</th>
+            </tr>
+          </thead>
+          <tbody id="ladders-body">
+            <tr class="empty-row"><td colspan="9">No active ladders</td></tr>
+          </tbody>
+        </table>
+      </div>
     </div>
 
-    <div class="spots" id="spots"></div>
+    <!-- Right column -->
+    <div class="right-stack">
 
-    <div class="grid-2">
-        <div class="panel">
-            <div class="panel-title">Active Ladders</div>
-            <table>
-                <thead>
-                    <tr>
-                        <th>Market</th><th>TF</th><th>Resting</th><th>Filled</th>
-                        <th>VWAP UP</th><th>VWAP DN</th><th>Pair Cost</th><th>Imbal</th><th>Time</th>
-                    </tr>
-                </thead>
-                <tbody id="ladders-body"></tbody>
-            </table>
+      <!-- Positions Panel -->
+      <div class="panel glass">
+        <div class="panel-header">
+          <span class="panel-title">Positions</span>
         </div>
-
-        <div>
-            <div class="panel">
-                <div class="panel-title">Positions</div>
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Market</th><th>UP Qty</th><th>DN Qty</th>
-                            <th>PnL if UP</th><th>PnL if DN</th><th>Worst</th>
-                        </tr>
-                    </thead>
-                    <tbody id="positions-body"></tbody>
-                </table>
-            </div>
-            <div class="panel">
-                <div class="panel-title">Wallet</div>
-                <div id="wallet-detail" class="text-muted">--</div>
-            </div>
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Market</th>
+                <th>QTY &#8593;</th>
+                <th>QTY &#8595;</th>
+                <th>IF &#8593;</th>
+                <th>IF &#8595;</th>
+                <th>WORST</th>
+              </tr>
+            </thead>
+            <tbody id="positions-body">
+              <tr class="empty-row"><td colspan="6">No open positions</td></tr>
+            </tbody>
+          </table>
         </div>
-    </div>
+      </div>
 
-    <div class="panel">
-        <div class="panel-title">Activity</div>
-        <div id="activity-feed"></div>
-    </div>
+      <!-- Wallet Panel -->
+      <div class="panel glass" id="wallet-detail">
+        <div class="panel-header">
+          <span class="panel-title">Wallet</span>
+        </div>
+        <div class="wallet-grid">
+          <div class="wallet-row">
+            <span class="wallet-label">Address</span>
+            <span class="wallet-value font-data" id="wallet-address">—</span>
+          </div>
+          <div class="wallet-row">
+            <span class="wallet-label">Balance</span>
+            <span class="wallet-value font-data" id="wallet-balance">—</span>
+          </div>
+          <div class="wallet-row">
+            <span class="wallet-label">On Orders</span>
+            <span class="wallet-value font-data" id="wallet-on-orders">—</span>
+          </div>
+          <div class="wallet-row">
+            <span class="wallet-label">In Positions</span>
+            <span class="wallet-value font-data" id="wallet-in-positions">—</span>
+          </div>
+          <div class="wallet-row">
+            <span class="wallet-label">Available</span>
+            <span class="wallet-value font-data" id="wallet-available">—</span>
+          </div>
+        </div>
+      </div>
 
-    <script src="/static/dashboard.js"></script>
+    </div><!-- /right-stack -->
+  </div><!-- /main-grid -->
+
+  <!-- Activity Feed -->
+  <div class="panel glass" id="activity-feed">
+    <div class="panel-header">
+      <span class="panel-title">Activity</span>
+    </div>
+    <div id="activity-list">
+      <div class="empty-row">No activity yet</div>
+    </div>
+  </div>
+
+  <script src="/static/dashboard.js"></script>
 </body>
 </html>
