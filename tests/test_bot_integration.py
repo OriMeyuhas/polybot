@@ -82,48 +82,66 @@ class TestWindowOpenPriceSnapshot:
 
 
 class TestSettlement:
-    def test_settlement_updates_bankroll(self, cfg, market, mock_clob):
+    def test_settlement_marks_pending(self, cfg, market, mock_clob):
+        """Settlement marks expired windows for async settlement instead of computing PnL."""
         bot = Bot(cfg, clob_client=mock_clob, initial_bankroll=10_000.0)
-        # Simulate a spread position: bought both sides below $1
         bot.position_manager.update_position(
             market.market_id, Side.UP, qty=100.0, cost=48.0,
         )
         bot.position_manager.update_position(
             market.market_id, Side.DOWN, qty=100.0, cost=49.0,
         )
-        # Set spot delta positive -> UP wins
-        bot.spot_prices["BTC"] = 85200.0
-        bot.window_open_prices["BTC"] = 85000.0
-
-        pos = bot.position_manager.positions[market.market_id]
-        pnl_up = pos.profit_if_up()  # 100*(1-0.48) - 49 = 52 - 49 = 3
-        assert pnl_up == pytest.approx(3.0)
-
-        # Manually call settlement
         bot.active_markets = [market]
-        # Set now to after window close
+        bot._snapped_windows.add(market.market_id)
+
+        # Call settlement after window close
         bot._settle_expired_windows(now_epoch=1400)
 
-        assert bot.position_manager.bankroll == pytest.approx(10_003.0)
-        assert bot.risk_manager.daily_pnl == pytest.approx(3.0)
-        assert market.market_id not in bot.position_manager.positions
+        # Position is NOT removed — it is marked pending
+        assert market.market_id in bot.position_manager.positions
+        assert market.market_id in bot.position_manager.get_pending_settlements()
+        # Bankroll unchanged
+        assert bot.position_manager.bankroll == pytest.approx(10_000.0)
+        # Snapped window cleaned up
+        assert market.market_id not in bot._snapped_windows
 
-
-class TestStopLoss:
-    def test_stop_loss_is_noop(self, cfg, market, mock_clob):
-        """Stop-loss was removed; _check_stop_losses is now a no-op."""
+    def test_settlement_skips_already_pending(self, cfg, market, mock_clob):
         bot = Bot(cfg, clob_client=mock_clob, initial_bankroll=10_000.0)
         bot.position_manager.update_position(
-            market.market_id, Side.UP, qty=100.0, cost=45.0,
+            market.market_id, Side.UP, qty=100.0, cost=48.0,
         )
         bot.active_markets = [market]
-        bot.spot_prices["BTC"] = 84800.0
-        bot.window_open_prices["BTC"] = 85000.0
 
-        bot._check_stop_losses(now_epoch=1100)
+        # Pre-mark as pending
+        bot.position_manager.mark_pending_settlement(market.market_id)
 
-        # Position should still be there (no-op)
-        assert market.market_id in bot.position_manager.positions
+        # Should not error or double-mark
+        bot._settle_expired_windows(now_epoch=1400)
+        assert bot.position_manager.get_pending_settlements().count(market.market_id) == 1
+
+    def test_settlement_skips_no_position(self, cfg, market, mock_clob):
+        bot = Bot(cfg, clob_client=mock_clob, initial_bankroll=10_000.0)
+        bot.active_markets = [market]
+        # No position — should be a no-op
+        bot._settle_expired_windows(now_epoch=1400)
+        assert market.market_id not in bot.position_manager.get_pending_settlements()
+
+
+class TestConnectionLost:
+    def test_on_connection_lost_resets_state(self, cfg, mock_clob):
+        bot = Bot(cfg, clob_client=mock_clob, initial_bankroll=10_000.0)
+        # Set up some state
+        bot._cancel_only_mode = True
+        # Add a mock ladder
+        bot.ladder_manager.ladders["m1"] = MagicMock()
+        bot.ladder_manager.cleanup_ladder = MagicMock()
+        bot.order_tracker.mark_all_unknown = MagicMock()
+
+        bot._on_connection_lost()
+
+        bot.ladder_manager.cleanup_ladder.assert_called_once_with("m1")
+        bot.order_tracker.mark_all_unknown.assert_called_once()
+        assert bot._cancel_only_mode is False
 
 
 class TestPositionLimit:

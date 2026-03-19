@@ -49,7 +49,8 @@ class Bot:
         self.window_open_prices: dict[str, float] = {}
         self.active_markets: list[MarketWindow] = []
         self._snapped_windows: set[str] = set()
-        self._exited_markets: set[str] = set()  # markets we already exited — don't re-enter
+        self._cancel_only_mode = False
+        self.heartbeat = None  # set in run()
         self._last_status_time: float = 0.0
         self._trade_count: int = 0
         self._start_time: float = time.time()
@@ -81,7 +82,7 @@ class Bot:
         stale = self._snapped_windows - active_ids
         for mid in stale:
             self._snapped_windows.discard(mid)
-        self._exited_markets -= stale  # allow re-entry on future windows
+        # (stale windows already cleaned up)
 
     def _log_status(self, now_epoch: int):
         """Print a periodic status summary."""
@@ -121,57 +122,33 @@ class Bot:
         ))
 
     def _settle_expired_windows(self, now_epoch: int):
-        """Handle settlement for expired windows with positions."""
-        settled_ids = []
         for market in list(self.active_markets):
             if market.is_active(now_epoch):
                 continue
-            if market.market_id not in self.position_manager.positions:
-                # No position but might have a ladder — clean it up
-                self.ladder_manager.cleanup_ladder(market.market_id)
+            mid = market.market_id
+            pos = self.position_manager.positions.get(mid)
+            if pos is None:
+                continue
+            if mid in self.position_manager.get_pending_settlements():
                 continue
 
-            pos = self.position_manager.positions[market.market_id]
-            spot_delta = self.compute_spot_delta(market.asset)
-            if spot_delta > 0:
-                pnl = pos.profit_if_up()
-                winner = "UP"
-            elif spot_delta < 0:
-                pnl = pos.profit_if_down()
-                winner = "DOWN"
-            else:
-                pnl = min(pos.profit_if_up(), pos.profit_if_down())
-                winner = "FLAT"
+            # Cancel any remaining orders on exchange
+            self.ladder_manager.cancel_ladder(mid)
+            self.ladder_manager.cleanup_ladder(mid)
 
-            old_bankroll = self.position_manager.bankroll
-            self.position_manager.update_bankroll(old_bankroll + pnl)
-            self.risk_manager.update_pnl(pnl)
-            self.position_manager.remove_position(market.market_id)
-            self.ladder_manager.cleanup_ladder(market.market_id)
-            settled_ids.append(market.market_id)
-
-            logger.info(
-                "SETTLEMENT: %s | winner=%s delta=%.4f | "
-                "up_qty=%.1f dn_qty=%.1f | pnl=$%.2f | "
-                "bankroll: $%.2f -> $%.2f",
-                market.market_id, winner, spot_delta,
-                pos.up_qty, pos.dn_qty, pnl,
-                old_bankroll, self.position_manager.bankroll,
-            )
-            self._record_activity(
-                "SETTLE", market.asset,
-                f"winner={winner} delta={spot_delta:+.4f} bankroll=${self.position_manager.bankroll:,.2f}",
-                pnl=pnl,
-            )
-            self._trade_count += 1
-
-        # Cleanup snapshots for settled markets
-        for mid in settled_ids:
+            # Clean up window state
             self._snapped_windows.discard(mid)
 
-    def _check_stop_losses(self, now_epoch: int):
-        """Stop-loss check — removed, will be replaced by settlement-aware logic."""
-        pass
+            # Mark for async settlement
+            self.position_manager.mark_pending_settlement(mid)
+            logger.info("Window expired for %s — pending settlement", mid)
+
+    def _on_connection_lost(self):
+        logger.warning("Connection lost — resetting all state")
+        for mid in list(self.ladder_manager.ladders.keys()):
+            self.ladder_manager.cleanup_ladder(mid)
+        self.order_tracker.mark_all_unknown()
+        self._cancel_only_mode = False
 
     async def run_binance_ws(self):
         """Connect to Binance combined stream for real-time spot prices."""
@@ -218,6 +195,11 @@ class Bot:
     async def run_trading_loop(self):
         """Main trading loop: manage ladders on all active markets."""
         while True:
+            # Heartbeat health gate
+            if self.heartbeat and not self.heartbeat.is_healthy():
+                await asyncio.sleep(self.cfg.poll_interval_ms / 1000.0)
+                continue
+
             now = int(time.time())
 
             # Snapshot open prices for new windows
@@ -233,26 +215,30 @@ class Bot:
             # Build market lookup
             market_map = {m.market_id: m for m in self.active_markets}
 
-            # 1. Post ladders on new markets (no existing ladder, not already exited)
-            for market in self.active_markets:
-                if not market.is_active(now):
-                    continue
-                if self.ladder_manager.has_ladder(market.market_id):
-                    continue
-                if market.market_id in self._exited_markets:
-                    continue
-                elapsed_pct = market.elapsed(now) / market.timeframe_sec
-                if elapsed_pct >= 0.10:
-                    count = await asyncio.to_thread(
-                        self.ladder_manager.post_ladder, market
-                    )
-                    if count > 0:
-                        self._record_activity(
-                            "LADDER", market.asset,
-                            f"posted {count} rungs on {market.market_id}",
+            if not self._cancel_only_mode:
+                # 1. Post ladders on new markets
+                for market in self.active_markets:
+                    if not market.is_active(now):
+                        continue
+                    if self.ladder_manager.has_ladder(market.market_id):
+                        continue
+                    elapsed_pct = market.elapsed(now) / market.timeframe_sec
+                    if elapsed_pct >= 0.10:
+                        count = await asyncio.to_thread(
+                            self.ladder_manager.post_ladder, market
                         )
+                        if count > 0:
+                            self._record_activity(
+                                "LADDER", market.asset,
+                                f"posted {count} rungs on {market.market_id}",
+                            )
 
-            # 2. Check fills on all active ladders
+                # 2. Reprice if book moved
+                await asyncio.to_thread(
+                    self.ladder_manager.reprice_if_needed, market_map
+                )
+
+            # 3. Check fills on all active ladders
             fills = await asyncio.to_thread(self.ladder_manager.check_fills)
             if fills > 0:
                 self._trade_count += fills
@@ -270,28 +256,10 @@ class Bot:
                                 f"combined=${combined:.3f}",
                             )
 
-            # 3. Reprice if book moved
-            await asyncio.to_thread(
-                self.ladder_manager.reprice_if_needed, market_map
-            )
-
             # 4. Imbalance guard
             self.ladder_manager.check_imbalance(now)
 
-            # 5. Early exit check
-            exits = await asyncio.to_thread(
-                self.ladder_manager.check_early_exits, market_map
-            )
-            for ex in exits:
-                self._exited_markets.add(ex["market_id"])
-                self._record_activity(
-                    "EARLY_EXIT", ex["asset"],
-                    f"sold {ex['exit_side'].value}@${ex['sell_price']:.2f}",
-                    pnl=ex["pnl"],
-                )
-                self._trade_count += 1
-
-            # 6. Cancel rungs on expiring windows
+            # 5. Cancel rungs on expiring windows
             for market in self.active_markets:
                 if market.is_active(now) and market.remaining(now) < self.cfg.no_trade_final_sec:
                     if self.ladder_manager.has_ladder(market.market_id):
@@ -302,14 +270,11 @@ class Bot:
                                 f"cancelled {cancelled} unfilled rungs (window expiring)",
                             )
 
-            # 7. Settlement
+            # 6. Settlement
             self._settle_expired_windows(now)
 
-            # 8. Cleanup expired window snapshots
+            # 7. Cleanup expired window snapshots
             self._cleanup_expired_windows(now)
-
-            # 9. Stop-loss on one-sided positions
-            self._check_stop_losses(now)
 
             await asyncio.sleep(self.cfg.poll_interval_ms / 1000.0)
 
