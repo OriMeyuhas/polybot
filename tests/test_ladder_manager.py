@@ -186,7 +186,7 @@ class TestCheckFills:
         # get_open_orders returns empty -> o1 filled
         mock_clob.get_open_orders.return_value = []
         fills = mgr.check_fills()
-        assert fills == 1
+        assert len(fills) == 1
         assert mgr.positions.positions[market.market_id].up_qty == 10.0
 
     def test_no_fill_when_order_still_open(self, cfg, market, mock_clob):
@@ -199,14 +199,14 @@ class TestCheckFills:
         ))
         mock_clob.get_open_orders.return_value = [{"id": "o1"}]
         fills = mgr.check_fills()
-        assert fills == 0
+        assert len(fills) == 0
 
     def test_clob_error_returns_zero(self, cfg, market, mock_clob):
         from polybot.errors import ClobApiError
         mgr = _make_manager(cfg, mock_clob)
         mock_clob.get_open_orders.side_effect = Exception("timeout")
         fills = mgr.check_fills()
-        assert fills == 0
+        assert len(fills) == 0
 
 
 class TestImbalance:
@@ -336,3 +336,35 @@ class TestCancelLadder:
         ))
         cancelled = mgr.cancel_ladder(market.market_id)
         assert cancelled == 2
+
+
+class TestCancelAllLadders:
+    def test_cancel_all_cancels_every_market(self, cfg, market, mock_clob):
+        mgr = _make_manager(cfg, mock_clob)
+        from polybot.order_tracker import TrackedOrder
+        mgr.tracker.add(TrackedOrder(order_id="o1", market_id="m1", token_id="t", side=Side.UP, price=0.45, size=10.0, placed_at=1000.0))
+        mgr.tracker.add(TrackedOrder(order_id="o2", market_id="m2", token_id="t", side=Side.DOWN, price=0.48, size=10.0, placed_at=1000.0))
+        from polybot.ladder_manager import LadderState
+        mgr.ladders["m1"] = LadderState(market_id="m1", asset="BTC", anchor_up=0.45, anchor_dn=0.48, posted_at=1000.0)
+        mgr.ladders["m2"] = LadderState(market_id="m2", asset="ETH", anchor_up=0.44, anchor_dn=0.49, posted_at=1000.0)
+
+        cancelled = mgr.cancel_all_ladders()
+        assert cancelled == 2
+        assert len(mgr.tracker.get_resting("m1")) == 0
+        assert len(mgr.tracker.get_resting("m2")) == 0
+        assert "m1" in mgr.ladders
+        assert "m2" in mgr.ladders
+
+
+class TestClearCancelledLadders:
+    def test_clear_removes_ladders_with_no_resting(self, cfg, market, mock_clob):
+        mgr = _make_manager(cfg, mock_clob)
+        from polybot.ladder_manager import LadderState
+        mgr.ladders["m1"] = LadderState(market_id="m1", asset="BTC", anchor_up=0.45, anchor_dn=0.48, posted_at=1000.0)
+        mgr.ladders["m2"] = LadderState(market_id="m2", asset="ETH", anchor_up=0.44, anchor_dn=0.49, posted_at=1000.0)
+        from polybot.order_tracker import TrackedOrder
+        mgr.tracker.add(TrackedOrder(order_id="o1", market_id="m2", token_id="t", side=Side.UP, price=0.44, size=10.0))
+
+        mgr.clear_cancelled_ladders()
+        assert "m1" not in mgr.ladders
+        assert "m2" in mgr.ladders

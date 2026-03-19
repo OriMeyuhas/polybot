@@ -92,12 +92,12 @@ class LadderManager:
         return market_id in self.ladders
 
     def total_committed(self) -> float:
-        """Total capital committed across all active ladders."""
-        total = 0.0
+        """Total capital committed: resting order cost + filled position cost."""
+        resting = 0.0
         for mid in self.ladders:
             for order in self.tracker.get_resting(mid):
-                total += order.price * (order.size - order.filled)
-        return total
+                resting += order.price * (order.size - order.filled)
+        return resting + self.positions.total_position_cost()
 
     def post_ladder(self, market: MarketWindow) -> int:
         """Post a full ladder (both sides) for a market. Returns number of orders placed."""
@@ -227,12 +227,12 @@ class LadderManager:
         except ClobApiError:
             return 0
 
-    def check_fills(self) -> int:
-        """Check for fills by querying open orders. Returns number of new fills detected."""
+    def check_fills(self) -> list[TrackedOrder]:
+        """Check for fills by querying open orders. Returns newly filled orders."""
         try:
             open_orders = self.executor.get_open_orders()
         except ClobApiError:
-            return 0
+            return []
 
         result = self.tracker.reconcile(open_orders)
 
@@ -248,7 +248,7 @@ class LadderManager:
         if result["orphaned"]:
             self.executor.cancel_batch(result["orphaned"])
 
-        return len(result["filled"])
+        return result["filled"]
 
     def reprice_if_needed(self, markets: dict[str, MarketWindow]) -> int:
         """Reprice ladders where the book has moved beyond threshold. Returns reprice count."""
@@ -415,6 +415,28 @@ class LadderManager:
         """Remove all state for a settled/expired market."""
         self.ladders.pop(market_id, None)
         self.tracker.cleanup_market(market_id)
+
+    def cancel_all_ladders(self) -> int:
+        """Cancel all resting orders across all ladders. Returns total cancelled count.
+
+        Ladder entries are NOT removed — they remain visible on the dashboard.
+        """
+        total = 0
+        for mid in list(self.ladders.keys()):
+            total += self.cancel_ladder(mid)
+        return total
+
+    def clear_cancelled_ladders(self) -> None:
+        """Remove ladder entries that have no resting orders (all filled/cancelled).
+
+        Called when the bot resumes from paused state so fresh ladders can be posted.
+        """
+        to_remove = [
+            mid for mid in self.ladders
+            if not self.tracker.has_orders(mid)
+        ]
+        for mid in to_remove:
+            self.cleanup_ladder(mid)
 
     def get_ladder_stats(self, market_id: str) -> dict:
         """Get ladder statistics for the dashboard."""
