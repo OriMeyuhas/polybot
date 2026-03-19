@@ -123,10 +123,12 @@ Flexible grid using `repeat(auto-fill, minmax(150px, 1fr))` — one card per con
 | Row | Value |
 |-----|-------|
 | Address | "DRY RUN" or truncated 0x address |
-| Balance | `usdc_balance` |
+| Balance | `usdc_balance` — in dry run mode, clicking the value opens an inline edit field to change the demo bankroll |
 | On Orders | **NEW** resting order cost |
 | In Positions | **NEW** filled position cost |
 | Available | `balance - on_orders - in_positions` |
+
+**Demo balance edit (dry run only):** The Balance value in the Wallet card is clickable when in dry run mode. Clicking it replaces the number with a text input pre-filled with the current value. Press Enter or blur to submit. This calls `POST /api/set-bankroll` with `{"bankroll": 5000}`. In live mode, the value is not editable (wallet balance comes from on-chain).
 
 ### Bottom — Activity Feed
 
@@ -205,6 +207,7 @@ When sections have no data, show a centered muted message inside the panel:
 
 - Add `POST /api/start` endpoint — sets `bot._cancel_only_mode = False`
 - Add `POST /api/stop` endpoint — sets `bot._cancel_only_mode = True` and sets a `_pending_cancel_all` flag on the bot
+- Add `POST /api/set-bankroll` endpoint — accepts `{"bankroll": float}`, only works in dry run mode. Updates `bot.position_manager.bankroll` and `bot.risk_manager.starting_bankroll`. Returns 403 in live mode.
 - The trading loop (in `bot.py`) checks `_pending_cancel_all` at the top of each iteration and cancels all ladders if set, then clears the flag. This avoids thread-safety issues — the HTTP handler only sets a flag, the trading loop performs the actual cancellation on its own thread.
 
 **Changes to `ladder_manager.py`:**
@@ -381,7 +384,7 @@ All frontend remains in `polybot/web/static/`:
 - New tests for:
   - `filled_count()` and `total_count()` methods on OrderTracker
   - `cancel_all_ladders()` on LadderManager
-  - `/api/start` and `/api/stop` endpoints
+  - `/api/start`, `/api/stop`, and `/api/set-bankroll` endpoints (including 403 for set-bankroll in live mode)
   - Updated `build_state_snapshot()` fields (new wallet split, trade_count, ladder ask prices, rung counts, position timeframe_sec)
   - Settlement detail format string (both two-sided and one-sided cases)
 
