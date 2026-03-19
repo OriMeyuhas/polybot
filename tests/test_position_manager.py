@@ -43,3 +43,24 @@ class TestPositionTracking:
     def test_update_bankroll(self, pm):
         pm.update_bankroll(10_500.0)
         assert pm.bankroll == 10_500.0
+
+
+class TestSettlementStates:
+    def test_mark_pending_settlement(self, pm):
+        pm.mark_pending_settlement("m1")
+        assert "m1" in pm.get_pending_settlements()
+
+    def test_mark_failed_moves_from_pending(self, pm):
+        pm.mark_pending_settlement("m1")
+        pm.mark_failed_settlement("m1")
+        assert "m1" not in pm.get_pending_settlements()
+        assert "m1" in pm.get_failed_settlements()
+
+    def test_complete_settlement_removes_from_both(self, pm):
+        pm.mark_pending_settlement("m1")
+        pm.mark_failed_settlement("m2")
+        pm.mark_pending_settlement("m2")  # also in pending
+        pm.complete_settlement("m1")
+        pm.complete_settlement("m2")
+        assert pm.get_pending_settlements() == []
+        assert pm.get_failed_settlements() == []

@@ -15,6 +15,8 @@ class PositionManager:
         self.cfg = cfg
         self.bankroll = bankroll
         self.positions: dict[str, Position] = {}
+        self._pending_settlement: set[str] = set()
+        self._failed_settlement: set[str] = set()
 
     def update_position(self, market_id: str, side: Side, qty: float, cost: float):
         if market_id not in self.positions:
@@ -35,3 +37,20 @@ class PositionManager:
 
     def update_bankroll(self, new_bankroll: float):
         self.bankroll = new_bankroll
+
+    def mark_pending_settlement(self, market_id: str) -> None:
+        self._pending_settlement.add(market_id)
+
+    def get_pending_settlements(self) -> list[str]:
+        return list(self._pending_settlement)
+
+    def mark_failed_settlement(self, market_id: str) -> None:
+        self._pending_settlement.discard(market_id)
+        self._failed_settlement.add(market_id)
+
+    def get_failed_settlements(self) -> list[str]:
+        return list(self._failed_settlement)
+
+    def complete_settlement(self, market_id: str) -> None:
+        self._pending_settlement.discard(market_id)
+        self._failed_settlement.discard(market_id)
