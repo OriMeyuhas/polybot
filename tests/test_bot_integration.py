@@ -239,3 +239,36 @@ class TestPositionLimit:
 
         count = bot.ladder_manager.post_ladder(market)
         assert count == 0
+
+
+class TestSettlementDetail:
+    def test_settle_two_sided_detail(self, cfg, market, mock_clob):
+        bot = Bot(cfg, clob_client=mock_clob, initial_bankroll=10_000.0)
+        bot.redeemer = MagicMock()
+        bot.position_manager.update_position(market.market_id, Side.UP, qty=100.0, cost=43.0)
+        bot.position_manager.update_position(market.market_id, Side.DOWN, qty=100.0, cost=48.0)
+        bot._expired_market_cache[market.market_id] = market
+        bot.position_manager.mark_pending_settlement(market.market_id)
+
+        bot._settle_position(market.market_id, market, "UP")
+
+        assert len(bot._activity_log) == 1
+        detail = bot._activity_log[0].detail
+        assert "UP won" in detail
+        assert "\u2191" in detail  # up arrow
+        assert "\u2193" in detail  # down arrow (losing side)
+        assert "net" in detail
+
+    def test_settle_one_sided_detail(self, cfg, market, mock_clob):
+        bot = Bot(cfg, clob_client=mock_clob, initial_bankroll=10_000.0)
+        bot.redeemer = MagicMock()
+        bot.position_manager.update_position(market.market_id, Side.UP, qty=100.0, cost=43.0)
+        # No DOWN side
+        bot._expired_market_cache[market.market_id] = market
+        bot.position_manager.mark_pending_settlement(market.market_id)
+
+        bot._settle_position(market.market_id, market, "UP")
+
+        detail = bot._activity_log[0].detail
+        assert "UP won" in detail
+        assert "\u2193" not in detail  # no down arrow when no losing side

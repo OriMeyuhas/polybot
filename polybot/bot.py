@@ -369,14 +369,22 @@ class Bot:
         if pos:
             if outcome in ("UP", "YES"):
                 pnl = pos.profit_if_up()
+                winning = pos.up_qty - pos.up_cost if pos.up_qty > 0 else 0.0
+                losing = pos.dn_cost
             else:
                 pnl = pos.profit_if_down()
+                winning = pos.dn_qty - pos.dn_cost if pos.dn_qty > 0 else 0.0
+                losing = pos.up_cost
 
             logger.info("Settled %s: %s, PnL=$%.2f", mid, outcome, pnl)
             self.risk_manager.update_pnl(pnl)
-            # Credit realized PnL back to bankroll so capital is available for new trades
             self.position_manager.bankroll += pnl
-            self._record_activity("SETTLE", market.asset, f"{outcome} PnL=${pnl:.2f}", pnl=pnl)
+
+            if losing > 0:
+                detail = f"{outcome} won \u2192 \u2191 +${winning:.2f} \u2193 -${losing:.2f} = net ${pnl:+.2f}"
+            else:
+                detail = f"{outcome} won \u2192 \u2191 +${winning:.2f} = net ${pnl:+.2f}"
+            self._record_activity("SETTLE", market.asset, detail, pnl=pnl)
 
             self.redeemer.queue_redemption(
                 market.condition_id,
