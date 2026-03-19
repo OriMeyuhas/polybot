@@ -15,12 +15,15 @@ from collections import deque
 import websockets
 
 from polybot.config import BotConfig
+from polybot.heartbeat import Heartbeat
 from polybot.ladder_manager import LadderManager
 from polybot.market_discovery import discover_active_markets
 from polybot.order_executor import OrderExecutor
 from polybot.order_tracker import OrderTracker
 from polybot.position_manager import PositionManager
+from polybot.redeemer import Redeemer
 from polybot.risk_manager import RiskManager
+from polybot.tick_size_cache import TickSizeCache
 from polybot.types import MarketWindow, Side
 
 logger = logging.getLogger(__name__)
@@ -37,14 +40,17 @@ class Bot:
         self.risk_manager = RiskManager(cfg, starting_bankroll=initial_bankroll)
         self.order_executor = OrderExecutor(cfg, clob_client=clob_client)
         self.order_tracker = OrderTracker()
+        self.tick_size_cache = TickSizeCache(clob_client, ttl_sec=cfg.tick_size_ttl_sec)
         self.ladder_manager = LadderManager(
             cfg,
             order_executor=self.order_executor,
             order_tracker=self.order_tracker,
             position_manager=self.position_manager,
             risk_manager=self.risk_manager,
+            tick_size_cache=self.tick_size_cache,
         )
 
+        self._expired_market_cache: dict[str, MarketWindow] = {}
         self.spot_prices: dict[str, float] = {}
         self.window_open_prices: dict[str, float] = {}
         self.active_markets: list[MarketWindow] = []
@@ -83,6 +89,18 @@ class Bot:
         for mid in stale:
             self._snapped_windows.discard(mid)
         # (stale windows already cleaned up)
+
+    def _find_market(self, market_id: str) -> MarketWindow | None:
+        for m in self.active_markets:
+            if m.market_id == market_id:
+                return m
+        return self._expired_market_cache.get(market_id)
+
+    async def _redeem_tokens(self, condition_id: str, token_ids: list[str]) -> float:
+        """Redeem winning tokens on-chain. Returns USDC.e received."""
+        # TODO: Implement actual on-chain redemption via web3/polygon RPC
+        logger.info("Redemption requested for %s (TODO: on-chain call)", condition_id)
+        return 0.0
 
     def _log_status(self, now_epoch: int):
         """Print a periodic status summary."""
@@ -141,6 +159,7 @@ class Bot:
 
             # Mark for async settlement
             self.position_manager.mark_pending_settlement(mid)
+            self._expired_market_cache[mid] = market
             logger.info("Window expired for %s — pending settlement", mid)
 
     def _on_connection_lost(self):
@@ -290,6 +309,55 @@ class Bot:
                 await asyncio.sleep(1)
                 live.update(build_display(self))
 
+    async def run_settlement_poller(self):
+        """Poll pending settlements for resolution."""
+        import httpx
+        from polybot.settlement import try_resolve_once
+
+        async with httpx.AsyncClient() as client:
+            while True:
+                for mid in list(self.position_manager.get_pending_settlements()):
+                    market = self._find_market(mid)
+                    if market is None:
+                        continue
+
+                    # Check timeout
+                    import time as _time
+                    now = _time.time()
+                    elapsed = now - market.close_epoch
+                    if elapsed > self.cfg.bot_settlement_give_up_sec:
+                        logger.error("Settlement timeout for %s after %.0fs", mid, elapsed)
+                        self.position_manager.mark_failed_settlement(mid)
+                        continue
+
+                    result = await try_resolve_once(
+                        client, self.cfg.polymarket_host,
+                        mid, market.condition_id,
+                    )
+
+                    if result is not None:
+                        pos = self.position_manager.positions.get(mid)
+                        if pos:
+                            outcome = result["outcome"]
+                            if outcome in ("UP", "YES"):
+                                pnl = pos.profit_if_up()
+                            else:
+                                pnl = pos.profit_if_down()
+
+                            logger.info("Settled %s: %s, PnL=$%.2f", mid, outcome, pnl)
+                            self.risk_manager.update_pnl(pnl)
+
+                            self.redeemer.queue_redemption(
+                                market.condition_id,
+                                [market.up_token_id, market.dn_token_id],
+                            )
+
+                        self.position_manager.complete_settlement(mid)
+                        self.position_manager.remove_position(mid)
+                        self._expired_market_cache.pop(mid, None)
+
+                await asyncio.sleep(30)
+
     async def run(self):
         """Start all concurrent tasks."""
         logger.info(
@@ -297,11 +365,22 @@ class Bot:
             self.position_manager.bankroll, self.cfg.assets,
             self.cfg.ladder_rungs, self.cfg.ladder_spacing,
         )
+        self.heartbeat = Heartbeat(
+            interval_sec=self.cfg.heartbeat_interval_sec,
+            max_failures=self.cfg.heartbeat_max_failures,
+        )
+        self.redeemer = Redeemer(
+            max_retries=self.cfg.redemption_retry_max,
+            backoff_sec=self.cfg.redemption_retry_backoff_sec,
+        )
         tasks = [
             asyncio.create_task(self.run_binance_ws()),
             asyncio.create_task(self.run_market_discovery()),
             asyncio.create_task(self.run_trading_loop()),
             asyncio.create_task(self.run_display()),
+            asyncio.create_task(self.heartbeat.run(self.clob_client, self._on_connection_lost)),
+            asyncio.create_task(self.run_settlement_poller()),
+            asyncio.create_task(self.redeemer.run(self._redeem_tokens)),
         ]
         try:
             await asyncio.gather(*tasks)

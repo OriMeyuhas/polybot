@@ -144,6 +144,91 @@ class TestConnectionLost:
         assert bot._cancel_only_mode is False
 
 
+class TestFindMarket:
+    def test_find_active_market(self, cfg, market, mock_clob):
+        bot = Bot(cfg, clob_client=mock_clob, initial_bankroll=10_000.0)
+        bot.active_markets = [market]
+        found = bot._find_market(market.market_id)
+        assert found is market
+
+    def test_find_cached_expired_market(self, cfg, market, mock_clob):
+        bot = Bot(cfg, clob_client=mock_clob, initial_bankroll=10_000.0)
+        bot.active_markets = []
+        bot._expired_market_cache[market.market_id] = market
+        found = bot._find_market(market.market_id)
+        assert found is market
+
+    def test_find_market_returns_none(self, cfg, mock_clob):
+        bot = Bot(cfg, clob_client=mock_clob, initial_bankroll=10_000.0)
+        bot.active_markets = []
+        assert bot._find_market("nonexistent") is None
+
+
+class TestSettlementPollerTimeout:
+    def test_settlement_timeout_marks_failed(self, cfg, market, mock_clob):
+        """When close_epoch is far in the past, the poller should mark failed.
+
+        We simulate the timeout logic inline (same as run_settlement_poller)
+        rather than running the full async poller.
+        """
+        import time as _time
+
+        bot = Bot(cfg, clob_client=mock_clob, initial_bankroll=10_000.0)
+        bot.position_manager.update_position(
+            market.market_id, Side.UP, qty=100.0, cost=48.0,
+        )
+        bot.active_markets = [market]
+        bot._snapped_windows.add(market.market_id)
+
+        # Settle the window to mark pending and cache it
+        bot._settle_expired_windows(now_epoch=1400)
+        assert market.market_id in bot.position_manager.get_pending_settlements()
+        assert market.market_id in bot._expired_market_cache
+
+        # Use a config with instant timeout (0 seconds)
+        cfg2 = BotConfig(
+            private_key="0xfake",
+            api_key="key",
+            api_secret="secret",
+            api_passphrase="pass",
+            poll_interval_ms=100,
+            ladder_rungs=4,
+            ladder_spacing=0.02,
+            ladder_width=0.06,
+            ladder_size_skew=1.5,
+            bot_settlement_give_up_sec=0.0,  # instant timeout
+        )
+        bot.cfg = cfg2
+
+        # Simulate the timeout check from run_settlement_poller
+        for mid in list(bot.position_manager.get_pending_settlements()):
+            mkt = bot._find_market(mid)
+            if mkt is None:
+                continue
+            now = _time.time()
+            elapsed = now - mkt.close_epoch
+            if elapsed > bot.cfg.bot_settlement_give_up_sec:
+                bot.position_manager.mark_failed_settlement(mid)
+
+        assert market.market_id not in bot.position_manager.get_pending_settlements()
+        assert market.market_id in bot.position_manager.get_failed_settlements()
+
+
+class TestSettlementCachesMarket:
+    def test_settle_caches_expired_market(self, cfg, market, mock_clob):
+        bot = Bot(cfg, clob_client=mock_clob, initial_bankroll=10_000.0)
+        bot.position_manager.update_position(
+            market.market_id, Side.UP, qty=100.0, cost=48.0,
+        )
+        bot.active_markets = [market]
+        bot._snapped_windows.add(market.market_id)
+
+        bot._settle_expired_windows(now_epoch=1400)
+
+        assert market.market_id in bot._expired_market_cache
+        assert bot._expired_market_cache[market.market_id] is market
+
+
 class TestPositionLimit:
     def test_no_ladder_when_at_limit(self, cfg, market, mock_clob):
         bot = Bot(cfg, clob_client=mock_clob, initial_bankroll=10_000.0)
