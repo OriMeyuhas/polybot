@@ -122,6 +122,14 @@ class BotConfig:
     web_port: int = 8080
     start_paused: bool = True
 
+    # Data layer config (new for infrastructure rebuild)
+    binance_fallback_interval_sec: float = 2.0
+    clob_midpoint_poll_sec: float = 2.0
+    market_ws_ping_sec: float = 10.0
+    book_stale_sec: float = 30.0
+    coingecko_ids: tuple = ("bitcoin", "ethereum", "solana", "ripple")
+    bankroll: float = 1000.0  # Default paper bankroll; overridable via env
+
     def get_ladder_params(self, timeframe_sec: int) -> LadderParams:
         """Return ladder parameters tuned for the given timeframe."""
         if timeframe_sec <= 300:  # 5m or shorter
@@ -185,6 +193,11 @@ def load_bot_config() -> BotConfig:
         mock_base_fill_rate=float(os.getenv("MOCK_BASE_FILL_RATE", "0.03")),
         web_port=int(os.getenv("WEB_PORT", "8080")),
         start_paused=os.getenv("START_PAUSED", "true").lower() in ("true", "1", "yes"),
+        binance_fallback_interval_sec=float(os.getenv("BINANCE_FALLBACK_INTERVAL_SEC", "2.0")),
+        clob_midpoint_poll_sec=float(os.getenv("CLOB_MIDPOINT_POLL_SEC", "2.0")),
+        market_ws_ping_sec=float(os.getenv("MARKET_WS_PING_SEC", "10.0")),
+        book_stale_sec=float(os.getenv("BOOK_STALE_SEC", "30.0")),
+        bankroll=float(os.getenv("BANKROLL", "1000.0")),
     )
 
 
