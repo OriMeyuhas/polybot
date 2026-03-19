@@ -53,34 +53,37 @@ def mock_clob():
     return clob
 
 
-def _make_manager(cfg, mock_clob):
+def _make_manager(cfg, mock_clob, bankroll=10000.0):
     executor = OrderExecutor(cfg, clob_client=mock_clob)
     tracker = OrderTracker()
-    positions = PositionManager(cfg, bankroll=1000.0)
-    risk = RiskManager(cfg, starting_bankroll=1000.0)
+    positions = PositionManager(cfg, bankroll=bankroll)
+    risk = RiskManager(cfg, starting_bankroll=bankroll)
     return LadderManager(cfg, executor, tracker, positions, risk)
 
 
 class TestBuildLadderRungs:
     def test_correct_number_of_rungs(self):
         rungs = build_ladder_rungs(
-            best_ask=0.50, budget=50.0, rungs=8,
+            best_ask=0.50, budget=500.0, rungs=8,
             spacing=0.02, width=0.10, size_skew=2.0,
+            tick_size=0.01,
         )
         assert len(rungs) == 8
 
     def test_prices_ascending(self):
         rungs = build_ladder_rungs(
-            best_ask=0.50, budget=50.0, rungs=8,
+            best_ask=0.50, budget=500.0, rungs=8,
             spacing=0.02, width=0.10, size_skew=2.0,
+            tick_size=0.01,
         )
         prices = [p for p, s in rungs]
         assert prices == sorted(prices)
 
     def test_sizes_ascending_with_skew(self):
         rungs = build_ladder_rungs(
-            best_ask=0.50, budget=50.0, rungs=8,
+            best_ask=0.50, budget=500.0, rungs=8,
             spacing=0.02, width=0.10, size_skew=2.0,
+            tick_size=0.01,
         )
         sizes = [s for p, s in rungs]
         # Most expensive rung should be larger than cheapest
@@ -88,8 +91,9 @@ class TestBuildLadderRungs:
 
     def test_skew_ratio(self):
         rungs = build_ladder_rungs(
-            best_ask=0.50, budget=50.0, rungs=8,
+            best_ask=0.50, budget=500.0, rungs=8,
             spacing=0.02, width=0.10, size_skew=3.0,
+            tick_size=0.01,
         )
         sizes = [s for p, s in rungs]
         ratio = sizes[-1] / sizes[0]
@@ -97,21 +101,44 @@ class TestBuildLadderRungs:
         assert ratio > 2.0
 
     def test_total_cost_matches_budget(self):
-        budget = 50.0
+        budget = 500.0
         rungs = build_ladder_rungs(
             best_ask=0.50, budget=budget, rungs=8,
             spacing=0.02, width=0.10, size_skew=2.0,
+            tick_size=0.01,
         )
         total_cost = sum(p * s for p, s in rungs)
         assert total_cost == pytest.approx(budget, rel=0.05)
 
     def test_anchor_clamped_to_min(self):
         rungs = build_ladder_rungs(
-            best_ask=0.05, budget=50.0, rungs=4,
+            best_ask=0.05, budget=500.0, rungs=4,
             spacing=0.01, width=0.10, size_skew=1.0,
+            tick_size=0.01,
         )
         prices = [p for p, s in rungs]
         assert all(p >= 0.01 for p in prices)
+
+    def test_small_budget_fewer_rungs(self):
+        """With min size 5.0, small budgets produce fewer rungs."""
+        rungs = build_ladder_rungs(
+            best_ask=0.50, budget=10.0, rungs=8,
+            spacing=0.02, width=0.10, size_skew=2.0,
+            tick_size=0.01,
+        )
+        # Small budget can't fill all 8 rungs at min size 5.0
+        assert len(rungs) < 8
+
+    def test_tick_size_applied(self):
+        rungs = build_ladder_rungs(
+            best_ask=0.455, budget=500.0, rungs=4,
+            spacing=0.025, width=0.05, size_skew=1.0,
+            tick_size=0.01,
+        )
+        for price, _size in rungs:
+            # All prices should be multiples of tick_size
+            remainder = round(price / 0.01) * 0.01
+            assert price == pytest.approx(remainder, abs=1e-9)
 
 
 class TestPostLadder:
@@ -123,7 +150,7 @@ class TestPostLadder:
 
     def test_no_ladder_when_halted(self, cfg, market, mock_clob):
         mgr = _make_manager(cfg, mock_clob)
-        mgr.risk.update_pnl(-100.0)  # trigger halt
+        mgr.risk.update_pnl(-1000.0)  # trigger halt (>5% of 10000 bankroll)
         count = mgr.post_ladder(market)
         assert count == 0
 
@@ -174,11 +201,22 @@ class TestCheckFills:
         fills = mgr.check_fills()
         assert fills == 0
 
+    def test_clob_error_returns_zero(self, cfg, market, mock_clob):
+        from polybot.errors import ClobApiError
+        mgr = _make_manager(cfg, mock_clob)
+        mock_clob.get_open_orders.side_effect = Exception("timeout")
+        fills = mgr.check_fills()
+        assert fills == 0
+
 
 class TestImbalance:
     def test_no_action_when_balanced(self, cfg, market, mock_clob):
         mgr = _make_manager(cfg, mock_clob)
-        mgr.ladders[market.market_id] = MagicMock(imbalance_alert_at=None)
+        from polybot.ladder_manager import LadderState
+        mgr.ladders[market.market_id] = LadderState(
+            market_id=market.market_id, asset="BTC",
+            anchor_up=0.45, anchor_dn=0.45, posted_at=1000.0,
+        )
         # Add balanced fills
         from polybot.order_tracker import TrackedOrder
         mgr.tracker.add(TrackedOrder(
@@ -228,14 +266,58 @@ class TestImbalance:
         # o3 should be cancelled
         assert mgr.tracker.orders["o3"].status == "cancelled"
 
-
-class TestEarlyExit:
-    def test_early_exit_returns_empty(self, cfg, market, mock_clob):
-        """Early exit was removed; check_early_exits always returns []."""
+    def test_imbalance_timeout_sets_accepted(self, cfg, market, mock_clob):
         mgr = _make_manager(cfg, mock_clob)
-        market_map = {market.market_id: market}
-        exits = mgr.check_early_exits(market_map)
-        assert exits == []
+        from polybot.ladder_manager import LadderState
+        state = LadderState(
+            market_id=market.market_id, asset="BTC",
+            anchor_up=0.45, anchor_dn=0.45, posted_at=1000.0,
+            imbalance_alert_at=1000,
+        )
+        mgr.ladders[market.market_id] = state
+        from polybot.order_tracker import TrackedOrder
+        mgr.tracker.add(TrackedOrder(
+            order_id="o1", market_id=market.market_id,
+            token_id="tok_up", side=Side.UP,
+            price=0.45, size=20.0, placed_at=1000.0,
+        ))
+        mgr.tracker.add(TrackedOrder(
+            order_id="o2", market_id=market.market_id,
+            token_id="tok_dn", side=Side.DOWN,
+            price=0.45, size=5.0, placed_at=1000.0,
+        ))
+        mgr.tracker.update_fill("o1", 20.0)
+        mgr.tracker.update_fill("o2", 5.0)
+        # Call with time past timeout
+        acted = mgr.check_imbalance(now_epoch=1000 + cfg.imbalance_timeout_sec + 1)
+        assert market.market_id in acted
+        assert state.imbalance_accepted is True
+        assert state.imbalance_alert_at is None
+
+    def test_imbalance_skipped_when_accepted(self, cfg, market, mock_clob):
+        mgr = _make_manager(cfg, mock_clob)
+        from polybot.ladder_manager import LadderState
+        state = LadderState(
+            market_id=market.market_id, asset="BTC",
+            anchor_up=0.45, anchor_dn=0.45, posted_at=1000.0,
+            imbalance_accepted=True,
+        )
+        mgr.ladders[market.market_id] = state
+        from polybot.order_tracker import TrackedOrder
+        mgr.tracker.add(TrackedOrder(
+            order_id="o1", market_id=market.market_id,
+            token_id="tok_up", side=Side.UP,
+            price=0.45, size=20.0, placed_at=1000.0,
+        ))
+        mgr.tracker.add(TrackedOrder(
+            order_id="o2", market_id=market.market_id,
+            token_id="tok_dn", side=Side.DOWN,
+            price=0.45, size=5.0, placed_at=1000.0,
+        ))
+        mgr.tracker.update_fill("o1", 20.0)
+        mgr.tracker.update_fill("o2", 5.0)
+        acted = mgr.check_imbalance(now_epoch=2000)
+        assert len(acted) == 0
 
 
 class TestCancelLadder:
