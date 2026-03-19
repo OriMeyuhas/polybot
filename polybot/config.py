@@ -120,7 +120,7 @@ class BotConfig:
     # Mock client tuning
     mock_base_fill_rate: float = 0.03
     web_port: int = 8080
-    start_paused: bool = False
+    start_paused: bool = True
 
     def get_ladder_params(self, timeframe_sec: int) -> LadderParams:
         """Return ladder parameters tuned for the given timeframe."""
@@ -184,7 +184,7 @@ def load_bot_config() -> BotConfig:
         dry_run=os.getenv("DRY_RUN", "true").lower() in ("true", "1", "yes"),
         mock_base_fill_rate=float(os.getenv("MOCK_BASE_FILL_RATE", "0.03")),
         web_port=int(os.getenv("WEB_PORT", "8080")),
-        start_paused=os.getenv("START_PAUSED", "false").lower() in ("true", "1", "yes"),
+        start_paused=os.getenv("START_PAUSED", "true").lower() in ("true", "1", "yes"),
     )
 
 
