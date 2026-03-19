@@ -32,6 +32,10 @@ class LadderState:
     imbalance_alert_at: float | None = None
     boosted_side: Side | None = None
     imbalance_accepted: bool = False
+    up_token_id: str = ""
+    dn_token_id: str = ""
+    current_ask_up: float = 0.0
+    current_ask_dn: float = 0.0
 
 
 def build_ladder_rungs(
@@ -209,6 +213,10 @@ class LadderManager:
                 anchor_up=anchor_up,
                 anchor_dn=anchor_dn,
                 posted_at=now,
+                up_token_id=market.up_token_id,
+                dn_token_id=market.dn_token_id,
+                current_ask_up=best_ask_up,
+                current_ask_dn=best_ask_dn,
             )
 
             # Log pair cost for monitoring
@@ -268,6 +276,10 @@ class LadderManager:
                 best_ask_dn = self.executor.get_best_ask(market.dn_token_id)
             except ClobApiError:
                 continue
+
+            # Cache latest ask prices for dashboard
+            state.current_ask_up = best_ask_up
+            state.current_ask_dn = best_ask_dn
 
             up_moved = abs(best_ask_up - state.anchor_up) > self.cfg.reprice_threshold
             dn_moved = abs(best_ask_dn - state.anchor_dn) > self.cfg.reprice_threshold
@@ -453,6 +465,8 @@ class LadderManager:
         total = up_filled + dn_filled
         imbalance = abs(up_filled - dn_filled) / max(up_filled, dn_filled) if total > 0 else 0.0
 
+        state = self.ladders.get(market_id)
+
         return {
             "up_resting": up_resting,
             "dn_resting": dn_resting,
@@ -460,6 +474,12 @@ class LadderManager:
             "dn_filled": dn_filled,
             "up_vwap": up_vwap,
             "dn_vwap": dn_vwap,
-            "combined_vwap": up_vwap + dn_vwap,
+            "pair_cost": up_vwap + dn_vwap,
             "imbalance": imbalance,
+            "ask_up": state.current_ask_up if state else 0.0,
+            "ask_dn": state.current_ask_dn if state else 0.0,
+            "up_filled_count": self.tracker.filled_count(market_id, Side.UP),
+            "dn_filled_count": self.tracker.filled_count(market_id, Side.DOWN),
+            "up_total_rungs": self.tracker.total_count(market_id, Side.UP),
+            "dn_total_rungs": self.tracker.total_count(market_id, Side.DOWN),
         }

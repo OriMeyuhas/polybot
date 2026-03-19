@@ -104,7 +104,10 @@ def test_snapshot_ladders_with_time_left():
         "up_resting": 5, "dn_resting": 6,
         "up_filled": 20.0, "dn_filled": 18.0,
         "up_vwap": 0.40, "dn_vwap": 0.45,
-        "combined_vwap": 0.85, "imbalance": 0.10,
+        "pair_cost": 0.85, "imbalance": 0.10,
+        "ask_up": 0.43, "ask_dn": 0.48,
+        "up_filled_count": 3, "dn_filled_count": 2,
+        "up_total_rungs": 8, "dn_total_rungs": 8,
     }
     snap = build_state_snapshot(bot)
     assert len(snap["ladders"]) == 1

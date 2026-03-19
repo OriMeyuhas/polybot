@@ -51,9 +51,15 @@ def build_state_snapshot(bot: Bot) -> dict:
             "up_resting": stats["up_resting"], "dn_resting": stats["dn_resting"],
             "up_filled": stats["up_filled"], "dn_filled": stats["dn_filled"],
             "up_vwap": round(stats["up_vwap"], 4), "dn_vwap": round(stats["dn_vwap"], 4),
-            "pair_cost": round(stats["combined_vwap"], 4),
+            "pair_cost": round(stats["pair_cost"], 4),
             "imbalance": round(stats["imbalance"], 4),
             "time_left_sec": time_left,
+            "ask_up": round(stats["ask_up"], 4),
+            "ask_dn": round(stats["ask_dn"], 4),
+            "up_filled_count": stats["up_filled_count"],
+            "dn_filled_count": stats["dn_filled_count"],
+            "up_total_rungs": stats["up_total_rungs"],
+            "dn_total_rungs": stats["dn_total_rungs"],
         })
 
     positions = []
