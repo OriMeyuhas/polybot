@@ -109,3 +109,25 @@ def test_parse_slug_timing_1h():
     _, timeframe_sec, _, close_epoch = result
     assert timeframe_sec == 3600
     assert close_epoch == 1773942300 + 3600
+
+
+import logging
+
+
+def test_discovery_logs_filter_reasons(caplog):
+    """Discovery should log why each market is filtered out."""
+    from polybot.data.gamma import _filter_market_from_event
+
+    # Market with missing token IDs (clobTokenIds is empty JSON array)
+    market = {
+        "slug": "btc-updown-5m-1773942300",
+        "clobTokenIds": "[]",
+        "outcomes": '["Up", "Down"]',
+        "endDate": "2026-03-20T12:05:00Z",
+        "active": True,
+        "liquidityNum": 100.0,
+    }
+    with caplog.at_level(logging.DEBUG, logger="polybot.data.gamma"):
+        result = _filter_market_from_event(market, event={}, patterns=["btc-updown-5m-"], now_epoch=1773942330)
+    assert result is None
+    assert "token" in caplog.text.lower() or "skip" in caplog.text.lower()
