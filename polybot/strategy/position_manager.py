@@ -41,6 +41,11 @@ class PositionManager:
         )
 
     def update_bankroll(self, new_bankroll: float):
+        if abs(new_bankroll - self.bankroll) > 0.01:
+            logger.info(
+                "Bankroll updated: $%.2f -> $%.2f (delta: %+.2f)",
+                self.bankroll, new_bankroll, new_bankroll - self.bankroll,
+            )
         self.bankroll = new_bankroll
 
     def mark_pending_settlement(self, market_id: str) -> None:
