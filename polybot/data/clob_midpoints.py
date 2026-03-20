@@ -33,20 +33,22 @@ class ClobMidpointPoller:
         async with httpx.AsyncClient(timeout=10) as client:
             while self._running:
                 if self._token_ids:
-                    try:
-                        resp = await client.post(
-                            f"{clob_host}/midpoints",
-                            json=list(self._token_ids),
-                        )
-                        if resp.status_code == 200:
-                            data = resp.json()
-                            for token_id, mid_str in data.items():
-                                try:
-                                    self._midpoints[token_id] = Decimal(str(mid_str))
-                                except (ValueError, TypeError):
-                                    pass
-                    except Exception as e:
-                        logger.warning("CLOB midpoint poll failed: %s", e)
+                    for token_id in list(self._token_ids):
+                        try:
+                            resp = await client.get(
+                                f"{clob_host}/midpoint",
+                                params={"token_id": token_id},
+                            )
+                            if resp.status_code == 200:
+                                data = resp.json()
+                                mid_str = data.get("mid") if isinstance(data, dict) else data
+                                if mid_str is not None:
+                                    try:
+                                        self._midpoints[token_id] = Decimal(str(mid_str))
+                                    except (ValueError, TypeError):
+                                        pass
+                        except Exception as e:
+                            logger.debug("Midpoint poll failed for %s: %s", token_id[:16], e)
                 await asyncio.sleep(poll_interval)
 
     async def stop(self) -> None:
