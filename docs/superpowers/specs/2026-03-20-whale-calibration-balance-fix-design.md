@@ -33,17 +33,20 @@ Then filters client-side by `hours_left > max_hours_to_resolution` (default 2h, 
 
 ### Fix
 
-1. **Server-side date filtering.** Use Gamma API's `end_date_window_start` and `end_date_window_end` query parameters to request only markets ending between `now` and `now + max_hours_to_resolution`. Combined with `active=true` status filter.
+1. **Server-side date filtering.** Try Gamma API `end_date_window_start` and `end_date_window_end` query parameters to request only markets ending between `now` and `now + max_hours_to_resolution`, combined with `active=true` status filter. **Fallback:** If those params are not supported by the Gamma API, keep client-side filtering but improve it with slug-derived timestamps (see #2) as the primary time source instead of the unreliable `endDate` field.
 
-2. **Slug-epoch cross-check.** Crypto up/down slugs embed the window start epoch: `btc-updown-5m-{epoch}`. Parse this to derive `open_epoch` and `close_epoch` (open + timeframe) independently of the API's `endDate` field. Use the slug-derived times as the primary source, with API `endDate` as validation.
+2. **Slug-based time derivation (primary time source).** Crypto up/down slugs embed timing info (e.g., `btc-updown-5m-1773942300` with epoch or `btc-updown-15m-2026-03-19` with date). Parse the slug to extract: asset, timeframe (5m/15m), and window identifier. Derive `open_epoch` and `close_epoch` (open + timeframe_seconds) from the slug. Use these as the primary time source for `is_active()` checks, with API `endDate` as a secondary validation. Handle both epoch and date formats in the slug suffix.
 
 3. **CLOB API fallback.** If Gamma returns 0 results, query `GET https://clob.polymarket.com/markets` filtered by known condition IDs or token patterns. This provides a second source of active markets.
 
-4. **Diagnostic logging.** Log the reason each market is filtered out (time, slug mismatch, liquidity, missing tokens) so "Discovered 0 active markets" is always diagnosable.
+4. **Preserve markets on total discovery failure.** If both Gamma and CLOB return 0 results, keep the previous `_active_markets` dict unchanged and log at ERROR level. This prevents wiping all active ladders/positions when the API is temporarily unavailable.
+
+5. **Diagnostic logging.** Log the reason each market is filtered out (time, slug mismatch, liquidity, missing tokens) so "Discovered 0 active markets" is always diagnosable.
 
 ### Files Changed
 
-- `polybot/data/gamma.py` — Server-side filters, slug-epoch parsing, CLOB fallback, logging.
+- `polybot/data/gamma.py` — Server-side filters (with fallback), slug-based time derivation, CLOB fallback, logging.
+- `polybot/bot.py` — Preserve previous markets on total discovery failure.
 
 ## Phase 2: Dynamic Balance Integration
 
@@ -56,15 +59,22 @@ Then filters client-side by `hours_left > max_hours_to_resolution` (default 2h, 
 
 ### Fix
 
-1. **Balance sync in `_poll_wallet_balance()`.** After polling:
-   - **Live mode:** Set `position_manager.bankroll = on-chain USDC balance` (from `get_balance_allowance` with `AssetType.COLLATERAL`). On-chain balance is the source of truth.
-   - **Paper mode:** `position_manager.bankroll` already tracks `initial + cumulative_pnl`. Set `_wallet_balance = position_manager.bankroll` (existing behavior, no change needed).
+1. **Initial balance fetch on startup.** In `Bot.start()` (or top of `_run_trading_loop()` before first tick), do one synchronous balance fetch so the first ladder is sized correctly. This eliminates the 60s stale-bankroll window after restart.
 
-2. **Dynamic `get_ladder_params()`.** Change signature to accept `current_bankroll: float` parameter. Every `post_ladder()` call passes the live `position_manager.bankroll`. The auto-scaling formulas then adapt:
+2. **Balance sync in `_poll_wallet_balance()`.** After polling:
+   - **Live mode:** Set `position_manager.bankroll = on-chain USDC balance` (via `clob_client.get_balance_allowance()`). On-chain balance is the source of truth. **Remove the `bankroll += pnl` line in `_settle_position()` for live mode** — PnL is reflected in the on-chain balance after redemption, so adding it locally would double-count.
+   - **Paper mode:** `position_manager.bankroll` already tracks `initial + cumulative_pnl` via `+= pnl` on settlement. Set `_wallet_balance = position_manager.bankroll` (existing behavior, no change needed).
+   - **On poll failure:** Keep the last known bankroll value, log at WARNING level (not DEBUG).
+
+3. **Dynamic `get_ladder_params()`.** Change signature to accept `current_bankroll: float` parameter. All internal formulas use `current_bankroll` instead of `self.bankroll`. Every call site passes the live `position_manager.bankroll`:
+   - `ladder_manager.py` — `post_ladder()` and `reprice_if_needed()`
+   - `bot.py` — `build_state_snapshot()` (dashboard display)
+
+   The auto-scaling formulas then adapt:
    - `auto_fraction = max(0.02, min(0.30, 25.0 / current_bankroll))`
    - `auto_rungs = max(8, min(60, int(12 * log10(current_bankroll))))`
 
-3. **Minimum capital guard.** Before posting a ladder, verify:
+4. **Minimum capital guard.** Before posting a ladder, verify:
    ```
    available = position_manager.bankroll - total_committed()
    min_required = MIN_ORDER_SIZE * avg_price * 2 * min_rungs_per_side
@@ -72,14 +82,14 @@ Then filters client-side by `hours_left > max_hours_to_resolution` (default 2h, 
    ```
    Prevents posting ladders with sub-minimum rung sizes.
 
-4. **Overleverage protection.** If `_wallet_balance < total_committed()` in live mode, pause new ladder posting and log a warning. Resume when balance recovers (e.g., after redemptions complete).
+5. **Overleverage protection.** If `_wallet_balance < total_committed()` in live mode, skip `post_ladder()` calls for new markets and log at WARNING level. Existing resting orders are NOT cancelled — they may still fill profitably. Resume posting when balance recovers (e.g., after redemptions complete).
 
 ### Files Changed
 
-- `polybot/bot.py` — Balance-to-bankroll sync in `_poll_wallet_balance()`, overleverage check before ladder posting.
-- `polybot/config.py` — `get_ladder_params(current_bankroll)` accepts dynamic bankroll argument.
+- `polybot/bot.py` — Initial balance fetch in `start()`, balance-to-bankroll sync in `_poll_wallet_balance()`, conditional `+= pnl` (paper only), overleverage check before ladder posting, `build_state_snapshot()` updated for new `get_ladder_params` signature.
+- `polybot/config.py` — `get_ladder_params(current_bankroll)` accepts dynamic bankroll argument, all internal references use the parameter.
 - `polybot/strategy/ladder_manager.py` — Pass current bankroll to `get_ladder_params()`, add minimum capital guard.
-- `polybot/strategy/position_manager.py` — Add `update_bankroll(balance: float)` method with logging.
+- `polybot/strategy/position_manager.py` — Enhance existing `update_bankroll(balance: float)` method with logging.
 
 ## Phase 3: Whale-Calibrated Parameters
 
@@ -116,7 +126,7 @@ Updated defaults in `polybot/config.py` for both 15m and 5m ladder parameters. T
 
 ### Files Changed
 
-- `polybot/config.py` — Updated default values for ladder parameters based on analysis.
+- `polybot/config.py` — Updated default values for ladder parameters (both field defaults and `load_bot_config()` env var defaults).
 
 ## What Does NOT Change
 
@@ -131,17 +141,33 @@ Updated defaults in `polybot/config.py` for both 15m and 5m ladder parameters. T
 
 | File | Phase | Nature of Change |
 |------|-------|-----------------|
-| `polybot/data/gamma.py` | 1 | Server-side date filters, slug-epoch parsing, CLOB fallback, diagnostic logging |
-| `polybot/bot.py` | 1, 2 | Balance-to-bankroll sync, overleverage check in trading loop |
-| `polybot/config.py` | 2, 3 | Dynamic `get_ladder_params(current_bankroll)`, whale-calibrated defaults |
-| `polybot/strategy/ladder_manager.py` | 2 | Pass current bankroll, minimum capital guard |
-| `polybot/strategy/position_manager.py` | 2 | `update_bankroll()` method |
+| `polybot/data/gamma.py` | 1 | Server-side date filters (with fallback), slug-based time derivation, CLOB fallback, diagnostic logging |
+| `polybot/bot.py` | 1, 2 | Preserve markets on discovery failure, initial balance fetch, balance-to-bankroll sync, conditional `+= pnl`, overleverage check, `build_state_snapshot()` signature update |
+| `polybot/config.py` | 2, 3 | Dynamic `get_ladder_params(current_bankroll)`, whale-calibrated defaults (both field and env defaults) |
+| `polybot/strategy/ladder_manager.py` | 2 | Pass current bankroll to all `get_ladder_params()` calls, minimum capital guard |
+| `polybot/strategy/position_manager.py` | 2 | Enhance `update_bankroll()` with logging |
 
 ## Testing Strategy
 
-- **Phase 1:** Run bot in paper mode, verify markets are continuously discovered every 60s across multiple 5m/15m window rollovers. Check logs show non-zero market count.
-- **Phase 2:** Start with $100 paper bankroll, run through several windows, verify ladder sizes scale down appropriately. Then $10,000, verify they scale up. Verify bankroll updates after settlement.
-- **Phase 3:** Compare whale-derived params against current defaults. Run paper mode with new params and verify ladders post at reasonable prices/sizes.
+### Unit Tests
+
+- **`get_ladder_params(current_bankroll)` signature change:** Test auto-scaling at $50, $500, $5,000, $50,000 bankrolls for both 5m and 15m timeframes. Update existing tests in `tests/test_config_new_fields.py`.
+- **Balance sync logic:** Test that `_poll_wallet_balance` updates `position_manager.bankroll` in live mode and does NOT overwrite in paper mode. Test failure path (keeps last known value).
+- **Minimum capital guard:** Test that ladders are skipped when available capital is below `MIN_ORDER_SIZE * avg_price * 2 * min_rungs`.
+- **Overleverage protection:** Test that `post_ladder()` is skipped when wallet balance < total committed, and resumes when balance recovers.
+- **PnL accounting:** Test that `bankroll += pnl` only fires in paper mode, not live mode.
+
+### Integration Tests
+
+- **Discovery continuity:** Mock Gamma API to return rolling 5m windows. Verify bot discovers new markets across 3+ window rollovers without gaps.
+- **CLOB fallback path:** Mock Gamma to return 0, verify CLOB fallback is attempted and produces valid markets.
+- **Total failure preservation:** Mock both Gamma and CLOB to return 0, verify `_active_markets` is preserved (not emptied).
+
+### Manual Verification
+
+- **Phase 1:** Run bot in paper mode, verify continuous discovery across multiple window rollovers. Check logs.
+- **Phase 2:** Run with $100 and $10,000 paper bankrolls, verify ladder sizes scale appropriately.
+- **Phase 3:** Compare whale-derived params against current defaults. Verify reasonable ladder configurations.
 
 ## Success Criteria
 
