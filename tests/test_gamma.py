@@ -1,4 +1,4 @@
-from polybot.data.gamma import MarketInfo, to_market_window
+from polybot.data.gamma import MarketInfo, to_market_window, _detect_asset, _parse_json_field
 
 
 def test_to_market_window_basic():
@@ -49,3 +49,63 @@ def test_slug_pattern_matching():
     assert any("eth" in p for p in CRYPTO_SLUG_PATTERNS)
     assert any("sol" in p for p in CRYPTO_SLUG_PATTERNS)
     assert any("xrp" in p for p in CRYPTO_SLUG_PATTERNS)
+
+
+def test_detect_asset_prefix_matching():
+    """Asset detection uses slug prefix — no false positives on 'netherlands'."""
+    assert _detect_asset("btc-updown-15m-2026") == "BTC"
+    assert _detect_asset("eth-updown-5m-12345") == "ETH"
+    assert _detect_asset("sol-updown-15m-12345") == "SOL"
+    assert _detect_asset("xrp-updown-5m-12345") == "XRP"
+    # Should NOT match non-crypto slugs
+    assert _detect_asset("will-netherlands-win") is None
+    assert _detect_asset("ethereum-classic-something") is None  # no 'eth-' prefix
+
+
+def test_parse_json_field():
+    """Gamma API returns JSON strings for outcomes and clobTokenIds."""
+    assert _parse_json_field('["Up", "Down"]') == ["Up", "Down"]
+    assert _parse_json_field('["tok1", "tok2"]') == ["tok1", "tok2"]
+    assert _parse_json_field(["already", "a", "list"]) == ["already", "a", "list"]
+    assert _parse_json_field(None) == []
+    assert _parse_json_field("invalid json{", default=["Yes", "No"]) == ["Yes", "No"]
+
+
+from polybot.data.gamma import parse_slug_timing
+
+
+def test_parse_slug_timing_epoch():
+    """Slug with epoch suffix: btc-updown-5m-1773942300."""
+    result = parse_slug_timing("btc-updown-5m-1773942300")
+    assert result is not None
+    asset, timeframe_sec, open_epoch, close_epoch = result
+    assert asset == "BTC"
+    assert timeframe_sec == 300
+    assert open_epoch == 1773942300
+    assert close_epoch == 1773942600  # open + 300
+
+
+def test_parse_slug_timing_date():
+    """Slug with date suffix: btc-updown-15m-2026-03-19."""
+    result = parse_slug_timing("btc-updown-15m-2026-03-19")
+    assert result is not None
+    asset, timeframe_sec, open_epoch, close_epoch = result
+    assert asset == "BTC"
+    assert timeframe_sec == 900
+    assert open_epoch > 0
+    assert close_epoch == open_epoch + 900
+
+
+def test_parse_slug_timing_unknown():
+    """Non-matching slug returns None."""
+    assert parse_slug_timing("will-trump-win") is None
+    assert parse_slug_timing("") is None
+
+
+def test_parse_slug_timing_1h():
+    """1-hour window slug."""
+    result = parse_slug_timing("eth-updown-1h-1773942300")
+    assert result is not None
+    _, timeframe_sec, _, close_epoch = result
+    assert timeframe_sec == 3600
+    assert close_epoch == 1773942300 + 3600
