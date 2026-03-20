@@ -176,8 +176,42 @@ class Bot:
             int(time.time() - self._start_time) if self._start_time else 0,
         )
 
+    async def run_standby(self):
+        """Start data feeds only — wait for UI Start button to begin trading.
+
+        This keeps the dashboard alive with live prices and market discovery,
+        but does NOT post any orders until ui_start_full() is called.
+        """
+        self.running = True
+        self._cancel_only_mode = True  # No trading until Start pressed
+        self._start_time = time.time()
+        self.gui_state.update(running=True, mode=self.mode)
+        logger.info("Bot in standby — waiting for Start button (bankroll: $%.2f, assets: %s)",
+                     self.position_manager.bankroll, self.cfg.assets)
+
+        # Start data feeds so dashboard shows live prices
+        tasks = [
+            asyncio.create_task(self.price_feed.run()),
+            asyncio.create_task(
+                self.midpoint_poller.run(
+                    self.cfg.polymarket_host, self.cfg.clob_midpoint_poll_sec
+                )
+            ),
+            asyncio.create_task(self.market_ws.run([])),
+            asyncio.create_task(self._run_trading_loop()),
+            asyncio.create_task(self._run_settlement_poller()),
+            asyncio.create_task(self._poll_wallet_balance()),
+        ]
+        self._tasks = tasks
+        try:
+            await asyncio.gather(*tasks)
+        except asyncio.CancelledError:
+            logger.info("Bot shutting down")
+        finally:
+            await self.stop()
+
     async def run(self):
-        """Main entry point — start all concurrent tasks."""
+        """Main entry point — start all concurrent tasks (auto-trade immediately)."""
         logger.info(
             "Bot starting — bankroll: $%.2f, assets: %s",
             self.position_manager.bankroll,
@@ -214,9 +248,27 @@ class Bot:
     # ------------------------------------------------------------------
 
     async def ui_start(self):
-        """Called from web UI POST /api/start."""
+        """Called from web UI POST /api/start — resume trading."""
         self._cancel_only_mode = False
         logger.info("Trading resumed via UI")
+
+    async def ui_start_full(self):
+        """Called from web UI POST /api/start — full start including balance fetch."""
+        # Initial balance fetch
+        if not self.cfg.dry_run:
+            try:
+                result = await asyncio.to_thread(
+                    self.clob_client.get_balance_allowance
+                )
+                balance = float(result.get("balance", 0)) / 1e6
+                self._wallet_balance = balance
+                self.position_manager.update_bankroll(balance)
+                logger.info("Initial wallet balance: $%.2f", balance)
+            except Exception as e:
+                logger.warning("Initial balance fetch failed: %s", e)
+        self._cancel_only_mode = False
+        self._start_time = time.time()
+        logger.info("Trading started via UI")
 
     async def ui_stop(self):
         """Called from web UI POST /api/stop."""
@@ -723,12 +775,21 @@ class Bot:
             if sp:
                 spots[asset] = sp
 
-        # CLOB midpoint prices
+        # CLOB midpoint prices (keyed by token_id for market cards)
         for mid, mkt in self._active_markets.items():
             for token_id in [mkt.up_token_id, mkt.dn_token_id]:
                 mp = self.midpoint_poller.get_mid(token_id)
                 if mp is not None:
                     prices[token_id] = float(mp)
+
+        # Polymarket asset-level prices (UP token midpoint per asset, for price strip)
+        polymarket_prices: dict[str, float] = {}
+        for mkt in active_list:
+            if mkt.asset in polymarket_prices:
+                continue  # first found (shortest timeframe) wins
+            up_mid = self.midpoint_poller.get_mid(mkt.up_token_id)
+            if up_mid is not None:
+                polymarket_prices[mkt.asset] = float(up_mid)
 
         # Active markets info — flat format matching frontend expectations
         active_markets_info = []
@@ -840,7 +901,7 @@ class Bot:
             ),
             "markets_active": len(self._active_markets),
             "win_rate": 0.0,  # TODO
-            "prices": prices,
+            "prices": polymarket_prices,
             "binance_prices": binance_prices,
             "spots": spots,
             "active_markets": active_markets_info,

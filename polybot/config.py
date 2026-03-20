@@ -70,7 +70,7 @@ class BotConfig:
     ladder_spacing: float = 0.01
     ladder_width: float = 0.70
     ladder_size_skew: float = 8.9
-    max_pair_cost: float = 0.54   # 95th-pct winning avg_price = 0.541
+    max_pair_cost: float = 0.92   # combined UP+DN VWAP ceiling (whale data: >0.95 loses money)
     position_size_fraction: float = 0.05
 
     # Ladder parameters — 5m overrides (whale-calibrated: 324 windows)
@@ -78,7 +78,7 @@ class BotConfig:
     ladder_spacing_5m: float = 0.01
     ladder_width_5m: float = 0.55
     ladder_size_skew_5m: float = 4.5
-    max_pair_cost_5m: float = 0.56  # 95th-pct winning avg_price = 0.557
+    max_pair_cost_5m: float = 0.92  # combined UP+DN VWAP ceiling
     position_size_fraction_5m: float = 0.021
 
     # Shared ladder / risk parameters
@@ -185,13 +185,13 @@ def load_bot_config() -> BotConfig:
         ladder_spacing=float(os.getenv("LADDER_SPACING", "0.01")),
         ladder_width=float(os.getenv("LADDER_WIDTH", "0.70")),
         ladder_size_skew=float(os.getenv("LADDER_SIZE_SKEW", "8.9")),
-        max_pair_cost=float(os.getenv("MAX_PAIR_COST", "0.54")),
+        max_pair_cost=float(os.getenv("MAX_PAIR_COST", "0.92")),
         position_size_fraction=float(os.getenv("POSITION_SIZE_FRACTION", "0.05")),
         ladder_rungs_5m=int(os.getenv("LADDER_RUNGS_5M", "23")),
         ladder_spacing_5m=float(os.getenv("LADDER_SPACING_5M", "0.01")),
         ladder_width_5m=float(os.getenv("LADDER_WIDTH_5M", "0.55")),
         ladder_size_skew_5m=float(os.getenv("LADDER_SIZE_SKEW_5M", "4.5")),
-        max_pair_cost_5m=float(os.getenv("MAX_PAIR_COST_5M", "0.56")),
+        max_pair_cost_5m=float(os.getenv("MAX_PAIR_COST_5M", "0.92")),
         position_size_fraction_5m=float(os.getenv("POSITION_SIZE_FRACTION_5M", "0.021")),
         reprice_threshold=float(os.getenv("REPRICE_THRESHOLD", "0.03")),
         max_imbalance_ratio=float(os.getenv("MAX_IMBALANCE_RATIO", "0.60")),

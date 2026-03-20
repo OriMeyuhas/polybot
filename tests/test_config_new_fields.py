@@ -15,7 +15,7 @@ def test_existing_fields_unchanged():
     cfg = BotConfig()
     assert cfg.ladder_rungs == 31
     assert cfg.ladder_spacing == 0.01
-    assert cfg.max_pair_cost == 0.54
+    assert cfg.max_pair_cost == 0.92
     assert cfg.web_port == 8080
     assert cfg.dry_run is True
 
