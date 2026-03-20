@@ -18,3 +18,29 @@ def test_existing_fields_unchanged():
     assert cfg.max_pair_cost == 0.95
     assert cfg.web_port == 8080
     assert cfg.dry_run is True
+
+
+def test_get_ladder_params_dynamic_bankroll():
+    """get_ladder_params should use current_bankroll, not self.bankroll."""
+    from polybot.config import BotConfig
+
+    cfg = BotConfig(dry_run=True, bankroll=1000.0)
+
+    lp_100 = cfg.get_ladder_params(900, current_bankroll=100.0)
+    lp_50k = cfg.get_ladder_params(900, current_bankroll=50000.0)
+
+    assert lp_100.position_size_fraction > lp_50k.position_size_fraction
+    assert lp_100.rungs < lp_50k.rungs
+
+
+def test_get_ladder_params_5m_dynamic_bankroll():
+    """5m params should also scale with current_bankroll."""
+    from polybot.config import BotConfig
+
+    cfg = BotConfig(dry_run=True, bankroll=1000.0)
+
+    lp_100 = cfg.get_ladder_params(300, current_bankroll=100.0)
+    lp_50k = cfg.get_ladder_params(300, current_bankroll=50000.0)
+
+    assert lp_100.position_size_fraction > lp_50k.position_size_fraction
+    assert lp_100.position_size_fraction < 0.10

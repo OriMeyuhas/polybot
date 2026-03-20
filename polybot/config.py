@@ -120,7 +120,7 @@ class BotConfig:
     # Mock client tuning
     mock_base_fill_rate: float = 0.03
     web_port: int = 8080
-    start_paused: bool = True
+    start_paused: bool = False
 
     # Data layer config (new for infrastructure rebuild)
     binance_fallback_interval_sec: float = 2.0
@@ -130,25 +130,33 @@ class BotConfig:
     coingecko_ids: tuple = ("bitcoin", "ethereum", "solana", "ripple")
     bankroll: float = 1000.0  # Default paper bankroll; overridable via env
 
-    def get_ladder_params(self, timeframe_sec: int) -> LadderParams:
-        """Return ladder parameters tuned for the given timeframe."""
-        if timeframe_sec <= 300:  # 5m or shorter
+    def get_ladder_params(self, timeframe_sec: int, current_bankroll: float | None = None) -> LadderParams:
+        """Return ladder parameters tuned for the given timeframe.
+
+        Auto-scales position_size_fraction and rung count based on current_bankroll.
+        Falls back to self.bankroll if current_bankroll is not provided (backward compat).
+        """
+        import math
+        bankroll = max(current_bankroll if current_bankroll is not None else self.bankroll, 50)
+        auto_fraction = max(0.02, min(0.30, 25.0 / bankroll))
+        auto_rungs = max(8, min(60, int(12 * math.log10(bankroll))))
+
+        if timeframe_sec <= 300:
             return LadderParams(
-                rungs=self.ladder_rungs_5m,
+                rungs=min(auto_rungs, self.ladder_rungs_5m),
                 spacing=self.ladder_spacing_5m,
                 width=self.ladder_width_5m,
                 size_skew=self.ladder_size_skew_5m,
                 max_pair_cost=self.max_pair_cost_5m,
-                position_size_fraction=self.position_size_fraction_5m,
+                position_size_fraction=auto_fraction * 0.33,
             )
-        # 15m and longer use default params
         return LadderParams(
-            rungs=self.ladder_rungs,
+            rungs=min(auto_rungs, self.ladder_rungs),
             spacing=self.ladder_spacing,
             width=self.ladder_width,
             size_skew=self.ladder_size_skew,
             max_pair_cost=self.max_pair_cost,
-            position_size_fraction=self.position_size_fraction,
+            position_size_fraction=auto_fraction,
         )
 
 
@@ -192,7 +200,7 @@ def load_bot_config() -> BotConfig:
         dry_run=os.getenv("DRY_RUN", "true").lower() in ("true", "1", "yes"),
         mock_base_fill_rate=float(os.getenv("MOCK_BASE_FILL_RATE", "0.03")),
         web_port=int(os.getenv("WEB_PORT", "8080")),
-        start_paused=os.getenv("START_PAUSED", "true").lower() in ("true", "1", "yes"),
+        start_paused=os.getenv("START_PAUSED", "false").lower() in ("true", "1", "yes"),
         binance_fallback_interval_sec=float(os.getenv("BINANCE_FALLBACK_INTERVAL_SEC", "2.0")),
         clob_midpoint_poll_sec=float(os.getenv("CLOB_MIDPOINT_POLL_SEC", "2.0")),
         market_ws_ping_sec=float(os.getenv("MARKET_WS_PING_SEC", "10.0")),
