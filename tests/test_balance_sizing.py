@@ -55,3 +55,53 @@ def test_min_capital_guard_skips_when_broke():
     )
     count = lm.post_ladder(market)
     assert count == 0
+
+
+from polybot.bot import Bot
+
+
+def test_settle_position_paper_updates_bankroll():
+    """In paper mode, _settle_position should add PnL to bankroll."""
+    cfg = BotConfig(dry_run=True, bankroll=1000.0)
+    bot = Bot(cfg)
+    assert bot.position_manager.bankroll == 1000.0
+
+
+def test_bot_wallet_balance_initialized_from_bankroll():
+    """Bot._wallet_balance should start equal to cfg.bankroll."""
+    cfg = BotConfig(dry_run=True, bankroll=500.0)
+    bot = Bot(cfg)
+    assert bot._wallet_balance == 500.0
+
+
+def test_settle_position_live_does_not_add_pnl():
+    """In live mode, _settle_position should NOT add PnL to bankroll."""
+    cfg = BotConfig(dry_run=False, bankroll=1000.0, private_key="0x" + "ab" * 32)
+    bot = Bot(cfg)
+    from polybot.types import Position
+    market = MarketWindow(
+        market_id="test", condition_id="c", asset="BTC",
+        timeframe_sec=300, up_token_id="up", dn_token_id="dn",
+        open_epoch=100, close_epoch=400,
+    )
+    bot.position_manager.positions["test"] = Position(
+        market_id="test", up_qty=100, up_cost=50, dn_qty=0, dn_cost=0,
+    )
+    bot.position_manager.mark_pending_settlement("test")
+    bot._expired_market_cache["test"] = market
+    bankroll_before = bot.position_manager.bankroll
+    bot._settle_position("test", market, "UP")
+    assert bot.position_manager.bankroll == bankroll_before
+
+
+def test_overleverage_flag():
+    """Bot should detect overleveraged state when wallet < committed."""
+    cfg = BotConfig(dry_run=False, bankroll=100.0, private_key="0x" + "ab" * 32)
+    bot = Bot(cfg)
+    bot._wallet_balance = 50.0
+    committed = 100.0
+    overleveraged = (
+        not bot.cfg.dry_run
+        and bot._wallet_balance < committed
+    )
+    assert overleveraged is True

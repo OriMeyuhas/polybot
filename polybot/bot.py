@@ -130,6 +130,20 @@ class Bot:
         self.running = True
         self._start_time = time.time()
         self.gui_state.update(running=True, mode=self.mode)
+
+        # Initial balance fetch so first ladder is sized correctly
+        if not self.cfg.dry_run:
+            try:
+                result = await asyncio.to_thread(
+                    self.clob_client.get_balance_allowance
+                )
+                balance = float(result.get("balance", 0)) / 1e6
+                self._wallet_balance = balance
+                self.position_manager.update_bankroll(balance)
+                logger.info("Initial wallet balance: $%.2f", balance)
+            except Exception as e:
+                logger.warning("Initial balance fetch failed: %s", e)
+
         logger.info("Bot started in %s mode", self.mode)
 
     async def stop(self):
@@ -285,27 +299,39 @@ class Bot:
         market_map = {m.market_id: m for m in active_list}
 
         if not self._cancel_only_mode:
-            # Post ladders on new markets
-            for market in active_list:
-                if not market.is_active(now):
-                    continue
-                if self.ladder_manager.has_ladder(market.market_id):
-                    continue
-                elapsed_pct = (
-                    market.elapsed(now) / market.timeframe_sec
-                    if market.timeframe_sec > 0
-                    else 1.0
+            # Overleverage protection (live mode only)
+            overleveraged = (
+                not self.cfg.dry_run
+                and self._wallet_balance < self.ladder_manager.total_committed()
+            )
+            if overleveraged:
+                logger.warning(
+                    "OVERLEVERAGED: wallet $%.2f < committed $%.2f — skipping new ladders",
+                    self._wallet_balance, self.ladder_manager.total_committed(),
                 )
-                if elapsed_pct >= 0.10:
-                    count = await asyncio.to_thread(
-                        self.ladder_manager.post_ladder, market
+
+            # Post ladders on new markets
+            if not overleveraged:
+                for market in active_list:
+                    if not market.is_active(now):
+                        continue
+                    if self.ladder_manager.has_ladder(market.market_id):
+                        continue
+                    elapsed_pct = (
+                        market.elapsed(now) / market.timeframe_sec
+                        if market.timeframe_sec > 0
+                        else 1.0
                     )
-                    if count > 0:
-                        self._record_activity(
-                            "LADDER",
-                            market.asset,
-                            f"posted {count} rungs on {market.market_id}",
+                    if elapsed_pct >= 0.10:
+                        count = await asyncio.to_thread(
+                            self.ladder_manager.post_ladder, market
                         )
+                        if count > 0:
+                            self._record_activity(
+                                "LADDER",
+                                market.asset,
+                                f"posted {count} rungs on {market.market_id}",
+                            )
 
             # Reprice if book moved
             await asyncio.to_thread(
@@ -472,7 +498,11 @@ class Bot:
             logger.info("Settled %s: %s, PnL=$%.2f", mid, outcome, pnl)
             self.risk.update_pnl(pnl)
             self._realized_pnl += pnl
-            self.position_manager.bankroll += pnl
+
+            # Only update bankroll from PnL in paper mode.
+            # In live mode, on-chain balance is the source of truth.
+            if self.cfg.dry_run:
+                self.position_manager.bankroll += pnl
 
             if losing > 0:
                 detail = f"{outcome} won \u2192 \u2191 +${winning:.2f} \u2193 -${losing:.2f} = net ${pnl:+.2f}"
@@ -566,18 +596,20 @@ class Bot:
     # ------------------------------------------------------------------
 
     async def _poll_wallet_balance(self):
-        """Poll wallet USDC balance every 60s. Stores in _wallet_balance."""
+        """Poll wallet USDC balance every 60s. Syncs into position_manager.bankroll."""
         while self.running:
             try:
                 if not self.cfg.dry_run:
                     result = await asyncio.to_thread(
                         self.clob_client.get_balance_allowance
                     )
-                    self._wallet_balance = float(result.get("balance", 0)) / 1e6
+                    balance = float(result.get("balance", 0)) / 1e6
+                    self._wallet_balance = balance
+                    self.position_manager.update_bankroll(balance)
                 else:
                     self._wallet_balance = self.position_manager.bankroll
             except Exception as e:
-                logger.debug("Balance poll failed: %s", e)
+                logger.warning("Balance poll failed (keeping last known): %s", e)
             await asyncio.sleep(60)
 
     # ------------------------------------------------------------------
@@ -723,7 +755,8 @@ class Bot:
                     {
                         "rungs_filled": 0,  # computed from ladder state
                         "rungs_total": self.cfg.get_ladder_params(
-                            mkt.timeframe_sec
+                            mkt.timeframe_sec,
+                            current_bankroll=self.position_manager.bankroll,
                         ).rungs,
                     }
                     if ladder
