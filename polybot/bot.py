@@ -30,7 +30,6 @@ from polybot.redeemer import Redeemer
 from polybot.errors import ClobApiError
 from polybot.types import MarketWindow, Side, ActivityEvent
 from polybot.web.state import GuiStateHolder
-from polybot.web.server import create_app, start_gui_server
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +106,20 @@ class Bot:
         self._activity_log: deque = deque(maxlen=20)
         self._tasks: list[asyncio.Task] = []
         self._wallet_balance: float = cfg.bankroll
+        self._wallet_address: str | None = self._derive_wallet_address(cfg)
+
+    @staticmethod
+    def _derive_wallet_address(cfg: BotConfig) -> str | None:
+        """Derive wallet address from private key without exposing key material."""
+        if cfg.dry_run or not cfg.private_key:
+            return None
+        try:
+            from eth_account import Account
+            acct = Account.from_key(cfg.private_key)
+            return acct.address
+        except Exception:
+            # If eth_account not installed, return a safe placeholder
+            return "live-wallet"
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -172,6 +185,7 @@ class Bot:
             asyncio.create_task(self._run_settlement_poller()),
             asyncio.create_task(self.redeemer.run(self._redeem_tokens)),
             asyncio.create_task(self._run_daily_reset()),
+            asyncio.create_task(self._poll_wallet_balance()),
         ]
         self._tasks = tasks
         try:
@@ -239,7 +253,7 @@ class Bot:
 
         # Handle pending cancel-all from /api/stop
         if self._pending_cancel_all:
-            self.ladder_manager.cancel_all_ladders()
+            await asyncio.to_thread(self.ladder_manager.cancel_all_ladders)
             self._pending_cancel_all = False
 
         # Detect resume transition (stopped -> running)
@@ -326,7 +340,7 @@ class Bot:
                 self._record_activity("FILL", market.asset, " ".join(parts))
 
         # Imbalance guard
-        self.ladder_manager.check_imbalance(now)
+        await asyncio.to_thread(self.ladder_manager.check_imbalance, now)
 
         # Cancel rungs on expiring windows
         for market in active_list:
@@ -335,7 +349,9 @@ class Bot:
                 and market.remaining(now) < self.cfg.no_trade_final_sec
             ):
                 if self.ladder_manager.has_ladder(market.market_id):
-                    cancelled = self.ladder_manager.cancel_ladder(market.market_id)
+                    cancelled = await asyncio.to_thread(
+                        self.ladder_manager.cancel_ladder, market.market_id
+                    )
                     if cancelled > 0:
                         self._record_activity(
                             "CANCEL",
@@ -344,7 +360,7 @@ class Bot:
                         )
 
         # Settlement
-        self._settle_expired_windows(now)
+        await self._settle_expired_windows(now)
 
         # Cleanup expired window snapshots
         self._cleanup_expired_windows(now)
@@ -359,7 +375,15 @@ class Bot:
     async def _discover_markets(self):
         """Discover active crypto up/down markets via Gamma API."""
         try:
-            results = await discover_crypto_updown_markets()
+            # Build slug patterns from enabled assets
+            patterns = []
+            for asset in self.cfg.assets:
+                a = asset.lower()
+                patterns.append(f"{a}-updown-5m-")
+                patterns.append(f"{a}-updown-15m-")
+            results = await discover_crypto_updown_markets(
+                slug_patterns=patterns,
+            )
             new_markets: dict[str, MarketWindow] = {}
             all_token_ids: list[str] = []
             for info, asset in results:
@@ -367,17 +391,21 @@ class Bot:
                 new_markets[mw.market_id] = mw
                 all_token_ids.extend([mw.up_token_id, mw.dn_token_id])
 
-            # Log arrivals/departures
-            old_ids = set(self._active_markets.keys())
-            new_ids = set(new_markets.keys())
-            arrived = new_ids - old_ids
-            departed = old_ids - new_ids
-            if arrived:
-                logger.info("NEW WINDOWS: %s", ", ".join(arrived))
-            if departed:
-                logger.info("EXPIRED WINDOWS: %s", ", ".join(departed))
-
-            self._active_markets = new_markets
+            if not new_markets and self._active_markets:
+                logger.error(
+                    "Discovery returned 0 markets — preserving %d existing markets",
+                    len(self._active_markets),
+                )
+            else:
+                old_ids = set(self._active_markets.keys())
+                new_ids = set(new_markets.keys())
+                arrived = new_ids - old_ids
+                departed = old_ids - new_ids
+                if arrived:
+                    logger.info("NEW WINDOWS: %s", ", ".join(arrived))
+                if departed:
+                    logger.info("EXPIRED WINDOWS: %s", ", ".join(departed))
+                self._active_markets = new_markets
 
             # Update subscriptions
             self.midpoint_poller.register_tokens(all_token_ids)
@@ -404,7 +432,7 @@ class Bot:
     # Settlement
     # ------------------------------------------------------------------
 
-    def _settle_expired_windows(self, now_epoch: int):
+    async def _settle_expired_windows(self, now_epoch: int):
         """Mark expired windows for settlement."""
         for market in list(self._active_markets.values()):
             if market.is_active(now_epoch):
@@ -417,7 +445,7 @@ class Bot:
                 continue
 
             # Cancel any remaining orders on exchange
-            self.ladder_manager.cancel_ladder(mid)
+            await asyncio.to_thread(self.ladder_manager.cancel_ladder, mid)
             self.ladder_manager.cleanup_ladder(mid)
 
             # Clean up window state
@@ -555,6 +583,10 @@ class Bot:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _compute_unrealized_pnl(self) -> float:
+        """Compute unrealized PnL across all open positions. Returns 0.0 for now."""
+        return 0.0
 
     def compute_spot_delta(self, asset: str) -> float:
         current = self.spot_prices.get(asset, 0.0)
@@ -709,11 +741,12 @@ class Bot:
         return {
             "mode": self.mode,
             "running": self.running,
+            "connected": self.running,
             "heartbeat_healthy": self.heartbeat.is_healthy(),
             "cancel_only_mode": self._cancel_only_mode,
-            "total_pnl": self._realized_pnl,
+            "total_pnl": self._realized_pnl + self._compute_unrealized_pnl(),
             "realized_pnl": self._realized_pnl,
-            "unrealized_pnl": 0.0,  # TODO: compute from positions
+            "unrealized_pnl": self._compute_unrealized_pnl(),
             "trade_count": self._trade_count,
             "position_count": self.position_manager.active_position_count(),
             "pairs_completed": pairs_completed,
@@ -743,6 +776,6 @@ class Bot:
             "wallet": (
                 None
                 if self.cfg.dry_run
-                else self.cfg.private_key[:10] + "..."
+                else self._wallet_address
             ),
         }
