@@ -128,7 +128,7 @@ class LadderManager:
                 return 0
 
             # Select timeframe-specific ladder parameters
-            lp = self.cfg.get_ladder_params(market.timeframe_sec)
+            lp = self.cfg.get_ladder_params(market.timeframe_sec, current_bankroll=self.positions.bankroll)
 
             # Don't commit more capital than available bankroll
             available = self.positions.bankroll - self.total_committed()
@@ -136,7 +136,11 @@ class LadderManager:
                 self.positions.bankroll * lp.position_size_fraction,
                 available,
             )
-            if budget < 1.0:
+            # Minimum capital guard: need enough for MIN_ORDER_SIZE on both sides
+            min_required = MIN_ORDER_SIZE * 2.0
+            if budget < min_required:
+                logger.info("MIN CAPITAL: %s skipped — available $%.2f < min $%.2f",
+                            market.market_id, budget, min_required)
                 return 0
 
             tick_size = self.tick_cache.get_tick_size(market.condition_id, token_id=market.up_token_id) if self.tick_cache else 0.01
@@ -304,7 +308,7 @@ class LadderManager:
                 continue
 
             # Select timeframe-specific ladder parameters
-            lp = self.cfg.get_ladder_params(market.timeframe_sec)
+            lp = self.cfg.get_ladder_params(market.timeframe_sec, current_bankroll=self.positions.bankroll)
 
             tick_size = self.tick_cache.get_tick_size(market.condition_id, token_id=market.up_token_id) if self.tick_cache else 0.01
 
