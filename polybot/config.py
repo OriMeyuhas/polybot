@@ -162,7 +162,18 @@ class BotConfig:
 
 def load_bot_config() -> BotConfig:
     load_dotenv()
+
+    # Filter assets based on TRADE_* env vars (default: all enabled)
+    all_assets = ("BTC", "ETH", "SOL", "XRP")
+    assets = tuple(
+        a for a in all_assets
+        if os.getenv(f"TRADE_{a}", "true").lower() in ("true", "1", "yes")
+    )
+    if not assets:
+        assets = all_assets  # fallback: don't run with zero assets
+
     return BotConfig(
+        assets=assets,
         polymarket_host=os.getenv("POLYMARKET_HOST", "https://clob.polymarket.com"),
         chain_id=int(os.getenv("CHAIN_ID", "137")),
         private_key=os.getenv("PRIVATE_KEY", ""),

@@ -730,38 +730,88 @@ class Bot:
                 if mp is not None:
                     prices[token_id] = float(mp)
 
-        # Active markets info
+        # Active markets info — flat format matching frontend expectations
         active_markets_info = []
         for mkt in active_list:
             pos = self.position_manager.positions.get(mkt.market_id)
             ladder = self.ladder_manager.ladders.get(mkt.market_id)
+
+            # Build human-readable label
+            tf_label = f"{mkt.timeframe_sec // 60}m" if mkt.timeframe_sec < 3600 else f"{mkt.timeframe_sec // 3600}h"
+            label = f"{mkt.asset} {tf_label}"
+
+            # Midpoint prices from CLOB poller
+            up_mid = prices.get(mkt.up_token_id)
+            dn_mid = prices.get(mkt.dn_token_id)
+
+            # Book prices from ladder state
+            up_ask = ladder.current_ask_up if ladder else None
+            dn_ask = ladder.current_ask_dn if ladder else None
+
+            # Spread width
+            spread_width = None
+            if up_mid is not None and dn_mid is not None:
+                spread_width = 1.0 - (up_mid + dn_mid)
+
+            # Ladder stats (flat, not nested)
+            lp = self.cfg.get_ladder_params(
+                mkt.timeframe_sec,
+                current_bankroll=self.position_manager.bankroll,
+            )
+            rungs_total = lp.rungs
+            rungs_filled = 0
+            imbalance = None
+            if ladder:
+                try:
+                    stats = self.ladder_manager.get_ladder_stats(mkt.market_id)
+                    if stats:
+                        rungs_filled = stats.get("up_filled_count", 0) + stats.get("dn_filled_count", 0)
+                        imbalance = stats.get("imbalance")
+                except Exception:
+                    pass
+
+            # Position (flat format for frontend)
+            position = None
+            if pos and (pos.up_qty > 0 or pos.dn_qty > 0):
+                if pos.up_qty >= pos.dn_qty:
+                    side = "Up"
+                    size = pos.up_qty
+                    avg_price = pos.up_cost / pos.up_qty if pos.up_qty > 0 else 0
+                    usdc_cost = pos.up_cost
+                else:
+                    side = "Down"
+                    size = pos.dn_qty
+                    avg_price = pos.dn_cost / pos.dn_qty if pos.dn_qty > 0 else 0
+                    usdc_cost = pos.dn_cost
+                position = {
+                    "side": side,
+                    "size": size,
+                    "avg_price": avg_price,
+                    "usdc_cost": usdc_cost,
+                    "unrealized_pnl": 0.0,
+                    "up_qty": pos.up_qty,
+                    "dn_qty": pos.dn_qty,
+                    "pair_cost": pos.pair_cost(),
+                }
+
             info: dict = {
                 "market_id": mkt.market_id,
+                "slug": mkt.market_id,
+                "label": label,
                 "asset": mkt.asset,
                 "timeframe": mkt.timeframe_sec,
                 "up_token_id": mkt.up_token_id,
                 "dn_token_id": mkt.dn_token_id,
                 "remaining_sec": mkt.remaining(now),
-                "position": (
-                    {
-                        "up_qty": pos.up_qty if pos else 0,
-                        "dn_qty": pos.dn_qty if pos else 0,
-                        "pair_cost": pos.pair_cost() if pos else 0,
-                    }
-                    if pos
-                    else None
-                ),
-                "ladder": (
-                    {
-                        "rungs_filled": 0,  # computed from ladder state
-                        "rungs_total": self.cfg.get_ladder_params(
-                            mkt.timeframe_sec,
-                            current_bankroll=self.position_manager.bankroll,
-                        ).rungs,
-                    }
-                    if ladder
-                    else None
-                ),
+                "up_mid": up_mid,
+                "down_mid": dn_mid,
+                "up_ask": up_ask,
+                "down_ask": dn_ask,
+                "spread_width": spread_width,
+                "rungs_filled": rungs_filled,
+                "rungs_total": rungs_total,
+                "imbalance": imbalance,
+                "position": position,
             }
             active_markets_info.append(info)
 
@@ -796,10 +846,9 @@ class Bot:
             "active_markets": active_markets_info,
             "activity_feed": [
                 {
-                    "timestamp": e.timestamp,
-                    "type": e.event_type,
-                    "asset": e.asset,
-                    "detail": e.detail,
+                    "ts": e.timestamp,
+                    "kind": e.event_type,
+                    "msg": f"[{e.asset}] {e.detail}" if e.asset else e.detail,
                     "pnl": e.pnl,
                 }
                 for e in self._activity_log
