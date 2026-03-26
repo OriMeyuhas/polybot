@@ -14,6 +14,14 @@ class LadderParams(NamedTuple):
     position_size_fraction: float
 
 
+class TradingRules(NamedTuple):
+    """Bankroll-adaptive trading rules."""
+    assets: tuple
+    timeframes: tuple       # allowed timeframe_sec values (300, 900, 3600)
+    max_concurrent: int
+    position_fraction: float  # base fraction per window
+
+
 @dataclass(frozen=True)
 class TrackerConfig:
     # Polymarket
@@ -65,29 +73,38 @@ class BotConfig:
     # Assets
     assets: tuple = ("BTC", "ETH", "SOL", "XRP")
 
-    # Ladder parameters — 15m default (whale-calibrated: 0x8dxd tracker 36h, 119 windows)
+    # Ladder parameters — 15m (whale-calibrated: 109K trades, 897 markets, 830 settlements)
     ladder_rungs: int = 31
     ladder_spacing: float = 0.01
-    ladder_width: float = 0.70
-    ladder_size_skew: float = 8.9
-    max_pair_cost: float = 0.92   # combined UP+DN VWAP ceiling (whale data: >0.95 loses money)
+    ladder_width: float = 0.41
+    ladder_size_skew: float = 1.5
+    max_pair_cost: float = 0.90   # combined UP+DN VWAP ceiling (whale data: >0.92 loses money)
     position_size_fraction: float = 0.05
 
-    # Ladder parameters — 5m overrides (whale-calibrated: 324 windows)
-    ladder_rungs_5m: int = 23
+    # Ladder parameters — 5m overrides
+    ladder_rungs_5m: int = 22
     ladder_spacing_5m: float = 0.01
-    ladder_width_5m: float = 0.55
-    ladder_size_skew_5m: float = 4.5
-    max_pair_cost_5m: float = 0.92  # combined UP+DN VWAP ceiling
+    ladder_width_5m: float = 0.29
+    ladder_size_skew_5m: float = 1.5
+    max_pair_cost_5m: float = 0.90
     position_size_fraction_5m: float = 0.021
 
+    # Ladder parameters — 1h overrides
+    ladder_rungs_1h: int = 22
+    ladder_spacing_1h: float = 0.01
+    ladder_width_1h: float = 0.42
+    ladder_size_skew_1h: float = 1.5
+    max_pair_cost_1h: float = 0.90
+    position_size_fraction_1h: float = 0.03
+
     # Shared ladder / risk parameters
-    reprice_threshold: float = 0.03
+    reprice_threshold: float = 0.05
     max_imbalance_ratio: float = 0.60
     imbalance_timeout_sec: int = 30
     # Heartbeat
     heartbeat_interval_sec: float = 5.0
     heartbeat_max_failures: int = 2
+    heartbeat_recovery_threshold: int = 3
 
     # Tick size cache
     tick_size_ttl_sec: float = 60.0
@@ -109,7 +126,8 @@ class BotConfig:
 
     # Polling
     poll_interval_ms: int = 500
-    market_discovery_interval_sec: int = 60
+    market_discovery_interval_sec: int = 15
+    balance_poll_sec: float = 60.0
 
     # Logging
     log_level: str = "INFO"
@@ -133,31 +151,112 @@ class BotConfig:
     def get_ladder_params(self, timeframe_sec: int, current_bankroll: float | None = None) -> LadderParams:
         """Return ladder parameters tuned for the given timeframe.
 
-        Auto-scales position_size_fraction and rung count based on current_bankroll.
-        Falls back to self.bankroll if current_bankroll is not provided (backward compat).
+        Uses get_trading_rules() for bankroll-adaptive position sizing.
         """
         import math
         bankroll = max(current_bankroll if current_bankroll is not None else self.bankroll, 50)
-        auto_fraction = max(0.02, min(0.30, 25.0 / bankroll))
+        rules = get_trading_rules(self.assets, bankroll)
+        base_fraction = rules.position_fraction
         auto_rungs = max(8, min(60, int(12 * math.log10(bankroll))))
 
-        if timeframe_sec <= 300:
+        if timeframe_sec <= 300:  # 5m
             return LadderParams(
                 rungs=min(auto_rungs, self.ladder_rungs_5m),
                 spacing=self.ladder_spacing_5m,
                 width=self.ladder_width_5m,
                 size_skew=self.ladder_size_skew_5m,
                 max_pair_cost=self.max_pair_cost_5m,
-                position_size_fraction=auto_fraction * 0.33,
+                position_size_fraction=base_fraction * 0.33,
             )
+        if timeframe_sec <= 900:  # 15m
+            return LadderParams(
+                rungs=min(auto_rungs, self.ladder_rungs),
+                spacing=self.ladder_spacing,
+                width=self.ladder_width,
+                size_skew=self.ladder_size_skew,
+                max_pair_cost=self.max_pair_cost,
+                position_size_fraction=base_fraction,
+            )
+        # 1h+
         return LadderParams(
-            rungs=min(auto_rungs, self.ladder_rungs),
-            spacing=self.ladder_spacing,
-            width=self.ladder_width,
-            size_skew=self.ladder_size_skew,
-            max_pair_cost=self.max_pair_cost,
-            position_size_fraction=auto_fraction,
+            rungs=min(auto_rungs, self.ladder_rungs_1h),
+            spacing=self.ladder_spacing_1h,
+            width=self.ladder_width_1h,
+            size_skew=self.ladder_size_skew_1h,
+            max_pair_cost=self.max_pair_cost_1h,
+            position_size_fraction=base_fraction * 0.50,
         )
+
+
+def validate_live_config(cfg: BotConfig) -> list[str]:
+    """Validate config bounds for live trading. Returns list of error messages."""
+    errors = []
+    if cfg.position_size_fraction > 0.30:
+        errors.append(f"position_size_fraction={cfg.position_size_fraction} exceeds 0.30 safety limit")
+    if cfg.max_daily_drawdown_pct > 0.20:
+        errors.append(f"max_daily_drawdown_pct={cfg.max_daily_drawdown_pct} exceeds 0.20 safety limit")
+    if cfg.max_concurrent_positions > 20:
+        errors.append(f"max_concurrent_positions={cfg.max_concurrent_positions} exceeds 20")
+    if cfg.bankroll < 10:
+        errors.append(f"bankroll=${cfg.bankroll} below $10 minimum")
+    if cfg.batch_order_size > 50:
+        errors.append(f"batch_order_size={cfg.batch_order_size} exceeds Polymarket limit of 50")
+    return errors
+
+
+ASSET_PRIORITY = ("BTC", "ETH", "SOL", "XRP")
+
+
+def get_trading_rules(enabled_assets: tuple[str, ...], bankroll: float) -> TradingRules:
+    """Bankroll-adaptive trading rules.
+
+    Tiers:
+      Micro  (< $200):   1 asset, 5m only, 2 concurrent, 15% fraction
+      Small  ($200-500):  1 asset, 5m+15m, 3 concurrent, 10% fraction
+      Medium ($500-2000): 2 assets, all TFs, 5 concurrent, 6% fraction
+      Standard ($2000+):  all assets, all TFs, 8 concurrent, 2-5% fraction
+    """
+    sorted_assets = sorted(
+        enabled_assets,
+        key=lambda a: ASSET_PRIORITY.index(a) if a in ASSET_PRIORITY else 99,
+    )
+
+    if bankroll < 200:  # Micro
+        # 15m windows instead of 5m: 3x more budget per window ($15 vs $5),
+        # more rungs (8-13 vs 1-4), and more time for both sides to fill.
+        # 5m windows at $100 produce 1-rung ladders with no edge.
+        return TradingRules(
+            assets=tuple(sorted_assets[:1]),
+            timeframes=(900,),
+            max_concurrent=2,
+            position_fraction=0.15,
+        )
+    if bankroll < 500:  # Small
+        return TradingRules(
+            assets=tuple(sorted_assets[:1]),
+            timeframes=(300, 900),
+            max_concurrent=3,
+            position_fraction=0.10,
+        )
+    if bankroll < 2000:  # Medium
+        return TradingRules(
+            assets=tuple(sorted_assets[:2]),
+            timeframes=(300, 900, 3600),
+            max_concurrent=5,
+            position_fraction=0.06,
+        )
+    # Standard ($2000+)
+    return TradingRules(
+        assets=tuple(sorted_assets),
+        timeframes=(300, 900, 3600),
+        max_concurrent=8,
+        position_fraction=max(0.02, min(0.05, 25.0 / bankroll)),
+    )
+
+
+def effective_assets(enabled_assets: tuple[str, ...], bankroll: float) -> tuple[str, ...]:
+    """Convenience wrapper — returns just the asset list from trading rules."""
+    return get_trading_rules(enabled_assets, bankroll).assets
 
 
 def load_bot_config() -> BotConfig:
@@ -183,17 +282,23 @@ def load_bot_config() -> BotConfig:
         binance_ws_url=os.getenv("BINANCE_WS_URL", "wss://stream.binance.com:9443/ws"),
         ladder_rungs=int(os.getenv("LADDER_RUNGS", "31")),
         ladder_spacing=float(os.getenv("LADDER_SPACING", "0.01")),
-        ladder_width=float(os.getenv("LADDER_WIDTH", "0.70")),
-        ladder_size_skew=float(os.getenv("LADDER_SIZE_SKEW", "8.9")),
-        max_pair_cost=float(os.getenv("MAX_PAIR_COST", "0.92")),
+        ladder_width=float(os.getenv("LADDER_WIDTH", "0.41")),
+        ladder_size_skew=float(os.getenv("LADDER_SIZE_SKEW", "1.5")),
+        max_pair_cost=float(os.getenv("MAX_PAIR_COST", "0.90")),
         position_size_fraction=float(os.getenv("POSITION_SIZE_FRACTION", "0.05")),
         ladder_rungs_5m=int(os.getenv("LADDER_RUNGS_5M", "23")),
         ladder_spacing_5m=float(os.getenv("LADDER_SPACING_5M", "0.01")),
-        ladder_width_5m=float(os.getenv("LADDER_WIDTH_5M", "0.55")),
-        ladder_size_skew_5m=float(os.getenv("LADDER_SIZE_SKEW_5M", "4.5")),
-        max_pair_cost_5m=float(os.getenv("MAX_PAIR_COST_5M", "0.92")),
+        ladder_width_5m=float(os.getenv("LADDER_WIDTH_5M", "0.29")),
+        ladder_size_skew_5m=float(os.getenv("LADDER_SIZE_SKEW_5M", "1.5")),
+        max_pair_cost_5m=float(os.getenv("MAX_PAIR_COST_5M", "0.90")),
         position_size_fraction_5m=float(os.getenv("POSITION_SIZE_FRACTION_5M", "0.021")),
-        reprice_threshold=float(os.getenv("REPRICE_THRESHOLD", "0.03")),
+        ladder_rungs_1h=int(os.getenv("LADDER_RUNGS_1H", "22")),
+        ladder_spacing_1h=float(os.getenv("LADDER_SPACING_1H", "0.01")),
+        ladder_width_1h=float(os.getenv("LADDER_WIDTH_1H", "0.42")),
+        ladder_size_skew_1h=float(os.getenv("LADDER_SIZE_SKEW_1H", "1.5")),
+        max_pair_cost_1h=float(os.getenv("MAX_PAIR_COST_1H", "0.90")),
+        position_size_fraction_1h=float(os.getenv("POSITION_SIZE_FRACTION_1H", "0.03")),
+        reprice_threshold=float(os.getenv("REPRICE_THRESHOLD", "0.05")),
         max_imbalance_ratio=float(os.getenv("MAX_IMBALANCE_RATIO", "0.60")),
         imbalance_timeout_sec=int(os.getenv("IMBALANCE_TIMEOUT_SEC", "30")),
         heartbeat_interval_sec=float(os.getenv("HEARTBEAT_INTERVAL_SEC", "5.0")),
@@ -207,7 +312,8 @@ def load_bot_config() -> BotConfig:
         max_daily_drawdown_pct=float(os.getenv("MAX_DAILY_DRAWDOWN_PCT", "0.05")),
         no_trade_final_sec=int(os.getenv("NO_TRADE_FINAL_SEC", "60")),
         poll_interval_ms=int(os.getenv("BOT_POLL_INTERVAL_MS", "500")),
-        log_level=os.getenv("LOG_LEVEL", "INFO"),
+        balance_poll_sec=float(os.getenv("BALANCE_POLL_SEC", "60.0")),
+        log_level=os.getenv("LOG_LEVEL", "ERROR"),
         dry_run=os.getenv("DRY_RUN", "true").lower() in ("true", "1", "yes"),
         mock_base_fill_rate=float(os.getenv("MOCK_BASE_FILL_RATE", "0.03")),
         web_port=int(os.getenv("WEB_PORT", "8080")),
@@ -230,7 +336,7 @@ def load_config() -> TrackerConfig:
         tracked_wallet=os.getenv("TRACKED_WALLET", "0x63ce342161250d705dc0b16df89036c8e5f9ba9a"),
         binance_ws_url=os.getenv("BINANCE_WS_URL", "wss://stream.binance.com:9443/ws"),
         poll_interval_sec=int(os.getenv("POLL_INTERVAL_SEC", "5")),
-        log_level=os.getenv("LOG_LEVEL", "INFO"),
+        log_level=os.getenv("LOG_LEVEL", "ERROR"),
         polygonscan_api_key=os.getenv("POLYGONSCAN_API_KEY", ""),
         trade_poll_interval_sec=int(os.getenv("TRADE_POLL_INTERVAL_SEC", "2")),
         spot_record_interval_sec=int(os.getenv("SPOT_RECORD_INTERVAL_SEC", "2")),

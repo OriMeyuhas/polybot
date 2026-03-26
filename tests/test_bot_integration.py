@@ -1,3 +1,6 @@
+import asyncio
+import time
+
 import pytest
 from unittest.mock import MagicMock
 from polybot.bot import Bot
@@ -68,19 +71,35 @@ class TestBotInitialization:
 
 
 class TestWindowOpenPriceSnapshot:
-    def test_snapshot_captures_spot_price(self, cfg, market, mock_clob):
+    def _active_market(self):
+        """Create a market window that is currently active (open_epoch in past, close_epoch in future)."""
+        now = int(time.time())
+        return MarketWindow(
+            market_id="btc-5m-active",
+            condition_id="0xabc",
+            asset="BTC",
+            timeframe_sec=300,
+            up_token_id="tok_up",
+            dn_token_id="tok_dn",
+            open_epoch=now - 60,
+            close_epoch=now + 240,
+        )
+
+    def test_snapshot_captures_spot_price(self, cfg, mock_clob):
+        active = self._active_market()
         bot = _make_bot(cfg, mock_clob)
-        bot._active_markets = {market.market_id: market}
+        bot._active_markets = {active.market_id: active}
         bot.spot_prices["BTC"] = 84500.0
 
         bot._snapshot_window_open_prices()
 
         assert bot.window_open_prices["BTC"] == 84500.0
-        assert market.market_id in bot._snapped_windows
+        assert active.market_id in bot._snapped_windows
 
-    def test_snapshot_not_overwritten_on_second_call(self, cfg, market, mock_clob):
+    def test_snapshot_not_overwritten_on_second_call(self, cfg, mock_clob):
+        active = self._active_market()
         bot = _make_bot(cfg, mock_clob)
-        bot._active_markets = {market.market_id: market}
+        bot._active_markets = {active.market_id: active}
         bot.spot_prices["BTC"] = 84500.0
 
         bot._snapshot_window_open_prices()
@@ -88,6 +107,28 @@ class TestWindowOpenPriceSnapshot:
         bot._snapshot_window_open_prices()
 
         assert bot.window_open_prices["BTC"] == 84500.0
+
+    def test_snapshot_skips_pre_open_window(self, cfg, mock_clob):
+        """Pre-open windows should NOT get their open price snapped early."""
+        now = int(time.time())
+        pre_open = MarketWindow(
+            market_id="btc-5m-preopen",
+            condition_id="0xdef",
+            asset="BTC",
+            timeframe_sec=300,
+            up_token_id="tok_up2",
+            dn_token_id="tok_dn2",
+            open_epoch=now + 60,  # opens in the future
+            close_epoch=now + 360,
+        )
+        bot = _make_bot(cfg, mock_clob)
+        bot._active_markets = {pre_open.market_id: pre_open}
+        bot.spot_prices["BTC"] = 84500.0
+
+        bot._snapshot_window_open_prices()
+
+        assert "BTC" not in bot.window_open_prices
+        assert pre_open.market_id not in bot._snapped_windows
 
 
 class TestSettlement:
@@ -104,7 +145,7 @@ class TestSettlement:
         bot._snapped_windows.add(market.market_id)
 
         # Call settlement after window close
-        bot._settle_expired_windows(now_epoch=1400)
+        asyncio.run(bot._settle_expired_windows(now_epoch=1400))
 
         # Position is NOT removed — it is marked pending
         assert market.market_id in bot.position_manager.positions
@@ -125,33 +166,34 @@ class TestSettlement:
         bot.position_manager.mark_pending_settlement(market.market_id)
 
         # Should not error or double-mark
-        bot._settle_expired_windows(now_epoch=1400)
+        asyncio.run(bot._settle_expired_windows(now_epoch=1400))
         assert bot.position_manager.get_pending_settlements().count(market.market_id) == 1
 
     def test_settlement_skips_no_position(self, cfg, market, mock_clob):
         bot = _make_bot(cfg, mock_clob)
         bot._active_markets = {market.market_id: market}
         # No position — should be a no-op
-        bot._settle_expired_windows(now_epoch=1400)
+        asyncio.run(bot._settle_expired_windows(now_epoch=1400))
         assert market.market_id not in bot.position_manager.get_pending_settlements()
 
 
 class TestConnectionLost:
-    def test_on_connection_lost_resets_state(self, cfg, mock_clob):
+    def test_on_connection_lost_preserves_state(self, cfg, mock_clob):
         bot = _make_bot(cfg, mock_clob)
         # Set up some state
-        bot._cancel_only_mode = True
+        bot._cancel_only_mode = False
         # Add a mock ladder
         bot.ladder_manager.ladders["m1"] = MagicMock()
-        bot.ladder_manager.cleanup_ladder = MagicMock()
         bot.order_tracker.mark_all_unknown = MagicMock()
 
         bot._on_connection_lost()
 
-        bot.ladder_manager.cleanup_ladder.assert_called_once_with("m1")
+        # Ladder should NOT be cleaned up — preserved for recovery
+        assert "m1" in bot.ladder_manager.ladders
         bot.order_tracker.mark_all_unknown.assert_called_once()
-        # _cancel_only_mode is preserved (user's stop intent not overridden)
+        # cancel_only_mode should be True after connection loss
         assert bot._cancel_only_mode is True
+        assert bot._cancel_only_reason == "connection_loss"
 
 
 class TestFindMarket:
@@ -191,7 +233,7 @@ class TestSettlementPollerTimeout:
         bot._snapped_windows.add(market.market_id)
 
         # Settle the window to mark pending and cache it
-        bot._settle_expired_windows(now_epoch=1400)
+        asyncio.run(bot._settle_expired_windows(now_epoch=1400))
         assert market.market_id in bot.position_manager.get_pending_settlements()
         assert market.market_id in bot._expired_market_cache
 
@@ -230,7 +272,7 @@ class TestSettlementCachesMarket:
         bot._active_markets = {market.market_id: market}
         bot._snapped_windows.add(market.market_id)
 
-        bot._settle_expired_windows(now_epoch=1400)
+        asyncio.run(bot._settle_expired_windows(now_epoch=1400))
 
         assert market.market_id in bot._expired_market_cache
         assert bot._expired_market_cache[market.market_id] is market
