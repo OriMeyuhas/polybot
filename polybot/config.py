@@ -77,30 +77,30 @@ class BotConfig:
     ladder_rungs: int = 31
     ladder_spacing: float = 0.01
     ladder_width: float = 0.41
-    ladder_size_skew: float = 1.5
-    max_pair_cost: float = 0.90   # combined UP+DN VWAP ceiling (whale data: >0.92 loses money)
+    ladder_size_skew: float = 1.0
+    max_pair_cost: float = 0.93   # combined UP+DN VWAP ceiling (whale data: >0.92 loses money)
     position_size_fraction: float = 0.05
 
     # Ladder parameters — 5m overrides
     ladder_rungs_5m: int = 22
     ladder_spacing_5m: float = 0.01
     ladder_width_5m: float = 0.29
-    ladder_size_skew_5m: float = 1.5
-    max_pair_cost_5m: float = 0.90
+    ladder_size_skew_5m: float = 1.0
+    max_pair_cost_5m: float = 0.93
     position_size_fraction_5m: float = 0.021
 
     # Ladder parameters — 1h overrides
     ladder_rungs_1h: int = 22
     ladder_spacing_1h: float = 0.01
     ladder_width_1h: float = 0.42
-    ladder_size_skew_1h: float = 1.5
-    max_pair_cost_1h: float = 0.90
+    ladder_size_skew_1h: float = 1.0
+    max_pair_cost_1h: float = 0.93
     position_size_fraction_1h: float = 0.03
 
     # Shared ladder / risk parameters
     reprice_threshold: float = 0.05
     max_imbalance_ratio: float = 0.60
-    imbalance_timeout_sec: int = 30
+    imbalance_timeout_sec: int = 120
     # Heartbeat
     heartbeat_interval_sec: float = 5.0
     heartbeat_max_failures: int = 2
@@ -132,11 +132,18 @@ class BotConfig:
     # Logging
     log_level: str = "INFO"
 
+    # Timeframe toggles
+    trade_5m: bool = True
+    trade_15m: bool = True
+    trade_1h: bool = True
+
     # Safety
     dry_run: bool = True
 
     # Mock client tuning
     mock_base_fill_rate: float = 0.03
+    # Polymarket maker fee rate (crypto up/down markets: 1.56%)
+    maker_fee_rate: float = 0.0156
     web_port: int = 8080
     start_paused: bool = False
 
@@ -145,8 +152,18 @@ class BotConfig:
     clob_midpoint_poll_sec: float = 2.0
     market_ws_ping_sec: float = 10.0
     book_stale_sec: float = 30.0
+    price_stale_sec: float = 30.0
+    price_snap_stale_sec: float = 15.0
+    consecutive_loss_halt: int = 5
+    max_capital_at_risk_pct: float = 0.40
     coingecko_ids: tuple = ("bitcoin", "ethereum", "solana", "ripple")
     bankroll: float = 1000.0  # Default paper bankroll; overridable via env
+
+    # Pair recovery parameters
+    boost_elapsed_pct: float = 0.20       # Phase D: min fraction of window elapsed before boost
+    force_buy_elapsed_pct: float = 0.70   # Phase B: min fraction of window elapsed before force-buy
+    force_buy_max_pair_cost: float = 0.93 # Phase B: pair cost ceiling for forced buy
+    imbalance_min_heavy_fills: int = 3    # Min fully filled orders on heavy side before imbalance fires
 
     def get_ladder_params(self, timeframe_sec: int, current_bankroll: float | None = None) -> LadderParams:
         """Return ladder parameters tuned for the given timeframe.
@@ -177,14 +194,14 @@ class BotConfig:
                 max_pair_cost=self.max_pair_cost,
                 position_size_fraction=base_fraction,
             )
-        # 1h+
+        # 1h+ — whale data: 1h is most profitable per market ($31.71 avg), give 1.5x budget
         return LadderParams(
             rungs=min(auto_rungs, self.ladder_rungs_1h),
             spacing=self.ladder_spacing_1h,
             width=self.ladder_width_1h,
             size_skew=self.ladder_size_skew_1h,
             max_pair_cost=self.max_pair_cost_1h,
-            position_size_fraction=base_fraction * 0.50,
+            position_size_fraction=base_fraction * 1.5,
         )
 
 
@@ -201,6 +218,17 @@ def validate_live_config(cfg: BotConfig) -> list[str]:
         errors.append(f"bankroll=${cfg.bankroll} below $10 minimum")
     if cfg.batch_order_size > 50:
         errors.append(f"batch_order_size={cfg.batch_order_size} exceeds Polymarket limit of 50")
+    if cfg.maker_fee_rate < 0.0:
+        errors.append(f"maker_fee_rate={cfg.maker_fee_rate} is negative — fee rates cannot be negative")
+    if cfg.maker_fee_rate > 0.10:
+        errors.append(f"maker_fee_rate={cfg.maker_fee_rate} exceeds 0.10 sanity bound — check Polymarket fee schedule")
+    # Pair recovery validation
+    if not (0.80 < cfg.force_buy_max_pair_cost < 0.99):
+        errors.append(f"force_buy_max_pair_cost={cfg.force_buy_max_pair_cost} must be in (0.80, 0.99)")
+    if cfg.boost_elapsed_pct >= cfg.force_buy_elapsed_pct:
+        errors.append(f"boost_elapsed_pct={cfg.boost_elapsed_pct} must be < force_buy_elapsed_pct={cfg.force_buy_elapsed_pct}")
+    if cfg.force_buy_elapsed_pct >= 0.95:
+        errors.append(f"force_buy_elapsed_pct={cfg.force_buy_elapsed_pct} must be < 0.95")
     return errors
 
 
@@ -231,19 +259,19 @@ def get_trading_rules(enabled_assets: tuple[str, ...], bankroll: float) -> Tradi
             max_concurrent=2,
             position_fraction=0.15,
         )
-    if bankroll < 500:  # Small
+    if bankroll < 400:  # Small
         return TradingRules(
             assets=tuple(sorted_assets[:1]),
-            timeframes=(300, 900),
+            timeframes=(900,),  # no 5m — too short for two-sided fills
             max_concurrent=3,
             position_fraction=0.10,
         )
     if bankroll < 2000:  # Medium
         return TradingRules(
             assets=tuple(sorted_assets[:2]),
-            timeframes=(300, 900, 3600),
-            max_concurrent=5,
-            position_fraction=0.06,
+            timeframes=(900, 3600),  # no 5m — structurally unprofitable at this bankroll
+            max_concurrent=4,
+            position_fraction=0.10,
         )
     # Standard ($2000+)
     return TradingRules(
@@ -283,24 +311,24 @@ def load_bot_config() -> BotConfig:
         ladder_rungs=int(os.getenv("LADDER_RUNGS", "31")),
         ladder_spacing=float(os.getenv("LADDER_SPACING", "0.01")),
         ladder_width=float(os.getenv("LADDER_WIDTH", "0.41")),
-        ladder_size_skew=float(os.getenv("LADDER_SIZE_SKEW", "1.5")),
+        ladder_size_skew=float(os.getenv("LADDER_SIZE_SKEW", "1.0")),
         max_pair_cost=float(os.getenv("MAX_PAIR_COST", "0.90")),
         position_size_fraction=float(os.getenv("POSITION_SIZE_FRACTION", "0.05")),
         ladder_rungs_5m=int(os.getenv("LADDER_RUNGS_5M", "23")),
         ladder_spacing_5m=float(os.getenv("LADDER_SPACING_5M", "0.01")),
         ladder_width_5m=float(os.getenv("LADDER_WIDTH_5M", "0.29")),
-        ladder_size_skew_5m=float(os.getenv("LADDER_SIZE_SKEW_5M", "1.5")),
+        ladder_size_skew_5m=float(os.getenv("LADDER_SIZE_SKEW_5M", "1.0")),
         max_pair_cost_5m=float(os.getenv("MAX_PAIR_COST_5M", "0.90")),
         position_size_fraction_5m=float(os.getenv("POSITION_SIZE_FRACTION_5M", "0.021")),
         ladder_rungs_1h=int(os.getenv("LADDER_RUNGS_1H", "22")),
         ladder_spacing_1h=float(os.getenv("LADDER_SPACING_1H", "0.01")),
         ladder_width_1h=float(os.getenv("LADDER_WIDTH_1H", "0.42")),
-        ladder_size_skew_1h=float(os.getenv("LADDER_SIZE_SKEW_1H", "1.5")),
+        ladder_size_skew_1h=float(os.getenv("LADDER_SIZE_SKEW_1H", "1.0")),
         max_pair_cost_1h=float(os.getenv("MAX_PAIR_COST_1H", "0.90")),
         position_size_fraction_1h=float(os.getenv("POSITION_SIZE_FRACTION_1H", "0.03")),
         reprice_threshold=float(os.getenv("REPRICE_THRESHOLD", "0.05")),
         max_imbalance_ratio=float(os.getenv("MAX_IMBALANCE_RATIO", "0.60")),
-        imbalance_timeout_sec=int(os.getenv("IMBALANCE_TIMEOUT_SEC", "30")),
+        imbalance_timeout_sec=int(os.getenv("IMBALANCE_TIMEOUT_SEC", "120")),
         heartbeat_interval_sec=float(os.getenv("HEARTBEAT_INTERVAL_SEC", "5.0")),
         heartbeat_max_failures=int(os.getenv("HEARTBEAT_MAX_FAILURES", "2")),
         tick_size_ttl_sec=float(os.getenv("TICK_SIZE_TTL_SEC", "60.0")),
@@ -316,6 +344,7 @@ def load_bot_config() -> BotConfig:
         log_level=os.getenv("LOG_LEVEL", "ERROR"),
         dry_run=os.getenv("DRY_RUN", "true").lower() in ("true", "1", "yes"),
         mock_base_fill_rate=float(os.getenv("MOCK_BASE_FILL_RATE", "0.03")),
+        maker_fee_rate=float(os.getenv("MAKER_FEE_RATE", "0.0156")),
         web_port=int(os.getenv("WEB_PORT", "8080")),
         start_paused=os.getenv("START_PAUSED", "false").lower() in ("true", "1", "yes"),
         binance_fallback_interval_sec=float(os.getenv("BINANCE_FALLBACK_INTERVAL_SEC", "2.0")),
@@ -323,6 +352,13 @@ def load_bot_config() -> BotConfig:
         market_ws_ping_sec=float(os.getenv("MARKET_WS_PING_SEC", "10.0")),
         book_stale_sec=float(os.getenv("BOOK_STALE_SEC", "30.0")),
         bankroll=float(os.getenv("BANKROLL", "1000.0")),
+        trade_5m=os.getenv("TRADE_5M", "true").lower() in ("true", "1", "yes"),
+        trade_15m=os.getenv("TRADE_15M", "true").lower() in ("true", "1", "yes"),
+        trade_1h=os.getenv("TRADE_1H", "true").lower() in ("true", "1", "yes"),
+        boost_elapsed_pct=float(os.getenv("BOOST_ELAPSED_PCT", "0.20")),
+        force_buy_elapsed_pct=float(os.getenv("FORCE_BUY_ELAPSED_PCT", "0.70")),
+        force_buy_max_pair_cost=float(os.getenv("FORCE_BUY_MAX_PAIR_COST", "0.93")),
+        imbalance_min_heavy_fills=int(os.getenv("IMBALANCE_MIN_HEAVY_FILLS", "3")),
     )
 
 

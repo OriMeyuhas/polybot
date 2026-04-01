@@ -66,7 +66,7 @@ class TestBuildLadderRungs:
         rungs = build_ladder_rungs(
             best_ask=0.50, budget=500.0, rungs=8,
             spacing=0.02, width=0.10, size_skew=2.0,
-            tick_size=0.01,
+            tick_size=0.01, max_rung_price=1.0,
         )
         assert len(rungs) == 8
 
@@ -242,29 +242,24 @@ class TestImbalance:
             anchor_up=0.45, anchor_dn=0.45, posted_at=1000.0,
         )
         from polybot.order_tracker import TrackedOrder
-        # UP has 20 filled, DOWN has 5 filled -> imbalance = 15/20 = 75%
-        mgr.tracker.add(TrackedOrder(
-            order_id="o1", market_id=market.market_id,
-            token_id="tok_up", side=Side.UP,
-            price=0.45, size=20.0, placed_at=1000.0,
-        ))
-        mgr.tracker.add(TrackedOrder(
-            order_id="o2", market_id=market.market_id,
-            token_id="tok_dn", side=Side.DOWN,
-            price=0.45, size=5.0, placed_at=1000.0,
-        ))
+        # 3 UP fills (>= imbalance_min_heavy_fills=3), 0 DN fills -> fully one-sided
+        for i in range(3):
+            mgr.tracker.add(TrackedOrder(
+                order_id=f"up_{i}", market_id=market.market_id,
+                token_id="tok_up", side=Side.UP,
+                price=0.45, size=7.0, placed_at=1000.0,
+            ))
+            mgr.tracker.update_fill(f"up_{i}", 7.0)
         # Add a resting UP order that should get cancelled
         mgr.tracker.add(TrackedOrder(
             order_id="o3", market_id=market.market_id,
             token_id="tok_up", side=Side.UP,
             price=0.50, size=10.0, placed_at=1000.0,
         ))
-        mgr.tracker.update_fill("o1", 20.0)
-        mgr.tracker.update_fill("o2", 5.0)
         acted = mgr.check_imbalance(now_epoch=2000)
         assert market.market_id in acted
-        # o3 should be cancelled
-        assert mgr.tracker.orders["o3"].status == "cancelled"
+        # o3 should be cancelling (transient) or cancelled
+        assert mgr.tracker.orders["o3"].status in ("cancelling", "cancelled")
 
     def test_imbalance_timeout_sets_accepted(self, cfg, market, mock_clob):
         mgr = _make_manager(cfg, mock_clob)
@@ -273,23 +268,22 @@ class TestImbalance:
             market_id=market.market_id, asset="BTC",
             anchor_up=0.45, anchor_dn=0.45, posted_at=1000.0,
             imbalance_alert_at=1000,
+            heavy_side_locked="UP",
+            timeframe_sec=300,  # 5m window
         )
         mgr.ladders[market.market_id] = state
         from polybot.order_tracker import TrackedOrder
-        mgr.tracker.add(TrackedOrder(
-            order_id="o1", market_id=market.market_id,
-            token_id="tok_up", side=Side.UP,
-            price=0.45, size=20.0, placed_at=1000.0,
-        ))
-        mgr.tracker.add(TrackedOrder(
-            order_id="o2", market_id=market.market_id,
-            token_id="tok_dn", side=Side.DOWN,
-            price=0.45, size=5.0, placed_at=1000.0,
-        ))
-        mgr.tracker.update_fill("o1", 20.0)
-        mgr.tracker.update_fill("o2", 5.0)
-        # Call with time past timeout
-        acted = mgr.check_imbalance(now_epoch=1000 + cfg.imbalance_timeout_sec + 1)
+        # 3 UP fills, 0 DN fills -> fully one-sided severe imbalance
+        for i in range(3):
+            mgr.tracker.add(TrackedOrder(
+                order_id=f"up_{i}", market_id=market.market_id,
+                token_id="tok_up", side=Side.UP,
+                price=0.45, size=7.0, placed_at=1000.0,
+            ))
+            mgr.tracker.update_fill(f"up_{i}", 7.0)
+        # Dynamic timeout for 5m = max(30, 300*0.30) = max(30, 90) = 90s
+        # Call with time past dynamic timeout (90s)
+        acted = mgr.check_imbalance(now_epoch=1000 + 91)
         assert market.market_id in acted
         assert state.imbalance_accepted is True
         assert state.imbalance_alert_at is None
@@ -354,6 +348,110 @@ class TestCancelAllLadders:
         assert len(mgr.tracker.get_resting("m2")) == 0
         assert "m1" in mgr.ladders
         assert "m2" in mgr.ladders
+
+
+class TestPartialFillCrediting:
+    def test_partial_fill_credited_to_position_manager(self, cfg, market, mock_clob):
+        """Partial fill via size_matched should credit PositionManager."""
+        mgr = _make_manager(cfg, mock_clob)
+        from polybot.order_tracker import TrackedOrder
+        mgr.tracker.add(TrackedOrder(
+            order_id="o1", market_id=market.market_id,
+            token_id="tok_up", side=Side.UP,
+            price=0.45, size=10.0, placed_at=1000.0,
+        ))
+        # Exchange returns o1 with size_matched=4.0 (partial fill)
+        mock_clob.get_open_orders.return_value = [{"id": "o1", "size_matched": "4.0"}]
+        fills = mgr.check_fills()
+        # check_fills returns only fully filled orders
+        assert len(fills) == 0
+        # But position manager should have the partial fill credited
+        pos = mgr.positions.positions.get(market.market_id)
+        assert pos is not None
+        assert pos.up_qty == pytest.approx(4.0)
+        from polybot.fees import compute_fee
+        expected_cost = 4.0 * (0.45 + compute_fee(0.45, cfg.maker_fee_rate))
+        assert pos.up_cost == pytest.approx(expected_cost)
+
+    def test_partial_fill_then_cancel_no_loss(self, cfg, market, mock_clob):
+        """Partial fill + cancel_ladder should keep the partial fill in position manager."""
+        mgr = _make_manager(cfg, mock_clob)
+        from polybot.order_tracker import TrackedOrder
+        from polybot.ladder_manager import LadderState
+        mgr.tracker.add(TrackedOrder(
+            order_id="o1", market_id=market.market_id,
+            token_id="tok_up", side=Side.UP,
+            price=0.45, size=10.0, placed_at=1000.0,
+        ))
+        mgr.ladders[market.market_id] = LadderState(
+            market_id=market.market_id, asset="BTC",
+            anchor_up=0.45, anchor_dn=0.45, posted_at=1000.0,
+        )
+        # Simulate partial fill
+        mgr.tracker.update_fill("o1", 4.0)
+        # Cancel ladder (which should flush uncredited fills first)
+        mgr.cancel_ladder(market.market_id)
+        # Position manager should have the partial fill
+        pos = mgr.positions.positions.get(market.market_id)
+        assert pos is not None
+        assert pos.up_qty == pytest.approx(4.0)
+        from polybot.fees import compute_fee
+        expected_cost = 4.0 * (0.45 + compute_fee(0.45, cfg.maker_fee_rate))
+        assert pos.up_cost == pytest.approx(expected_cost)
+
+    def test_full_fill_after_partial_no_double_credit(self, cfg, market, mock_clob):
+        """Partial fill credited, then order disappears (full fill) — no double credit."""
+        mgr = _make_manager(cfg, mock_clob)
+        from polybot.order_tracker import TrackedOrder
+        mgr.tracker.add(TrackedOrder(
+            order_id="o1", market_id=market.market_id,
+            token_id="tok_up", side=Side.UP,
+            price=0.45, size=10.0, placed_at=1000.0,
+        ))
+        # First check_fills: partial fill of 4
+        mock_clob.get_open_orders.return_value = [{"id": "o1", "size_matched": "4.0"}]
+        mgr.check_fills()
+        # Second check_fills: order disappeared (fully filled)
+        mock_clob.get_open_orders.return_value = []
+        mgr.check_fills()
+        # Position manager should have total of 10.0, not 14.0
+        pos = mgr.positions.positions[market.market_id]
+        assert pos.up_qty == pytest.approx(10.0)
+        from polybot.fees import compute_fee
+        expected_cost = 10.0 * (0.45 + compute_fee(0.45, cfg.maker_fee_rate))
+        assert pos.up_cost == pytest.approx(expected_cost)
+
+    def test_reprice_flushes_partial_before_cancel(self, cfg, market, mock_clob):
+        """Partial fill on UP side, reprice triggers, verify UP partial is in position manager."""
+        mgr = _make_manager(cfg, mock_clob)
+        from polybot.order_tracker import TrackedOrder
+        from polybot.ladder_manager import LadderState
+        mgr.tracker.add(TrackedOrder(
+            order_id="o1", market_id=market.market_id,
+            token_id="tok_up", side=Side.UP,
+            price=0.45, size=10.0, placed_at=1000.0,
+        ))
+        mgr.ladders[market.market_id] = LadderState(
+            market_id=market.market_id, asset="BTC",
+            anchor_up=0.45, anchor_dn=0.45, posted_at=1000.0,
+            last_reprice_at=0.0,
+            up_token_id="tok_up", dn_token_id="tok_dn",
+        )
+        # Simulate partial fill
+        mgr.tracker.update_fill("o1", 4.0)
+        # Set best_ask to trigger reprice
+        mock_clob.get_order_book.return_value = MagicMock(
+            bids=[MagicMock(price="0.34", size="5000")],
+            asks=[MagicMock(price="0.36", size="5000")],
+        )
+        mgr.reprice_if_needed({market.market_id: market})
+        # Partial fill should be in position manager
+        pos = mgr.positions.positions.get(market.market_id)
+        assert pos is not None
+        assert pos.up_qty == pytest.approx(4.0)
+        from polybot.fees import compute_fee
+        expected_cost = 4.0 * (0.45 + compute_fee(0.45, cfg.maker_fee_rate))
+        assert pos.up_cost == pytest.approx(expected_cost)
 
 
 class TestClearCancelledLadders:

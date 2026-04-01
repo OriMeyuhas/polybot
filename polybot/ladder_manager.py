@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 from polybot.config import BotConfig
 from polybot.errors import ClobApiError
+from polybot.fees import compute_fee
 from polybot.order_executor import OrderExecutor
 from polybot.order_tracker import OrderTracker, TrackedOrder
 from polybot.position_manager import PositionManager
@@ -32,10 +33,12 @@ class LadderState:
     imbalance_alert_at: float | None = None
     boosted_side: Side | None = None
     imbalance_accepted: bool = False
+    heavy_side_locked: str | None = None
     up_token_id: str = ""
     dn_token_id: str = ""
     current_ask_up: float = 0.0
     current_ask_dn: float = 0.0
+    timeframe_sec: int = 900
 
 
 MIN_ORDER_SIZE = 5.0  # Polymarket minimum for GTC orders
@@ -49,10 +52,13 @@ def build_ladder_rungs(
     width: float,
     size_skew: float,
     tick_size: float = 0.01,
+    max_rung_price: float = 1.0,
+    fee_rate: float = 0.0,
 ) -> list[tuple[float, float]]:
     """Build ladder rungs as (price, size) pairs.
 
     Returns rungs from cheapest (farthest from market) to most expensive (near market).
+    The top rung is offset 1 tick below best_ask (passive limit, not marketable).
     Automatically reduces rung count if budget is too small for the configured amount.
     """
     if best_ask <= 0 or budget <= 0:
@@ -60,17 +66,18 @@ def build_ladder_rungs(
 
     # Estimate max affordable rungs: ensure the cheapest rung (weight=1.0)
     # gets at least MIN_ORDER_SIZE shares.
-    avg_price = max(0.01, best_ask - width / 2)
+    avg_price = max(tick_size, best_ask - width / 2)
     min_cost_per_rung = MIN_ORDER_SIZE * avg_price
     max_affordable = max(1, int(budget / min_cost_per_rung))
     effective_rungs = min(rungs, max_affordable)
 
-    anchor = max(0.01, best_ask - width)
+    # Offset anchor by 1 tick so top rung is passive (best_ask - tick_size), not marketable
+    anchor = max(tick_size, best_ask - width - tick_size)
     # Spread rungs evenly across the width with the effective count
     effective_spacing = spacing if effective_rungs == rungs else width / max(effective_rungs, 1)
     prices = [round_to_tick(anchor + i * effective_spacing, tick_size) for i in range(effective_rungs)]
-    # Clamp prices to valid range
-    prices = [max(0.01, min(0.99, p)) for p in prices]
+    # Clamp prices to valid range using tick_size as floor/ceiling
+    prices = [max(tick_size, min(min(1.0 - tick_size, max_rung_price), p)) for p in prices]
 
     # Linear size skew: cheapest gets weight 1.0, most expensive gets weight size_skew
     weights = [1.0 + (size_skew - 1.0) * (i / max(effective_rungs - 1, 1)) for i in range(effective_rungs)]
@@ -86,6 +93,14 @@ def build_ladder_rungs(
         size = scale * weight
         if size >= MIN_ORDER_SIZE:
             result.append((price, round(size, 1)))
+
+    # Rescale sizes so total cost matches budget (rungs may have been dropped)
+    if result:
+        actual_cost = sum(p * s for p, s in result)  # fee_rate not used in this copy
+        if actual_cost > 0 and abs(actual_cost - budget) / budget > 0.01:
+            rescale = budget / actual_cost
+            result = [(p, round(s * rescale, 1)) for p, s in result]
+            result = [(p, s) for p, s in result if s >= MIN_ORDER_SIZE]
 
     return result
 
@@ -106,7 +121,13 @@ class LadderManager:
         self.positions = position_manager
         self.risk = risk_manager
         self.ladders: dict[str, LadderState] = {}
+        self._killed_ladders: set[str] = set()
         self.tick_cache = tick_size_cache
+        self.fee_rate: float = getattr(cfg, "maker_fee_rate", 0.0)
+
+    def _fill_cost(self, price: float, qty: float) -> float:
+        """Fee-inclusive cost for qty shares at price."""
+        return qty * (price + compute_fee(price, self.fee_rate))
 
     def has_ladder(self, market_id: str) -> bool:
         return market_id in self.ladders
@@ -123,6 +144,8 @@ class LadderManager:
         """Post a full ladder (both sides) for a market. Returns number of orders placed."""
         try:
             if self.risk.is_halted():
+                return 0
+            if market.market_id in self._killed_ladders:
                 return 0
             if not self.risk.can_open_position(self.positions.active_position_count()):
                 return 0
@@ -146,7 +169,7 @@ class LadderManager:
 
             # Dynamic budget skew: allocate more to the cheaper side
             # Data shows whale puts ~60% on cheaper side, with higher skew at lower pair costs
-            if best_ask_up > 0 and best_ask_dn > 0:
+            if best_ask_up is not None and best_ask_dn is not None and best_ask_up > 0 and best_ask_dn > 0:
                 total_ask = best_ask_up + best_ask_dn
                 # Invert: cheaper side gets larger share
                 up_weight = (1.0 - best_ask_up / total_ask)
@@ -169,7 +192,7 @@ class LadderManager:
                 tick_size=tick_size,
             )
 
-            # Pair cost guard: check if worst-case combined VWAP exceeds max_pair_cost
+            # Pair cost guard: check VWAP and top-rung pair cost
             if up_rungs and dn_rungs:
                 up_vwap = sum(p * s for p, s in up_rungs) / sum(s for _, s in up_rungs)
                 dn_vwap = sum(p * s for p, s in dn_rungs) / sum(s for _, s in dn_rungs)
@@ -178,6 +201,20 @@ class LadderManager:
                         "Pair cost guard: %s combined VWAP %.4f > %.4f, skipping",
                         market.market_id, up_vwap + dn_vwap, lp.max_pair_cost,
                     )
+                    return 0
+                # Top-rung guard: trim the most expensive rungs that would produce bad pair costs
+                top_up = up_rungs[-1][0]
+                top_dn = dn_rungs[-1][0]
+                while len(up_rungs) > 1 and len(dn_rungs) > 1 and top_up + top_dn > lp.max_pair_cost:
+                    if top_up >= top_dn:
+                        up_rungs.pop()
+                    else:
+                        dn_rungs.pop()
+                    top_up = up_rungs[-1][0]
+                    top_dn = dn_rungs[-1][0]
+                if top_up + top_dn > lp.max_pair_cost:
+                    logger.info("Top-rung guard: %s pair=%.3f > %.3f after trim, skipping",
+                                market.market_id, top_up + top_dn, lp.max_pair_cost)
                     return 0
 
             now = time.time()
@@ -233,6 +270,7 @@ class LadderManager:
                 dn_token_id=market.dn_token_id,
                 current_ask_up=best_ask_up,
                 current_ask_dn=best_ask_dn,
+                timeframe_sec=market.timeframe_sec,
             )
 
             # Log pair cost for monitoring
@@ -251,28 +289,95 @@ class LadderManager:
         except ClobApiError:
             return 0
 
-    def check_fills(self) -> list[TrackedOrder]:
+    def _check_one_side_cap(self, filled_orders: list) -> None:
+        """Cancel resting orders on heavy side when fill ratio exceeds 3:1 and qty > 5."""
+        checked: set[str] = set()
+        for order in filled_orders:
+            mid = order.market_id
+            if mid in checked:
+                continue
+            checked.add(mid)
+            up_qty = self.tracker.filled_qty(mid, Side.UP)
+            dn_qty = self.tracker.filled_qty(mid, Side.DOWN)
+            for side, qty, other_qty in [(Side.UP, up_qty, dn_qty), (Side.DOWN, dn_qty, up_qty)]:
+                if qty >= 5.0 and (other_qty == 0 or qty / max(other_qty, 0.1) > 3.0):
+                    cancelled = self.tracker.cancel_side(mid, side)
+                    for oid in cancelled:
+                        self.executor.cancel_order(oid)
+                    self.tracker.confirm_cancels(cancelled)
+                    state = self.ladders.get(mid)
+                    if state:
+                        state.heavy_side_locked = side.value
+                    if cancelled:
+                        logger.warning("ONE-SIDE CAP: %s %s %.0f fills (other=%.0f), cancelled %d",
+                                       mid, side.value, qty, other_qty, len(cancelled))
+
+    def check_fills(self, settled_markets: set[str] | None = None) -> list[TrackedOrder]:
         """Check for fills by querying open orders. Returns newly filled orders."""
         try:
             open_orders = self.executor.get_open_orders()
         except ClobApiError:
             return []
 
-        result = self.tracker.reconcile(open_orders)
+        result = self.tracker.reconcile(open_orders, settled_markets)
 
         for order in result["filled"]:
-            fill_qty = order.size
-            self.positions.update_position(
-                order.market_id, order.side, fill_qty, fill_qty * order.price,
-            )
-            logger.info("FILL: %s %s %.1f @ $%.2f on %s",
-                         order.side.value, order.token_id[:16],
-                         fill_qty, order.price, order.market_id)
+            # Credit full fill minus any already-credited partial fills
+            fill_qty = order.size - order.credited_to_pm
+            if fill_qty > 0:
+                self.positions.update_position(
+                    order.market_id, order.side, fill_qty, self._fill_cost(order.price, fill_qty),
+                )
+                order.credited_to_pm = order.size
+                logger.info("FILL: %s %s %.1f @ $%.2f on %s",
+                             order.side.value, order.token_id[:16],
+                             fill_qty, order.price, order.market_id)
+
+        for order in result["partial"]:
+            # Credit the newly matched quantity
+            new_qty = order.filled - order.credited_to_pm
+            if new_qty > 0:
+                self.positions.update_position(
+                    order.market_id, order.side, new_qty, self._fill_cost(order.price, new_qty),
+                )
+                order.credited_to_pm = order.filled
+                logger.info("PARTIAL FILL: %s %s %.1f @ $%.2f on %s",
+                             order.side.value, order.token_id[:16],
+                             new_qty, order.price, order.market_id)
 
         if result["orphaned"]:
             self.executor.cancel_batch(result["orphaned"])
 
+        if result["filled"]:
+            self._check_one_side_cap(result["filled"])
+
         return result["filled"]
+
+    def process_paper_fills(self, paper_fills: list[dict]) -> list[TrackedOrder]:
+        """Process pre-simulated fills from PaperClobClient.tick()."""
+        if not paper_fills:
+            return []
+        filled = []
+        for fill in paper_fills:
+            order_id = fill.get("id", fill.get("orderID", ""))
+            order = self.tracker.orders.get(order_id)
+            if order is None:
+                continue
+            if order.status == "filled":
+                continue
+            fill_qty = order.size
+            self.positions.update_position(
+                order.market_id, order.side, fill_qty, fill_qty * order.price,
+            )
+            order.status = "filled"
+            order.filled = fill_qty
+            logger.info("FILL: %s %s %.1f @ $%.2f on %s",
+                         order.side.value, order.token_id[:16],
+                         fill_qty, order.price, order.market_id)
+            filled.append(order)
+        if filled:
+            self._check_one_side_cap(filled)
+        return filled
 
     def reprice_if_needed(self, markets: dict[str, MarketWindow]) -> int:
         """Reprice ladders where the book has moved beyond threshold. Returns reprice count."""
@@ -316,12 +421,29 @@ class LadderManager:
                 continue
 
             try:
-                if up_moved:
-                    # Cancel unfilled UP rungs and repost
+                up_qty = self.tracker.filled_qty(mid, Side.UP)
+                dn_qty = self.tracker.filled_qty(mid, Side.DOWN)
+
+                if up_moved and state.heavy_side_locked == "UP":
+                    # UP is the locked heavy side — never reprice it
+                    state.anchor_up = best_ask_up
+                    logger.info("REPRICE SKIP UP: %s locked heavy side", mid)
+                    up_moved_ok = False
+                elif up_moved:
+                    # UP is the light side (or no lock) — always allow reprice
+                    up_moved_ok = True
+                else:
+                    up_moved_ok = False
+
+                if up_moved_ok:
+                    # Flush uncredited partial fills before cancelling the side
+                    for order, delta in self.tracker.flush_uncredited(mid):
+                        if order.side == Side.UP:
+                            self.positions.update_position(
+                                order.market_id, order.side, delta, self._fill_cost(order.price, delta),
+                            )
                     cancelled = self.tracker.cancel_side(mid, Side.UP)
                     self.executor.cancel_batch(cancelled)
-
-                    # Only budget for unfilled portion of this side
                     already_filled_cost = self.tracker.filled_cost(mid, Side.UP)
                     side_budget = max(0, budget_per_side - already_filled_cost)
                     if side_budget >= 1.0:
@@ -345,10 +467,20 @@ class LadderManager:
                                 ))
                     state.anchor_up = best_ask_up
 
+                if dn_moved and state.heavy_side_locked == "DOWN":
+                    # DN is the locked heavy side — never reprice it
+                    state.anchor_dn = best_ask_dn
+                    logger.info("REPRICE SKIP DN: %s locked heavy side", mid)
+                    dn_moved = False
+                elif dn_moved:
+                    # DN is the light side (or no lock) — always allow reprice
+                    pass  # dn_moved stays True
+                else:
+                    pass  # dn_moved stays False
+
                 if dn_moved:
                     cancelled = self.tracker.cancel_side(mid, Side.DOWN)
                     self.executor.cancel_batch(cancelled)
-
                     already_filled_cost = self.tracker.filled_cost(mid, Side.DOWN)
                     side_budget = max(0, budget_per_side - already_filled_cost)
                     if side_budget >= 1.0:
@@ -372,7 +504,7 @@ class LadderManager:
                                 ))
                     state.anchor_dn = best_ask_dn
 
-                state.imbalance_accepted = False
+                # Note: do NOT reset imbalance_accepted — reprice should not undo imbalance guard
                 repriced += 1
                 state.last_reprice_at = now
                 logger.info("REPRICE: %s (UP moved=%s, DN moved=%s)", mid, up_moved, dn_moved)
@@ -394,10 +526,27 @@ class LadderManager:
             if total < 1.0:
                 continue
 
+            # Require minimum fills on the heavy side before judging imbalance
+            heavy_count = max(
+                self.tracker.filled_count(mid, Side.UP),
+                self.tracker.filled_count(mid, Side.DOWN),
+            )
+            light_count = min(
+                self.tracker.filled_count(mid, Side.UP),
+                self.tracker.filled_count(mid, Side.DOWN),
+            )
+            min_heavy_fills = getattr(self.cfg, "imbalance_min_heavy_fills", 3)
+            if heavy_count < min_heavy_fills:
+                continue  # not enough fills to judge imbalance
+
             max_qty = max(up_qty, dn_qty)
             imbalance = abs(up_qty - dn_qty) / max_qty
 
-            if imbalance > self.cfg.max_imbalance_ratio:
+            # Dynamic timeout: 30% of window timeframe, floored by config
+            dynamic_timeout = state.timeframe_sec * 0.30
+            timeout = max(self.cfg.imbalance_timeout_sec, dynamic_timeout)
+
+            if imbalance > self.cfg.max_imbalance_ratio and light_count == 0:
                 # Severe imbalance: cancel the heavy side's unfilled rungs
                 heavy_side = Side.UP if up_qty > dn_qty else Side.DOWN
                 if state.imbalance_alert_at is None:
@@ -405,13 +554,14 @@ class LadderManager:
                     cancelled = self.tracker.cancel_side(mid, heavy_side)
                     for oid in cancelled:
                         self.executor.cancel_order(oid)
+                    state.heavy_side_locked = heavy_side.value
                     if cancelled:
                         logger.warning(
-                            "IMBALANCE >%.0f%%: %s — cancelled %d %s rungs, waiting for other side",
+                            "IMBALANCE >%.0f%%: %s — cancelled %d %s rungs, locked side",
                             imbalance * 100, mid, len(cancelled), heavy_side.value,
                         )
                     acted.append(mid)
-                elif now_epoch - state.imbalance_alert_at > self.cfg.imbalance_timeout_sec:
+                elif now_epoch - state.imbalance_alert_at > timeout:
                     # Timeout: accept the imbalance as a directional position
                     logger.warning(
                         "IMBALANCE TIMEOUT: %s — accepting one-sided position", mid,
@@ -421,9 +571,20 @@ class LadderManager:
                     acted.append(mid)
 
             elif imbalance > 0.30:
-                # Moderate imbalance: already handled by natural fill dynamics
-                # Could boost lagging side here in future
-                pass
+                # Moderate imbalance: tighten the light side closer to market
+                light_side = Side.DOWN if up_qty > dn_qty else Side.UP
+                light_token = state.dn_token_id if light_side == Side.DOWN else state.up_token_id
+                best_ask = self.executor.get_best_ask(light_token) if light_token else None
+                if best_ask is not None and best_ask > 0:
+                    resting = self.tracker.get_resting_side(mid, light_side)
+                    # If resting orders are more than $0.03 from market, cancel and repost tighter
+                    far_orders = [o for o in resting if abs(o.price - best_ask) > 0.03]
+                    if far_orders:
+                        for o in far_orders:
+                            self.executor.cancel_order(o.order_id)
+                            self.tracker.cancel(o.order_id)
+                        logger.info("LIGHT-SIDE TIGHTEN: %s — cancelled %d far %s rungs (imb=%.0f%%)",
+                                    mid, len(far_orders), light_side.value, imbalance * 100)
             else:
                 # Clear any previous alert
                 state.imbalance_alert_at = None
@@ -431,7 +592,19 @@ class LadderManager:
         return acted
 
     def cancel_ladder(self, market_id: str) -> int:
-        """Cancel all unfilled orders for a market. Returns count cancelled."""
+        """Cancel all unfilled orders for a market. Returns count cancelled.
+
+        Flushes any uncredited partial fills to PositionManager before cancelling
+        so that partial fills are not lost when orders are cancelled.
+        """
+        # Flush uncredited partial fills before cancelling
+        for order, delta in self.tracker.flush_uncredited(market_id):
+            self.positions.update_position(
+                order.market_id, order.side, delta, self._fill_cost(order.price, delta),
+            )
+            logger.info("FLUSH PARTIAL: %s %s %.1f @ $%.2f on %s",
+                         order.side.value, order.token_id[:16],
+                         delta, order.price, order.market_id)
         cancelled = self.tracker.cancel_market(market_id)
         for oid in cancelled:
             self.executor.cancel_order(oid)
@@ -442,6 +615,7 @@ class LadderManager:
     def cleanup_ladder(self, market_id: str) -> None:
         """Remove all state for a settled/expired market."""
         self.ladders.pop(market_id, None)
+        self._killed_ladders.discard(market_id)
         self.tracker.cleanup_market(market_id)
 
     def cancel_all_ladders(self) -> int:

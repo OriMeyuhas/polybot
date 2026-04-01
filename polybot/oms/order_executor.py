@@ -1,10 +1,12 @@
 """Rebuilt order executor for the OMS layer.
 
 Uses the new client wrapper (PaperClobClient or live ClobClient) from
-polybot/oms/clob_client.py.  Unlike the original order_executor.py:
+polybot/oms/clob_client.py.
 
-- ClobApiError is never caught and re-wrapped — it propagates directly to the
-  caller so retry/backoff logic higher up the stack sees the original attributes.
+- All raw py-clob-client exceptions are converted to ClobApiError via
+  _make_clob_error() so callers can rely on a single exception type with
+  status_code / retry_after / cancel_only attributes.
+- ClobApiError raised by the client propagates unchanged (no double-wrapping).
 - Tick size validation via round_to_tick is applied before order submission.
 - Batch orders are capped at cfg.batch_order_size (default 15).
 - No dry_run branching here — paper/live behaviour is handled by the client.
@@ -14,7 +16,27 @@ from __future__ import annotations
 
 import logging
 import time
+from dataclasses import dataclass, field
 from typing import Any
+
+try:
+    from py_clob_client.clob_types import OrderArgs
+    from py_clob_client.order_builder.constants import BUY
+except ImportError:
+    # Fallback when py-clob-client is not installed (tests / paper-only envs).
+    # Must mirror the real OrderArgs fields so attribute-presence checks pass.
+    @dataclass
+    class OrderArgs:  # type: ignore[no-redef]
+        token_id: str = ""
+        price: float = 0.0
+        size: float = 0.0
+        side: str = "BUY"
+        fee_rate_bps: str = ""
+        nonce: int = 0
+        expiration: int = 0
+        taker: str = "0x0000000000000000000000000000000000000000"
+
+    BUY = "BUY"
 
 from polybot.config import BotConfig
 from polybot.errors import ClobApiError
@@ -25,6 +47,29 @@ logger = logging.getLogger(__name__)
 
 # Default tick size used when the client does not expose get_tick_size
 _DEFAULT_TICK = 0.01
+
+
+def _make_clob_error(exc: Exception) -> ClobApiError:
+    """Convert a raw API exception into a ClobApiError with proper attributes.
+
+    Extracts status_code from exc.response (if present), parses Retry-After
+    header for 429s (default 5s), and sets cancel_only for 503s.
+    """
+    # PolyApiException stores status_code directly; httpx/requests store it on .response
+    status_code = getattr(exc, 'status_code', None)
+    if status_code is None:
+        status_code = getattr(getattr(exc, 'response', None), 'status_code', None)
+    retry_after = None
+    cancel_only = False
+    if status_code == 429:
+        # Try exc.response.headers first (PolyApiException doesn't carry headers)
+        headers = getattr(getattr(exc, 'response', None), 'headers', {}) or {}
+        retry_after = float(headers.get('Retry-After', 5))
+    elif status_code == 503:
+        cancel_only = True
+    return ClobApiError(
+        str(exc), status_code=status_code, retry_after=retry_after, cancel_only=cancel_only
+    )
 
 
 def _get_tick_size(client: Any, token_id: str) -> float:
@@ -70,7 +115,7 @@ class OrderExecutor:
         """Place a single limit buy and return an OrderRecord.
 
         Tick size validation is applied to *price* before submission.
-        ClobApiError propagates to the caller without wrapping.
+        Raw exceptions are wrapped into ClobApiError via _make_clob_error().
         """
         tick = _get_tick_size(self.client, token_id)
         validated_price = round_to_tick(price, tick)
@@ -83,25 +128,27 @@ class OrderExecutor:
             timestamp=time.time(),
         )
 
-        # Build a minimal order-args object compatible with both
-        # PaperClobClient.create_order and py-clob-client's ClobClient.
-        class _OrderArgs:
-            def __init__(self, token_id, price, size, side):
-                self.token_id = token_id
-                self.price = price
-                self.size = size
-                self.side = side
-
-        order_args = _OrderArgs(
+        # Build OrderArgs compatible with both PaperClobClient and live SDK.
+        order_args = OrderArgs(
             token_id=token_id,
             price=validated_price,
             size=size,
-            side="BUY",
+            side=BUY,
         )
 
-        # ClobApiError raised here propagates directly — no wrapping.
-        signed = self.client.create_order(order_args)
-        resp = self.client.post_order(signed, orderType="GTC")
+        try:
+            signed = self.client.create_order(order_args)
+            resp = self.client.post_order(signed, orderType="GTC")
+        except ClobApiError:
+            raise
+        except Exception as e:
+            raise _make_clob_error(e) from e
+
+        if not resp.get("success", True):
+            raise ClobApiError(
+                f"Order rejected: {resp.get('errorMsg', resp)}",
+                status_code=None,
+            )
 
         record.order_id = resp.get("orderID", "")
         record.status = resp.get("status", "unknown")
@@ -121,19 +168,49 @@ class OrderExecutor:
         """Return list of open orders from the client.
 
         Supports both PaperClobClient (get_open_orders) and live ClobClient
-        (get_orders).  ClobApiError propagates to the caller.
+        (get_orders).  Raw exceptions are wrapped into ClobApiError.
         """
-        # Prefer get_open_orders (paper client); fall back to get_orders (live)
-        if hasattr(self.client, "get_open_orders") and callable(self.client.get_open_orders):
-            return self.client.get_open_orders()
-        return self.client.get_orders()
+        try:
+            # Prefer get_open_orders (paper client); fall back to get_orders (live)
+            if hasattr(self.client, "get_open_orders") and callable(self.client.get_open_orders):
+                return self.client.get_open_orders()
+            return self.client.get_orders()
+        except ClobApiError:
+            raise
+        except Exception as e:
+            raise _make_clob_error(e) from e
+
+    def get_recent_matched_orders(self) -> list[dict]:
+        """Return recently matched/filled orders from the CLOB.
+
+        Used on startup to detect stale fills from a previous session.
+        Paper client always returns [] (no cross-session state).
+        """
+        # Paper client has no cross-session state
+        if hasattr(self.client, '_resting'):
+            return []
+        try:
+            orders = self.client.get_orders()
+            return [
+                o for o in orders
+                if str(o.get("status", "")).upper() in ("MATCHED", "FILLED")
+            ]
+        except ClobApiError:
+            raise
+        except Exception as e:
+            raise _make_clob_error(e) from e
 
     def cancel_order(self, order_id: str) -> bool:
         """Cancel a single order by ID.  Returns True on success.
 
-        ClobApiError propagates to the caller.
+        Raw exceptions are wrapped into ClobApiError.
         """
-        self.client.cancel(order_id)
+        try:
+            self.client.cancel(order_id)
+        except ClobApiError:
+            raise
+        except Exception as e:
+            raise _make_clob_error(e) from e
         logger.debug("ORDER CANCELLED: %s", order_id)
         return True
 
@@ -146,8 +223,7 @@ class OrderExecutor:
         except ClobApiError:
             raise
         except Exception as exc:
-            logger.error("Cancel all failed: %s", exc)
-            return False
+            raise _make_clob_error(exc) from exc
 
     # ------------------------------------------------------------------
     # Book queries
@@ -183,12 +259,49 @@ class OrderExecutor:
             logger.error("Book depth fetch failed: %s", exc)
             return 0.0
 
-    def get_best_ask(self, token_id: str) -> float:
-        """Return best ask price, or 1.0 if no asks.  ClobApiError propagates."""
-        book = self.client.get_order_book(token_id)
+    def estimate_fill_cost(self, token_id: str, qty: float) -> tuple[float, float] | None:
+        """Walk the ask side of the order book to estimate the average fill price
+        for buying `qty` shares.
+
+        Returns (avg_price, total_cost) or None if the book is empty or
+        insufficient depth exists for the requested quantity.
+
+        Does NOT place any orders.
+        """
+        try:
+            book = self.client.get_order_book(token_id)
+            if book is None or not book.asks:
+                return None
+            remaining = qty
+            total_cost = 0.0
+            for ask in book.asks:
+                ask_price = float(ask.price)
+                ask_size = float(ask.size)
+                take = min(remaining, ask_size)
+                total_cost += take * ask_price
+                remaining -= take
+                if remaining <= 0:
+                    break
+            if remaining > 0:
+                return None  # insufficient depth
+            avg_price = total_cost / qty
+            return (avg_price, total_cost)
+        except ClobApiError:
+            return None
+        except Exception:
+            return None
+
+    def get_best_ask(self, token_id: str) -> float | None:
+        """Return best ask price, or None if no asks.  ClobApiError propagates."""
+        try:
+            book = self.client.get_order_book(token_id)
+        except ClobApiError:
+            raise
+        except Exception as e:
+            raise _make_clob_error(e) from e
         if book is not None and book.asks:
             return float(book.asks[0].price)
-        return 1.0
+        return None
 
     # ------------------------------------------------------------------
     # Batch operations

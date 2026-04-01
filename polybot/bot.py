@@ -95,6 +95,7 @@ class Bot:
         )
 
         # Internal state
+        self._stopped = False
         self._active_markets: dict[str, MarketWindow] = {}
         self._expired_market_cache: dict[str, MarketWindow] = {}
         self._start_time = 0.0
@@ -108,15 +109,20 @@ class Bot:
         self._last_status_time = 0.0
         self._snapped_windows: set[str] = set()
         self._settled_markets: set[str] = set()  # markets that have been settled — no more trading
+        self._settled_wins = 0
+        self._settled_losses = 0
+        self._settled_pair_costs: list[float] = []
         self.spot_prices: dict[str, float] = {}
-        self.window_open_prices: dict[str, float] = {}
-        self._activity_log: deque = deque(maxlen=20)
+        self.ladder_manager._spot_prices = self.spot_prices  # share by reference
+        self.window_open_prices: dict[str, float] = {}  # keyed by market_id, NOT asset
+        self._activity_log: deque = deque(maxlen=50)
         self._tasks: list[asyncio.Task] = []
         self._wallet_balance: float = cfg.bankroll
         self._balance_poll_failures: int = 0
         self._wallet_address: str | None = self._derive_wallet_address(cfg)
         self._connection_loss_at: float = 0.0
         self._cancel_only_reason: str = ""
+        self._price_stale_logged: bool = False
 
     @staticmethod
     def _derive_wallet_address(cfg: BotConfig) -> str | None:
@@ -169,36 +175,77 @@ class Bot:
             except Exception as e:
                 logger.warning("Initial balance fetch failed: %s", e)
 
-            # Cancel stale orders from previous session
+            # Cancel stale orders from previous session (gate on failure)
             try:
                 logger.info("Cancelling stale orders from previous session...")
                 await asyncio.to_thread(self.order_executor.cancel_all)
                 logger.info("Stale orders cancelled — clean slate")
             except Exception as e:
-                logger.error("Failed to cancel stale orders: %s — proceed with caution", e)
+                logger.error(
+                    "Failed to cancel stale orders: %s — blocking trading", e
+                )
+                self._cancel_only_mode = True
+                self._cancel_only_reason = "cancel_all_failed"
+
+            # Pre-flight stale fill audit
+            if not self._cancel_only_mode:
+                try:
+                    matched = await asyncio.to_thread(
+                        self.order_executor.get_recent_matched_orders
+                    )
+                    if matched:
+                        count = len(matched)
+                        logger.error(
+                            "STALE FILL DETECTED: %d matched orders from previous session — "
+                            "staying in cancel_only_mode", count,
+                        )
+                        self._cancel_only_mode = True
+                        self._cancel_only_reason = f"stale_fills:{count}"
+                except Exception as e:
+                    logger.warning("Stale fill audit failed: %s — proceeding cautiously", e)
 
         logger.info("Bot started in %s mode", self.mode)
 
     async def stop(self):
-        """Graceful shutdown."""
+        """Graceful shutdown — idempotent, non-blocking, resilient."""
+        if self._stopped:
+            return
+        self._stopped = True
         self.running = False
 
-        # Cancel all resting orders in live mode
+        # Cancel all resting orders in live mode (non-blocking with timeout)
         if not self.cfg.dry_run:
             try:
-                self.order_executor.cancel_all()
+                await asyncio.wait_for(
+                    asyncio.to_thread(self.order_executor.cancel_all),
+                    timeout=10.0,
+                )
+                logger.info("All orders cancelled on shutdown")
+            except asyncio.TimeoutError:
+                logger.error("cancel_all timed out after 10s on shutdown")
             except Exception as e:
                 logger.error("Error cancelling orders on shutdown: %s", e)
 
-        # Stop subsystems
-        await self.price_feed.stop()
-        await self.midpoint_poller.stop()
-        await self.market_ws.stop()
-        await self.heartbeat.stop()
+        # Stop subsystems — each in try/except so one failure does not block others
+        for coro in [
+            self.price_feed.stop(),
+            self.midpoint_poller.stop(),
+            self.market_ws.stop(),
+            self.heartbeat.stop(),
+            self.rtds_feed.stop(),
+        ]:
+            try:
+                await asyncio.wait_for(coro, timeout=5.0)
+            except asyncio.TimeoutError:
+                logger.warning("Subsystem stop timed out: %s", coro)
+            except Exception as e:
+                logger.warning("Subsystem stop error: %s", e)
 
-        # Cancel async tasks
+        # Cancel async tasks with grace period
         for task in self._tasks:
             task.cancel()
+        if self._tasks:
+            await asyncio.wait(self._tasks, timeout=5.0)
         self._tasks.clear()
 
         self.gui_state.update(running=False)
@@ -232,8 +279,17 @@ class Bot:
                 )
             ),
             asyncio.create_task(self.market_ws.run([])),
+            asyncio.create_task(
+                self.heartbeat.run(
+                    self.clob_client,
+                    self._on_connection_lost,
+                    on_connection_recovered=self._on_connection_recovered,
+                )
+            ),
+            asyncio.create_task(self.redeemer.run(self._redeem_tokens)),
             asyncio.create_task(self._run_trading_loop()),
             asyncio.create_task(self._run_settlement_poller()),
+            asyncio.create_task(self._run_daily_reset()),
             asyncio.create_task(self._poll_wallet_balance()),
             asyncio.create_task(self._run_gui_broadcast()),
         ]
@@ -242,8 +298,6 @@ class Bot:
             await asyncio.gather(*tasks)
         except asyncio.CancelledError:
             logger.info("Bot shutting down")
-        finally:
-            await self.stop()
 
     async def run(self):
         """Main entry point — start all concurrent tasks (auto-trade immediately)."""
@@ -281,8 +335,6 @@ class Bot:
             await asyncio.gather(*tasks)
         except asyncio.CancelledError:
             logger.info("Bot shutting down")
-        finally:
-            await self.stop()
 
     # ------------------------------------------------------------------
     # Web UI hooks
@@ -296,7 +348,10 @@ class Bot:
 
     async def ui_start_full(self):
         """Called from web UI POST /api/start — full start including balance fetch."""
-        # Initial balance fetch
+        # Clear stale alert from previous attempt (Step 6)
+        self.gui_state.update(stale_order_alert="")
+
+        # Credential pre-flight + initial balance fetch
         if not self.cfg.dry_run:
             try:
                 result = await asyncio.to_thread(self._fetch_live_balance)
@@ -307,23 +362,68 @@ class Bot:
                         self._wallet_balance = balance
                         self.position_manager.update_bankroll(balance)
                         self._balance_poll_failures = 0
-                        logger.info("Initial wallet balance: $%.2f", balance)
+                        logger.info("Credential check passed — wallet balance: $%.2f", balance)
                     else:
-                        self._balance_poll_failures += 1
-                        logger.warning("Initial balance returned $0 — using configured bankroll $%.2f", self._wallet_balance)
+                        raise ValueError("Wallet balance is $0 — check funding")
                 else:
-                    self._balance_poll_failures += 1
-                    logger.warning("Initial balance malformed — using configured bankroll $%.2f", self._wallet_balance)
+                    raise ValueError("Balance response malformed — check API credentials")
             except Exception as e:
-                logger.warning("Initial balance fetch failed: %s", e)
+                logger.error("Credential/balance check failed: %s — blocking trading", e)
+                self._cancel_only_mode = True
+                self._cancel_only_reason = "credential_check_failed"
+                self._record_activity(
+                    "ALERT", "SYSTEM",
+                    f"Credential check failed: {e}. Fix credentials and hit Start again.",
+                )
+                self.gui_state.update(
+                    stale_order_alert=f"Credential check failed: {e}"
+                )
+                return
 
-            # Cancel stale orders from previous session
+            # Cancel stale orders from previous session (Step 3 — gate on failure)
             try:
                 logger.info("Cancelling stale orders from previous session...")
                 await asyncio.to_thread(self.order_executor.cancel_all)
                 logger.info("Stale orders cancelled — clean slate")
             except Exception as e:
-                logger.error("Failed to cancel stale orders: %s — proceed with caution", e)
+                logger.error(
+                    "Failed to cancel stale orders: %s — blocking trading", e
+                )
+                self._cancel_only_mode = True
+                self._cancel_only_reason = "cancel_all_failed"
+                self._record_activity(
+                    "ALERT", "SYSTEM",
+                    f"cancel_all failed: {e}. Trading blocked — fix connection and hit Start again.",
+                )
+                self.gui_state.update(
+                    stale_order_alert="cancel_all failed — trading blocked"
+                )
+                return  # Do NOT proceed to trading
+
+            # Pre-flight: detect matched orders from before this session (Step 2)
+            try:
+                matched = await asyncio.to_thread(
+                    self.order_executor.get_recent_matched_orders
+                )
+                if matched:
+                    count = len(matched)
+                    logger.error(
+                        "STALE FILL DETECTED: %d matched orders from previous session — "
+                        "staying in cancel_only_mode", count,
+                    )
+                    self._cancel_only_mode = True
+                    self._cancel_only_reason = f"stale_fills:{count}"
+                    self._record_activity(
+                        "ALERT", "SYSTEM",
+                        f"Stale fills detected: {count} matched orders from previous session. "
+                        "Manual review required — hit Start again after confirming positions.",
+                    )
+                    self.gui_state.update(
+                        stale_order_alert=f"{count} stale fills from previous session"
+                    )
+                    return  # Do NOT proceed to trading
+            except Exception as e:
+                logger.warning("Stale fill audit failed: %s — proceeding cautiously", e)
 
         self._cancel_only_mode = False
         self._cancel_only_reason = ""
@@ -354,20 +454,27 @@ class Bot:
         self._cancel_only_reason = "connection_loss"
         # 2. Mark all resting orders as unknown — reconcile() will fix on recovery
         self.order_tracker.mark_all_unknown()
-        # 3. Best-effort cancel all on exchange
+        # 3. Schedule best-effort cancel in a thread (don't block event loop)
+        async def _async_cancel():
+            try:
+                await asyncio.to_thread(self.order_executor.cancel_all)
+            except Exception as exc:
+                logger.warning("Best-effort cancel_all failed (expected during outage): %s", exc)
+                self._pending_cancel_all = True
         try:
-            self.order_executor.cancel_all()
-        except Exception as exc:
-            logger.warning("Best-effort cancel_all failed (expected during outage): %s", exc)
-            # 4. Set pending flag so cancel retries on next healthy tick
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.create_task(_async_cancel())
+            else:
+                self._pending_cancel_all = True
+        except RuntimeError:
             self._pending_cancel_all = True
         self._record_activity("WARN", "SYSTEM", "connection lost — cancel-only mode")
 
     def _on_connection_recovered(self):
         duration = time.time() - self._connection_loss_at if self._connection_loss_at else 0
-        logger.info("Connection recovered after %.1fs — running reconciliation", duration)
+        logger.info("Connection recovered after %.1fs — scheduling reconciliation", duration)
         # Auto-exit cancel-only mode ONLY if it was set by connection loss
-        # (not by user pressing Stop or balance safety)
         if self._cancel_only_reason == "connection_loss":
             self._cancel_only_mode = False
             self._cancel_only_reason = ""
@@ -376,6 +483,36 @@ class Bot:
                 "INFO", "SYSTEM",
                 f"connection recovered after {duration:.0f}s — resuming trading",
             )
+        # Schedule order resolution in a thread (sync HTTP calls, don't block event loop)
+        async def _async_resolve():
+            try:
+                unknown_ids = self.order_tracker.get_unknown_ids()
+                if unknown_ids:
+                    statuses = {}
+                    for oid in unknown_ids:
+                        try:
+                            resp = await asyncio.to_thread(self.clob_client.get_order, oid)
+                            statuses[oid] = resp.get("status", "CANCELLED")
+                        except Exception:
+                            statuses[oid] = "CANCELLED"
+                    result = self.order_tracker.resolve_unknowns(statuses)
+                    logger.info(
+                        "Resolved %d unknown orders: %d reverted, %d filled, %d cancelled",
+                        len(unknown_ids),
+                        len(result["reverted"]),
+                        len(result["filled"]),
+                        len(result["cancelled"]),
+                    )
+            except Exception:
+                logger.exception("Failed to resolve unknown orders during recovery")
+
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.create_task(_async_resolve())
+        except RuntimeError:
+            logger.warning("Could not schedule order resolution — no event loop")
+
         logger.info("Cancel-only mode: %s (reason: %s)", self._cancel_only_mode, self._cancel_only_reason)
 
     # ------------------------------------------------------------------
@@ -439,11 +576,23 @@ class Bot:
 
         now = int(time.time())
 
-        # Snapshot open prices for new windows
-        self._snapshot_window_open_prices()
+        # Snapshot open prices for new windows (uses Binance klines API)
+        await self._snapshot_window_open_prices()
 
         # Update spot prices from price feed
         self._update_spot_prices()
+
+        # Price staleness gate — check ALL enabled assets
+        price_stale = not self.price_feed.is_fresh(self.cfg.price_stale_sec)
+        if price_stale and not self._price_stale_logged:
+            logger.warning(
+                "PRICE FEED STALE: one or more assets >%.0fs old — blocking new ladders and repricing",
+                self.cfg.price_stale_sec,
+            )
+            self._price_stale_logged = True
+        elif not price_stale and self._price_stale_logged:
+            logger.info("PRICE FEED RECOVERED: all assets fresh — resuming normal trading")
+            self._price_stale_logged = False
 
         # Status logging
         self._log_status(now)
@@ -470,7 +619,7 @@ class Bot:
                        if m.market_id not in self._settled_markets]
         market_map = {m.market_id: m for m in active_list}
 
-        if not self._cancel_only_mode:
+        if not self._cancel_only_mode and not price_stale:
             # Apply bankroll-adaptive position limits
             rules = get_trading_rules(self.cfg.assets, self.position_manager.bankroll)
             self.risk._max_concurrent_override = rules.max_concurrent
@@ -478,12 +627,12 @@ class Bot:
             # Overleverage protection (live mode only)
             overleveraged = (
                 not self.cfg.dry_run
-                and self._wallet_balance < self.ladder_manager.total_committed()
+                and self._wallet_balance < self.ladder_manager.resting_order_cost()
             )
             if overleveraged:
                 logger.warning(
-                    "OVERLEVERAGED: wallet $%.2f < committed $%.2f — skipping new ladders",
-                    self._wallet_balance, self.ladder_manager.total_committed(),
+                    "OVERLEVERAGED: wallet $%.2f < resting orders $%.2f — skipping new ladders",
+                    self._wallet_balance, self.ladder_manager.resting_order_cost(),
                 )
 
             # Post ladders on new markets (active + pre-open)
@@ -531,7 +680,9 @@ class Bot:
                 self.ladder_manager.process_paper_fills, paper_fills
             )
         else:
-            filled_orders = await asyncio.to_thread(self.ladder_manager.check_fills)
+            filled_orders = await asyncio.to_thread(
+                self.ladder_manager.check_fills, self._settled_markets
+            )
         if filled_orders:
             self._trade_count += len(filled_orders)
             # Log each fill individually with correct side and price
@@ -547,6 +698,35 @@ class Bot:
 
         # Imbalance guard
         await asyncio.to_thread(self.ladder_manager.check_imbalance, now)
+
+        # Loss cap: cancel remaining orders on one-sided positions exceeding 3% bankroll
+        await asyncio.to_thread(self.ladder_manager.check_loss_cap, self.spot_prices)
+
+        # Phase D: Boost light side ladder
+        for market in active_list:
+            if market.is_active(now) and self.ladder_manager.has_ladder(market.market_id):
+                boosted = await asyncio.to_thread(
+                    self.ladder_manager.boost_light_side, market, now
+                )
+                if boosted > 0:
+                    self._record_activity(
+                        "BOOST", market.asset,
+                        f"reanchored light side with {boosted} new rungs on {market.market_id}",
+                    )
+
+        # Phase B: Pair completion — late-window force-buy of unfilled side
+        for market in active_list:
+            if self.ladder_manager.is_killed(market.market_id):
+                continue
+            if market.is_active(now) and self.ladder_manager.has_ladder(market.market_id):
+                result = await asyncio.to_thread(
+                    self.ladder_manager.try_complete_pair, market, now
+                )
+                if result:
+                    self._record_activity(
+                        "PAIR_COMPLETE", market.asset,
+                        f"bought {result['side'].value} @${result['price']:.3f} pair_cost=${result['pair_cost']:.3f}",
+                    )
 
         # Cancel rungs on expiring windows
         for market in active_list:
@@ -644,10 +824,24 @@ class Bot:
                             self._expired_market_cache[mid] = old_mkt
                 self._active_markets = new_markets
 
-            # Update subscriptions
-            self.midpoint_poller.register_tokens(all_token_ids)
+            # Collect tokens still needed for pending settlements
+            settlement_token_ids: list[str] = []
+            for mid in self.position_manager.get_pending_settlements():
+                mkt = self._expired_market_cache.get(mid)
+                if mkt:
+                    settlement_token_ids.extend([mkt.up_token_id, mkt.dn_token_id])
+            # Also include tokens from positions (covers orphaned position detection)
+            for mid in self.position_manager.positions:
+                mkt = self._find_market(mid)
+                if mkt:
+                    settlement_token_ids.extend([mkt.up_token_id, mkt.dn_token_id])
+
+            all_protected = all_token_ids + settlement_token_ids
+
+            # Update subscriptions — set-based to prune stale entries
+            self.midpoint_poller.set_tokens(all_protected)
             self.market_ws.update_subscriptions(all_token_ids)
-            self.book_manager.update_assets(all_token_ids)
+            self.book_manager.set_active_tokens(all_protected)
 
             # Seed books via HTTP for newly arrived tokens (faster than waiting for WS)
             for mid in arrived:
@@ -765,11 +959,28 @@ class Bot:
                 mid,
             )
 
+    _VALID_OUTCOMES = {"UP", "DOWN", "YES", "NO"}
+
     def _settle_position(self, mid: str, market: MarketWindow, outcome: str):
         """Settle a single position: compute PnL, update risk/bankroll, queue redemption."""
+        # --- Outcome validation guard ---
+        if outcome.upper() not in self._VALID_OUTCOMES:
+            logger.critical(
+                "INVALID OUTCOME '%s' for %s -- skipping settlement to prevent PnL corruption",
+                outcome, mid,
+            )
+            return
+
+        # --- Normalize: YES->UP, NO->DOWN ---
+        normalized = outcome.upper()
+        if normalized == "YES":
+            normalized = "UP"
+        elif normalized == "NO":
+            normalized = "DOWN"
+
         pos = self.position_manager.positions.get(mid)
         if pos:
-            if outcome in ("UP", "YES"):
+            if normalized == "UP":
                 pnl = pos.profit_if_up()
                 winning = pos.up_qty - pos.up_cost if pos.up_qty > 0 else 0.0
                 losing = pos.dn_cost
@@ -778,9 +989,15 @@ class Bot:
                 winning = pos.dn_qty - pos.dn_cost if pos.dn_qty > 0 else 0.0
                 losing = pos.up_cost
 
-            logger.info("Settled %s: %s, PnL=$%.2f", mid, outcome, pnl)
+            logger.info("Settled %s: %s, PnL=$%.2f", mid, normalized, pnl)
             self.risk.update_pnl(pnl)
             self._realized_pnl += pnl
+            if pnl > 0:
+                self._settled_wins += 1
+            elif pnl < 0:
+                self._settled_losses += 1
+            if min(pos.up_qty, pos.dn_qty) > 0:
+                self._settled_pair_costs.append(pos.pair_cost())
 
             # Only update bankroll from PnL in paper mode.
             # In live mode, on-chain balance is the source of truth.
@@ -788,10 +1005,29 @@ class Bot:
                 self.position_manager.bankroll += pnl
 
             if losing > 0:
-                detail = f"{outcome} won \u2192 \u2191 +${winning:.2f} \u2193 -${losing:.2f} = net ${pnl:+.2f}"
+                detail = f"{normalized} won \u2192 \u2191 +${winning:.2f} \u2193 -${losing:.2f} = net ${pnl:+.2f}"
             else:
-                detail = f"{outcome} won \u2192 \u2191 +${winning:.2f} = net ${pnl:+.2f}"
-            self._record_activity("SETTLE", market.asset, detail, pnl=pnl)
+                detail = f"{normalized} won \u2192 \u2191 +${winning:.2f} = net ${pnl:+.2f}"
+            tf_label = {300: "5m", 900: "15m", 3600: "1h"}.get(
+                market.timeframe_sec, f"{market.timeframe_sec}s"
+            )
+            settle_meta = {
+                "timeframe": tf_label,
+                "outcome": normalized,
+                "up_qty": round(pos.up_qty, 2),
+                "dn_qty": round(pos.dn_qty, 2),
+                "up_cost": round(pos.up_cost, 2),
+                "dn_cost": round(pos.dn_cost, 2),
+                "total_cost": round(pos.up_cost + pos.dn_cost, 2),
+                "revenue": round(pos.up_cost + pos.dn_cost + pnl, 2),
+                "winning": round(winning, 2),
+                "losing": round(losing, 2),
+                "pair_cost": round(pos.pair_cost(), 3) if min(pos.up_qty, pos.dn_qty) > 0 else None,
+            }
+            self._record_activity("SETTLE", market.asset, detail, pnl=pnl, meta=settle_meta)
+
+            # Persist settlement record to JSONL for future analysis
+            self._log_settlement(market, settle_meta, pnl)
 
             self.redeemer.queue_redemption(
                 market.condition_id,
@@ -803,9 +1039,41 @@ class Bot:
         self._expired_market_cache.pop(mid, None)
         self._settled_markets.add(mid)  # prevent re-posting ladders
 
-    def _dry_run_resolve(self, market: MarketWindow) -> str | None:
-        """In dry-run mode, resolve using the last known spot delta."""
-        delta = self.compute_spot_delta(market.asset)
+    def _log_settlement(self, market: MarketWindow, meta: dict, pnl: float):
+        """Append settlement record to data/settlement_log.jsonl for analysis."""
+        import json as _json
+        record = {
+            "ts": time.time(),
+            "market_id": market.market_id,
+            "asset": market.asset,
+            "timeframe_sec": market.timeframe_sec,
+            "pnl": round(pnl, 4),
+            "bankroll": round(self.position_manager.bankroll, 2),
+            "exposure_factor": self.risk.exposure_factor(),
+            "consecutive_losses": self.risk.consecutive_losses,
+            **meta,
+        }
+        try:
+            import pathlib
+            log_path = pathlib.Path("data/settlement_log.jsonl")
+            log_path.parent.mkdir(exist_ok=True)
+            with open(log_path, "a") as f:
+                f.write(_json.dumps(record) + "\n")
+        except Exception as e:
+            logger.debug("Settlement log write failed: %s", e)
+
+    def _dry_run_resolve(self, market: MarketWindow) -> str:
+        """In dry-run mode, resolve using the last known spot delta.
+
+        Always returns an outcome — paper mode should never block on stale prices.
+        """
+        age = self.price_feed.get_price_age(market.asset)
+        if age is not None and age > self.cfg.price_stale_sec:
+            logger.info(
+                "DRY_RUN_RESOLVE: %s price age=%.1fs (stale) — using last known delta for %s",
+                market.asset, age, market.market_id,
+            )
+        delta = self.compute_spot_delta(market.asset, market.market_id)
         if delta > 0:
             return "UP"
         elif delta < 0:
@@ -816,19 +1084,20 @@ class Bot:
     async def _redeem_tokens(self, condition_id: str, token_ids: list[str]) -> float:
         """Redeem winning tokens on-chain. Returns USDC.e received.
 
-        Full on-chain redemption via web3 + CTF Exchange is Phase 3.
-        For now, log the details so the user can redeem manually via Polymarket UI.
+        Paper mode: no-op (no real tokens). Live mode: log for manual redemption.
         """
-        logger.critical(
-            "REDEMPTION NEEDED: condition_id=%s, token_ids=%s — "
-            "redeem manually via Polymarket UI until on-chain implementation is added",
-            condition_id, token_ids,
+        if self.cfg.dry_run:
+            return 0.0  # paper mode — no real tokens to redeem
+        # Live mode: log for manual redemption, don't raise (prevents retry spam)
+        logger.warning(
+            "REDEMPTION NEEDED: condition_id=%s — redeem manually via Polymarket UI",
+            condition_id,
         )
         self._record_activity(
             "REDEEM", "SYSTEM",
-            f"manual redemption needed: {condition_id} tokens={len(token_ids)}",
+            f"manual redemption needed: {condition_id}",
         )
-        return 0.0
+        return 0.0  # operator redeems manually; balance poller picks up the USDC
 
     async def _run_settlement_poller(self):
         """Poll pending settlements for resolution (every 30s)."""
@@ -875,6 +1144,11 @@ class Bot:
                     )
 
                     if result is not None:
+                        # Back-propagate condition_id if returned by resolver
+                        new_cid = result.get("condition_id")
+                        if new_cid and new_cid != market.condition_id:
+                            logger.info("Back-propagated condition_id for %s: %s", mid, new_cid)
+                            market.condition_id = new_cid
                         self._settle_position(mid, market, result["outcome"])
 
                 await asyncio.sleep(30)
@@ -921,7 +1195,8 @@ class Bot:
                                        self._wallet_balance, self._balance_poll_failures)
 
                     if self._balance_poll_failures >= 5:
-                        logger.error("SAFETY: 5 consecutive balance failures — entering cancel-only mode")
+                        logger.warning("Balance fetch failed 5x — entering cancel-only mode")
+                        self._record_activity("ERROR", "SYSTEM", "Balance fetch failed 5x — entering cancel-only mode")
                         self._cancel_only_mode = True
                         self._cancel_only_reason = "balance_safety"
                 else:
@@ -938,35 +1213,89 @@ class Bot:
         """Compute unrealized PnL across all open positions. Returns 0.0 for now."""
         return 0.0
 
-    def compute_spot_delta(self, asset: str) -> float:
+    def compute_spot_delta(self, asset: str, market_id: str) -> float:
         current = self.spot_prices.get(asset, 0.0)
-        open_price = self.window_open_prices.get(asset, 0.0)
+        open_price = self.window_open_prices.get(market_id, 0.0)
         if open_price <= 0:
             return 0.0
         return (current - open_price) / open_price
 
     def _snapshot_window_open_prices(self):
-        """Capture spot prices at the start of each new market window.
+        """Capture open prices for each new market window.
 
-        Only snap for windows that are currently active (open_epoch <= now).
-        Pre-open windows must wait until they actually open — snapping early
-        would record the wrong open price and corrupt settlement outcome.
+        Immediately applies the spot-price fallback (synchronous). Also returns an
+        awaitable coroutine that attempts to upgrade snapshots with Binance candle
+        open prices. Callers that run in an async context should await the return
+        value; synchronous callers can ignore it.
+
+        Returns an awaitable for backward compatibility with ``asyncio.run()`` callers.
+        """
+        # --- Synchronous spot-price fallback (runs immediately) ---
+        now = int(time.time())
+        for market in list(self._active_markets.values()):
+            if market.market_id in self._snapped_windows:
+                continue
+            if not market.is_active(now):
+                continue
+
+            # Use spot price from our feed (gated on freshness)
+            fresh_price = self.price_feed.get_price_if_fresh(
+                market.asset, self.cfg.price_snap_stale_sec
+            )
+            spot = float(fresh_price) if fresh_price is not None else 0.0
+            if spot > 0:
+                self.window_open_prices[market.market_id] = spot
+                self._snapped_windows.add(market.market_id)
+                logger.info(
+                    "SNAPSHOT: %s spot = $%.2f for window %s",
+                    market.asset, spot, market.market_id,
+                )
+            else:
+                age = self.price_feed.get_price_age(market.asset)
+                logger.warning(
+                    "SNAP DEFERRED: %s price stale (age=%.1fs, max=%.1fs) for window %s",
+                    market.asset,
+                    age if age is not None else -1,
+                    self.cfg.price_snap_stale_sec,
+                    market.market_id,
+                )
+
+        # --- Async upgrade with Binance candle opens ---
+        return self._snapshot_upgrade_candles()
+
+    async def _snapshot_upgrade_candles(self):
+        """Attempt to upgrade spot snapshots with authoritative Binance candle opens.
+
+        Called via the return value of _snapshot_window_open_prices() in async contexts.
         """
         now = int(time.time())
-        for market in self._active_markets.values():
-            if market.market_id not in self._snapped_windows:
+        for market in list(self._active_markets.values()):
+            if market.market_id in self._snapped_windows:
+                # Already snapped — try to upgrade with Binance candle if we only have spot
+                pass
+            else:
                 if not market.is_active(now):
-                    continue  # pre-open: wait until window opens
-                spot = self.spot_prices.get(market.asset, 0.0)
-                if spot > 0:
-                    self.window_open_prices[market.asset] = spot
-                    self._snapped_windows.add(market.market_id)
-                    logger.info(
-                        "SNAPSHOT: %s open price = $%.2f for window %s",
-                        market.asset,
-                        spot,
-                        market.market_id,
-                    )
+                    continue
+
+            # Determine Binance interval from timeframe
+            if market.timeframe_sec <= 300:
+                interval = "5m"
+            elif market.timeframe_sec <= 900:
+                interval = "15m"
+            else:
+                interval = "1h"
+
+            # Try Binance candle open (authoritative for resolution)
+            candle_open = await self.price_feed.fetch_binance_candle_open(
+                market.asset, interval, market.open_epoch
+            )
+            if candle_open and candle_open > 0:
+                self.window_open_prices[market.market_id] = candle_open
+                self._snapped_windows.add(market.market_id)
+                logger.info(
+                    "SNAPSHOT: %s candle open = $%.2f for window %s (%s)",
+                    market.asset, candle_open, market.market_id, interval,
+                )
 
     def _cleanup_expired_windows(self, now_epoch: int):
         """Remove window IDs and stale ladders no longer in the active market list."""
@@ -974,6 +1303,7 @@ class Bot:
         stale = self._snapped_windows - active_ids
         for mid in stale:
             self._snapped_windows.discard(mid)
+            self.window_open_prices.pop(mid, None)
 
         # Clean up settled market markers when markets leave active list
         stale_settled = self._settled_markets - active_ids
@@ -984,6 +1314,19 @@ class Bot:
         for mid in stale_ladders:
             if mid not in self.position_manager.get_pending_settlements():
                 self.ladder_manager.cleanup_ladder(mid)
+
+        # Prune expired market cache: remove entries with no position and not pending
+        pending = set(self.position_manager.get_pending_settlements())
+        has_position = set(self.position_manager.positions.keys())
+        stale_expired = [
+            mid for mid in self._expired_market_cache
+            if mid not in pending and mid not in has_position
+        ]
+        for mid in stale_expired:
+            self._expired_market_cache.pop(mid)
+
+        # Evict stale tick size cache entries
+        self.tick_cache.evict_stale()
 
     def _find_market(self, market_id: str) -> MarketWindow | None:
         market = self._active_markets.get(market_id)
@@ -1001,8 +1344,20 @@ class Bot:
         for asset in self.cfg.assets:
             price = self.spot_prices.get(asset, 0.0)
             if price > 0:
-                delta = self.compute_spot_delta(asset)
-                spot_parts.append(f"{asset}=${price:,.2f}({delta:+.3%})")
+                # Find nearest-expiry active window for this asset to compute delta
+                best_mid = None
+                best_remaining = float("inf")
+                for mkt in self._active_markets.values():
+                    if mkt.asset == asset and mkt.is_active(now_epoch):
+                        rem = mkt.remaining(now_epoch)
+                        if rem < best_remaining:
+                            best_remaining = rem
+                            best_mid = mkt.market_id
+                if best_mid is not None:
+                    delta = self.compute_spot_delta(asset, best_mid)
+                    spot_parts.append(f"{asset}=${price:,.2f}({delta:+.3%})")
+                else:
+                    spot_parts.append(f"{asset}=${price:,.2f}")
         spot_str = " | ".join(spot_parts) if spot_parts else "waiting for prices..."
 
         pos_count = self.position_manager.active_position_count()
@@ -1019,7 +1374,7 @@ class Bot:
         )
 
     def _record_activity(
-        self, event_type: str, asset: str, detail: str, pnl: float | None = None
+        self, event_type: str, asset: str, detail: str, pnl: float | None = None, meta: dict | None = None
     ):
         self._activity_log.append(
             ActivityEvent(
@@ -1028,6 +1383,7 @@ class Bot:
                 asset=asset,
                 detail=detail,
                 pnl=pnl,
+                meta=meta,
             )
         )
 
@@ -1036,7 +1392,7 @@ class Bot:
     # ------------------------------------------------------------------
 
     def build_state_snapshot(self) -> dict:
-        """Returns dict matching GUI state spec with all 23 fields."""
+        """Returns dict matching GUI state spec with all 24 fields."""
         now = int(time.time())
         active_list = list(self._active_markets.values())
 
@@ -1102,6 +1458,11 @@ class Bot:
             # Current spot price for this asset (RTDS primary, Binance fallback)
             current_price = spots.get(mkt.asset)
 
+            # Per-window spot delta (keyed by market_id)
+            spot_delta = None
+            if mkt.market_id in self.window_open_prices and current_price:
+                spot_delta = self.compute_spot_delta(mkt.asset, mkt.market_id)
+
             # Spread width
             spread_width = None
             if up_mid is not None and dn_mid is not None:
@@ -1113,14 +1474,19 @@ class Bot:
                 current_bankroll=self.position_manager.bankroll,
             )
             rungs_total = lp.rungs
+            budget = round(lp.position_size_fraction * self.position_manager.bankroll, 2)
             rungs_filled = 0
             imbalance = None
+            resting_up = 0
+            resting_dn = 0
             if ladder:
                 try:
                     stats = self.ladder_manager.get_ladder_stats(mkt.market_id)
                     if stats:
                         rungs_filled = stats.get("up_filled_count", 0) + stats.get("dn_filled_count", 0)
                         imbalance = stats.get("imbalance")
+                        resting_up = stats.get("up_resting", 0)
+                        resting_dn = stats.get("dn_resting", 0)
                 except Exception:
                     pass
 
@@ -1136,6 +1502,8 @@ class Bot:
                     "dn_avg": pos.dn_cost / pos.dn_qty if pos.dn_qty > 0 else 0,
                     "dn_cost": pos.dn_cost,
                     "pair_cost": pos.pair_cost(),
+                    "profit_if_up": pos.profit_if_up(),
+                    "profit_if_down": pos.profit_if_down(),
                 }
 
             # Compute window status for frontend
@@ -1170,10 +1538,18 @@ class Bot:
                 "spread_width": spread_width,
                 "rungs_filled": rungs_filled,
                 "rungs_total": rungs_total,
+                "resting_up": resting_up,
+                "resting_dn": resting_dn,
+                "budget": budget,
                 "imbalance": imbalance,
                 "position": position,
                 "window_status": window_status,
                 "opens_in_sec": opens_in_sec,
+                "spot_delta": spot_delta,
+                "price_to_beat": float(
+                    self.rtds_feed.price_at_timestamp(mkt.asset, mkt.open_epoch)
+                    or self.window_open_prices.get(mkt.market_id, 0)
+                ),
             }
             active_markets_info.append(info)
 
@@ -1205,14 +1581,33 @@ class Bot:
             "unrealized_pnl": self._compute_unrealized_pnl(),
             "trade_count": self._trade_count,
             "position_count": self.position_manager.active_position_count(),
-            "pairs_completed": pairs_completed,
-            "avg_pair_cost": 0.0,  # TODO
-            "imbalance_ratio": 0.0,  # TODO
+            "pairs_completed": self._settled_wins + self._settled_losses,
+            "avg_pair_cost": (
+                sum(self._settled_pair_costs) / len(self._settled_pair_costs)
+                if self._settled_pair_costs else 0.0
+            ),
+            "best_pair_cost": (
+                min(self._settled_pair_costs)
+                if self._settled_pair_costs else 0.0
+            ),
+            "imbalance_ratio": 0.0,
             "runtime_sec": (
                 int(time.time() - self._start_time) if self._start_time else 0
             ),
             "markets_active": len(self._active_markets),
-            "win_rate": 0.0,  # TODO
+            "win_rate": (
+                self._settled_wins / (self._settled_wins + self._settled_losses)
+                if (self._settled_wins + self._settled_losses) > 0 else 0.0
+            ),
+            "settled_wins": self._settled_wins,
+            "settled_losses": self._settled_losses,
+            "consecutive_losses": self.risk.consecutive_losses,
+            "exposure_factor": self.risk.exposure_factor(),
+            "daily_pnl": round(self.risk.daily_pnl, 2),
+            "is_halted": self.risk.is_halted(),
+            "capital_at_risk_pct": round(
+                self.ladder_manager.total_committed() / max(self.position_manager.bankroll, 1) * 100, 1
+            ),
             "prices": polymarket_prices,
             "binance_prices": binance_prices,
             "spots": spots,
@@ -1221,8 +1616,10 @@ class Bot:
                 {
                     "ts": e.timestamp,
                     "kind": e.event_type,
+                    "asset": e.asset,
                     "msg": f"[{e.asset}] {e.detail}" if e.asset else e.detail,
                     "pnl": e.pnl,
+                    "meta": e.meta,
                 }
                 for e in self._activity_log
             ],
@@ -1233,4 +1630,10 @@ class Bot:
                 if self.cfg.dry_run
                 else self._wallet_address
             ),
+            "usdc_balance": (
+                self.position_manager.bankroll
+                if self.cfg.dry_run
+                else self._wallet_balance
+            ),
+            "price_feed_stale": not self.price_feed.is_fresh(self.cfg.price_stale_sec),
         }
