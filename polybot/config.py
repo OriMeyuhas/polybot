@@ -162,8 +162,14 @@ class BotConfig:
     # Pair recovery parameters
     boost_elapsed_pct: float = 0.20       # Phase D: min fraction of window elapsed before boost
     force_buy_elapsed_pct: float = 0.70   # Phase B: min fraction of window elapsed before force-buy
-    force_buy_max_pair_cost: float = 0.93 # Phase B: pair cost ceiling for forced buy
+    force_buy_max_pair_cost: float = 0.88 # Phase B: pair cost ceiling for forced buy
     imbalance_min_heavy_fills: int = 3    # Min fully filled orders on heavy side before imbalance fires
+
+    # Spot-awareness parameters
+    spot_delta_reduce_threshold: float = 0.0015  # 0.15% — reduce losing side budget
+    spot_delta_skip_threshold: float = 0.005     # 0.50% — skip losing side entirely
+    spot_gate_force_buy_threshold: float = 0.003 # 0.30% — block force-buy when spot against
+    spot_loss_cap_multiplier: float = 0.50       # tighten loss cap when spot confirms loss
 
     def get_ladder_params(self, timeframe_sec: int, current_bankroll: float | None = None) -> LadderParams:
         """Return ladder parameters tuned for the given timeframe.
@@ -229,6 +235,16 @@ def validate_live_config(cfg: BotConfig) -> list[str]:
         errors.append(f"boost_elapsed_pct={cfg.boost_elapsed_pct} must be < force_buy_elapsed_pct={cfg.force_buy_elapsed_pct}")
     if cfg.force_buy_elapsed_pct >= 0.95:
         errors.append(f"force_buy_elapsed_pct={cfg.force_buy_elapsed_pct} must be < 0.95")
+    # Spot-awareness validation
+    if cfg.spot_delta_reduce_threshold <= 0:
+        errors.append(f"spot_delta_reduce_threshold={cfg.spot_delta_reduce_threshold} must be > 0")
+    if cfg.spot_delta_reduce_threshold >= cfg.spot_delta_skip_threshold:
+        errors.append(
+            f"spot_delta_reduce_threshold={cfg.spot_delta_reduce_threshold} must be < "
+            f"spot_delta_skip_threshold={cfg.spot_delta_skip_threshold}"
+        )
+    if not (0 < cfg.spot_loss_cap_multiplier <= 1.0):
+        errors.append(f"spot_loss_cap_multiplier={cfg.spot_loss_cap_multiplier} must be in (0, 1.0]")
     return errors
 
 
@@ -357,8 +373,12 @@ def load_bot_config() -> BotConfig:
         trade_1h=os.getenv("TRADE_1H", "true").lower() in ("true", "1", "yes"),
         boost_elapsed_pct=float(os.getenv("BOOST_ELAPSED_PCT", "0.20")),
         force_buy_elapsed_pct=float(os.getenv("FORCE_BUY_ELAPSED_PCT", "0.70")),
-        force_buy_max_pair_cost=float(os.getenv("FORCE_BUY_MAX_PAIR_COST", "0.93")),
+        force_buy_max_pair_cost=float(os.getenv("FORCE_BUY_MAX_PAIR_COST", "0.88")),
         imbalance_min_heavy_fills=int(os.getenv("IMBALANCE_MIN_HEAVY_FILLS", "3")),
+        spot_delta_reduce_threshold=float(os.getenv("SPOT_DELTA_REDUCE_THRESHOLD", "0.0015")),
+        spot_delta_skip_threshold=float(os.getenv("SPOT_DELTA_SKIP_THRESHOLD", "0.005")),
+        spot_gate_force_buy_threshold=float(os.getenv("SPOT_GATE_FORCE_BUY_THRESHOLD", "0.003")),
+        spot_loss_cap_multiplier=float(os.getenv("SPOT_LOSS_CAP_MULTIPLIER", "0.50")),
     )
 
 

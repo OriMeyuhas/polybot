@@ -31,6 +31,7 @@ from polybot.redeemer import Redeemer
 from polybot.errors import ClobApiError
 from polybot.types import MarketWindow, Side, ActivityEvent
 from polybot.web.state import GuiStateHolder
+from polybot import market_logger
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +113,10 @@ class Bot:
         self._settled_wins = 0
         self._settled_losses = 0
         self._settled_pair_costs: list[float] = []
+        self._per_asset_pnl: dict[str, float] = {}  # asset -> cumulative realized PnL
+        self._per_asset_pairs: dict[str, int] = {}  # asset -> settlement count
+        self._settlement_history: list[dict] = []  # all settlements for UI
+        self._pnl_series: list[dict] = []  # {"ts": epoch, "pnl": cumulative} for graph
         self.spot_prices: dict[str, float] = {}
         self.ladder_manager._spot_prices = self.spot_prices  # share by reference
         self.window_open_prices: dict[str, float] = {}  # keyed by market_id, NOT asset
@@ -428,6 +433,7 @@ class Bot:
         self._cancel_only_mode = False
         self._cancel_only_reason = ""
         self._start_time = time.time()
+        self._trading_active = True
         self._record_activity(
             "INFO", "SYSTEM",
             f"trading started — {'LIVE' if not self.cfg.dry_run else 'PAPER'} mode, bankroll=${self.position_manager.bankroll:,.2f}",
@@ -652,12 +658,14 @@ class Bot:
                     if market.is_pre_open(now):
                         # Pre-open: books are live, skip timing/elapsed guards
                         pre_open = True
+                        sd = self.compute_spot_delta(market.asset, market.market_id)
                         count = await asyncio.to_thread(
-                            self.ladder_manager.post_ladder_pre_open, market
+                            self.ladder_manager.post_ladder_pre_open, market, sd
                         )
                     elif market.is_active(now):
+                        sd = self.compute_spot_delta(market.asset, market.market_id)
                         count = await asyncio.to_thread(
-                            self.ladder_manager.post_ladder, market
+                            self.ladder_manager.post_ladder, market, sd
                         )
 
                     if count > 0:
@@ -667,6 +675,16 @@ class Bot:
                             market.asset,
                             f"{label}posted {count} rungs on {market.market_id}",
                         )
+                        # Log real order book snapshot for verification
+                        if self.cfg.dry_run and getattr(self, '_trading_active', False):
+                            try:
+                                market_logger.log_book_snapshot(
+                                    market.market_id, market.asset,
+                                    market.up_token_id, market.dn_token_id,
+                                    reason="ladder_post",
+                                )
+                            except Exception:
+                                pass
 
             # Reprice if book moved
             await asyncio.to_thread(
@@ -693,20 +711,31 @@ class Bot:
                 side_label = "UP" if order.side == Side.UP else "DN"
                 self._record_activity(
                     "FILL", market.asset,
-                    f"{side_label} {order.size:.0f}@${order.price:.2f}",
+                    f"{side_label} {order.size:.0f}@${order.price:.2f} on {market.market_id}",
                 )
+                # Log real book state at fill time for verification
+                if self.cfg.dry_run and getattr(self, '_trading_active', False):
+                    try:
+                        token_id = market.up_token_id if order.side == Side.UP else market.dn_token_id
+                        market_logger.log_fill(
+                            market.market_id, market.asset, side_label,
+                            order.price, order.size, token_id,
+                        )
+                    except Exception:
+                        pass
 
         # Imbalance guard
         await asyncio.to_thread(self.ladder_manager.check_imbalance, now)
 
         # Loss cap: cancel remaining orders on one-sided positions exceeding 3% bankroll
-        await asyncio.to_thread(self.ladder_manager.check_loss_cap, self.spot_prices)
+        await asyncio.to_thread(self.ladder_manager.check_loss_cap, self.spot_prices, self.window_open_prices)
 
         # Phase D: Boost light side ladder
         for market in active_list:
             if market.is_active(now) and self.ladder_manager.has_ladder(market.market_id):
+                sd = self.compute_spot_delta(market.asset, market.market_id)
                 boosted = await asyncio.to_thread(
-                    self.ladder_manager.boost_light_side, market, now
+                    self.ladder_manager.boost_light_side, market, now, sd
                 )
                 if boosted > 0:
                     self._record_activity(
@@ -719,14 +748,26 @@ class Bot:
             if self.ladder_manager.is_killed(market.market_id):
                 continue
             if market.is_active(now) and self.ladder_manager.has_ladder(market.market_id):
+                sd = self.compute_spot_delta(market.asset, market.market_id)
                 result = await asyncio.to_thread(
-                    self.ladder_manager.try_complete_pair, market, now
+                    self.ladder_manager.try_complete_pair, market, now, sd
                 )
                 if result:
                     self._record_activity(
                         "PAIR_COMPLETE", market.asset,
                         f"bought {result['side'].value} @${result['price']:.3f} pair_cost=${result['pair_cost']:.3f}",
                     )
+                    # Log real book state at force-buy time
+                    if self.cfg.dry_run and getattr(self, '_trading_active', False):
+                        try:
+                            token_id = market.up_token_id if result['side'] == Side.UP else market.dn_token_id
+                            market_logger.log_force_buy(
+                                market.market_id, market.asset,
+                                result['side'].value, result['price'],
+                                result['qty'], result['pair_cost'], token_id,
+                            )
+                        except Exception:
+                            pass
 
         # Cancel rungs on expiring windows
         for market in active_list:
@@ -992,6 +1033,11 @@ class Bot:
             logger.info("Settled %s: %s, PnL=$%.2f", mid, normalized, pnl)
             self.risk.update_pnl(pnl)
             self._realized_pnl += pnl
+            if not hasattr(self, '_per_asset_pnl'):
+                self._per_asset_pnl = {}
+                self._per_asset_pairs = {}
+            self._per_asset_pnl[market.asset] = self._per_asset_pnl.get(market.asset, 0.0) + pnl
+            self._per_asset_pairs[market.asset] = self._per_asset_pairs.get(market.asset, 0) + 1
             if pnl > 0:
                 self._settled_wins += 1
             elif pnl < 0:
@@ -1026,8 +1072,46 @@ class Bot:
             }
             self._record_activity("SETTLE", market.asset, detail, pnl=pnl, meta=settle_meta)
 
+            # Track settlement history and PnL series for UI
+            if not hasattr(self, '_settlement_history'):
+                self._settlement_history = []
+                self._pnl_series = []
+            self._settlement_history.append({
+                "ts": time.time(),
+                "asset": market.asset,
+                "timeframe": tf_label,
+                "outcome": normalized,
+                "pnl": round(pnl, 2),
+                "up_qty": round(pos.up_qty, 1),
+                "dn_qty": round(pos.dn_qty, 1),
+                "total_cost": round(pos.up_cost + pos.dn_cost, 2),
+                "pair_cost": round(pos.pair_cost(), 3) if min(pos.up_qty, pos.dn_qty) > 0 else None,
+            })
+            self._pnl_series.append({
+                "ts": time.time(),
+                "pnl": round(self._realized_pnl, 2),
+            })
+
             # Persist settlement record to JSONL for future analysis
             self._log_settlement(market, settle_meta, pnl)
+
+            # Log real market data for paper mode verification
+            if self.cfg.dry_run and getattr(self, '_trading_active', False):
+                try:
+                    market_logger.log_settlement(
+                        market_id=mid, asset=market.asset,
+                        timeframe_sec=market.timeframe_sec,
+                        up_token_id=market.up_token_id,
+                        dn_token_id=market.dn_token_id,
+                        paper_outcome=normalized,
+                        spot_price=self.spot_prices.get(market.asset, 0.0),
+                        open_price=self.window_open_prices.get(mid, 0.0),
+                        pnl=pnl,
+                        pair_cost=settle_meta.get("pair_cost"),
+                        up_qty=pos.up_qty, dn_qty=pos.dn_qty,
+                    )
+                except Exception:
+                    pass
 
             self.redeemer.queue_redemption(
                 market.condition_id,
@@ -1041,6 +1125,8 @@ class Bot:
 
     def _log_settlement(self, market: MarketWindow, meta: dict, pnl: float):
         """Append settlement record to data/settlement_log.jsonl for analysis."""
+        if not getattr(self, '_trading_active', False):
+            return
         import json as _json
         record = {
             "ts": time.time(),
@@ -1376,9 +1462,10 @@ class Bot:
     def _record_activity(
         self, event_type: str, asset: str, detail: str, pnl: float | None = None, meta: dict | None = None
     ):
+        ts = time.time()
         self._activity_log.append(
             ActivityEvent(
-                timestamp=time.time(),
+                timestamp=ts,
                 event_type=event_type,
                 asset=asset,
                 detail=detail,
@@ -1386,6 +1473,34 @@ class Bot:
                 meta=meta,
             )
         )
+        # Persist all activity to JSONL for analysis
+        self._persist_activity(ts, event_type, asset, detail, pnl, meta)
+
+    def _persist_activity(self, ts: float, event_type: str, asset: str, detail: str,
+                          pnl: float | None, meta: dict | None):
+        """Append activity event to data/activity_log.jsonl."""
+        if not getattr(self, '_trading_active', False):
+            return  # don't log during tests or before trading starts
+        import json as _json
+        import pathlib
+        record = {
+            "ts": ts,
+            "type": event_type,
+            "asset": asset,
+            "detail": detail,
+            "bankroll": round(self.position_manager.bankroll, 2),
+        }
+        if pnl is not None:
+            record["pnl"] = round(pnl, 4)
+        if meta:
+            record.update(meta)
+        try:
+            log_path = pathlib.Path("data/activity_log.jsonl")
+            log_path.parent.mkdir(exist_ok=True)
+            with open(log_path, "a") as f:
+                f.write(_json.dumps(record) + "\n")
+        except Exception:
+            pass  # never block trading on log writes
 
     # ------------------------------------------------------------------
     # State snapshot for GUI
@@ -1579,6 +1694,10 @@ class Bot:
             "total_pnl": self._realized_pnl + self._compute_unrealized_pnl(),
             "realized_pnl": self._realized_pnl,
             "unrealized_pnl": self._compute_unrealized_pnl(),
+            "per_asset_pnl": {k: round(v, 2) for k, v in getattr(self, '_per_asset_pnl', {}).items()},
+            "per_asset_pairs": dict(getattr(self, '_per_asset_pairs', {})),
+            "settlement_history": getattr(self, '_settlement_history', []),
+            "pnl_series": getattr(self, '_pnl_series', []),
             "trade_count": self._trade_count,
             "position_count": self.position_manager.active_position_count(),
             "pairs_completed": self._settled_wins + self._settled_losses,

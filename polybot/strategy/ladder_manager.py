@@ -39,6 +39,8 @@ class LadderState:
     current_ask_up: float = 0.0
     current_ask_dn: float = 0.0
     timeframe_sec: int = 900
+    force_buy_done: bool = False  # True after a force-buy has been placed
+    boosted_at: float = 0.0  # timestamp when boost fired — loss cap grace period
 
 
 MIN_ORDER_SIZE = 5.0  # Polymarket minimum for GTC orders
@@ -159,11 +161,11 @@ class LadderManager:
         """Return True if this market's ladder was killed by check_loss_cap."""
         return market_id in self._killed_ladders
 
-    def post_ladder_pre_open(self, market: MarketWindow) -> int:
+    def post_ladder_pre_open(self, market: MarketWindow, spot_delta: float = 0.0) -> int:
         """Post ladder for pre-open markets. Delegates to post_ladder."""
-        return self.post_ladder(market)
+        return self.post_ladder(market, spot_delta=spot_delta)
 
-    def try_complete_pair(self, market: MarketWindow, now: float = 0) -> dict | None:
+    def try_complete_pair(self, market: MarketWindow, now: float = 0, spot_delta: float = 0.0) -> dict | None:
         """Phase B: Force-buy the light side to complete a one-sided position.
 
         Trigger conditions (ALL must be true):
@@ -180,6 +182,11 @@ class LadderManager:
 
         # Guard: killed ladder
         if mid in self._killed_ladders:
+            return None
+
+        # Guard: already force-bought this window
+        state = self.ladders.get(mid)
+        if state is not None and state.force_buy_done:
             return None
 
         # Check position exists
@@ -215,6 +222,24 @@ class LadderManager:
             light_side = Side.UP
             light_token = market.up_token_id
 
+        # Require minimum fills on heavy side (aligned with imbalance detection)
+        min_heavy = getattr(self.cfg, "imbalance_min_heavy_fills", 3)
+        heavy_side_enum = Side.UP if up_qty >= dn_qty else Side.DOWN
+        if self.tracker.filled_count(mid, heavy_side_enum) < min_heavy:
+            return None
+
+        # Spot gate: block force-buy when spot moves against heavy side
+        gate = self.cfg.spot_gate_force_buy_threshold
+        if abs(spot_delta) > gate:
+            spot_against = (
+                (heavy_side_enum == Side.UP and spot_delta < -gate) or
+                (heavy_side_enum == Side.DOWN and spot_delta > gate)
+            )
+            if spot_against:
+                logger.info("SPOT GATE FORCE-BUY: %s delta=%.3f%% against heavy=%s, skip",
+                             mid, spot_delta * 100, heavy_side_enum.value)
+                return None
+
         # Check one-sidedness: light must be < 25% of heavy
         if heavy_qty > 0 and light_qty >= 0.25 * heavy_qty:
             return None
@@ -234,9 +259,20 @@ class LadderManager:
 
         # Pair cost guard
         heavy_vwap = heavy_cost / heavy_qty if heavy_qty > 0 else 0
-        force_buy_max = getattr(self.cfg, "force_buy_max_pair_cost", 0.93)
+        force_buy_max = getattr(self.cfg, "force_buy_max_pair_cost", 0.88)
         hypothetical_pair_cost = heavy_vwap + estimated_avg_price
         if hypothetical_pair_cost >= force_buy_max:
+            # Pair can't be completed profitably — kill the ladder to stop bleeding
+            if mid in self.ladders:
+                self.cancel_ladder(mid)
+                del self.ladders[mid]
+                self._killed_ladders.add(mid)
+                logger.warning(
+                    "FORCE-BUY REJECTED: %s — pair_cost $%.3f > $%.3f, killed ladder to cut losses",
+                    mid, hypothetical_pair_cost, force_buy_max,
+                )
+            if state is not None:
+                state.force_buy_done = True
             return None
 
         # Get best ask for the limit order price
@@ -271,6 +307,10 @@ class LadderManager:
         fill_cost = self._fill_cost(best_ask, deficit)
         self.positions.update_position(mid, light_side, deficit, fill_cost)
 
+        # Mark force-buy done so we don't repeat
+        if state is not None:
+            state.force_buy_done = True
+
         logger.info(
             "FORCE-BUY: %s — %s %.1f @ $%.3f, pair_cost=$%.3f",
             mid, light_side.value, deficit, best_ask, hypothetical_pair_cost,
@@ -300,7 +340,7 @@ class LadderManager:
         """Total capital committed: fee-inclusive resting order cost + filled position cost."""
         return self.resting_order_cost() + self.positions.total_position_cost()
 
-    def boost_light_side(self, market: MarketWindow, now: float) -> int:
+    def boost_light_side(self, market: MarketWindow, now: float, spot_delta: float = 0.0) -> int:
         """Phase D: Reanchor the light side's ladder closer to market.
 
         Trigger conditions (ALL must be true):
@@ -351,9 +391,27 @@ class LadderManager:
         else:
             return 0  # conditions not met
 
-        # Cancel the light side's resting orders
-        cancelled = self.tracker.cancel_side(mid, light_side)
-        self.executor.cancel_batch(cancelled)
+        # Spot gate: skip boost if spot moves away from heavy side
+        if abs(spot_delta) > self.cfg.spot_delta_reduce_threshold:
+            spot_toward_heavy = (
+                (heavy_side == Side.UP and spot_delta > 0) or
+                (heavy_side == Side.DOWN and spot_delta < 0)
+            )
+            if not spot_toward_heavy:
+                logger.info("SPOT GATE BOOST: %s delta=%.3f%% away from heavy=%s, skip",
+                             mid, spot_delta * 100, heavy_side.value)
+                return 0
+
+        # Cancel BOTH sides' resting orders:
+        # - Light side: stale rungs too far from market
+        # - Heavy side: stop further accumulation while we wait for light side to fill
+        cancelled_light = self.tracker.cancel_side(mid, light_side)
+        self.executor.cancel_batch(cancelled_light)
+        cancelled_heavy = self.tracker.cancel_side(mid, heavy_side)
+        self.executor.cancel_batch(cancelled_heavy)
+        if cancelled_heavy:
+            logger.info("BOOST: %s — cancelled %d heavy-side (%s) rungs to cap exposure",
+                        mid, len(cancelled_heavy), heavy_side.value)
 
         # Get best ask for the light side
         try:
@@ -422,6 +480,7 @@ class LadderManager:
 
         # Mark as boosted
         state.boosted_side = light_side
+        state.boosted_at = time.time()
         # Update anchor for the light side
         if light_side == Side.UP:
             state.anchor_up = best_ask
@@ -434,13 +493,21 @@ class LadderManager:
         )
         return count
 
-    def post_ladder(self, market: MarketWindow) -> int:
+    def post_ladder(self, market: MarketWindow, spot_delta: float = 0.0) -> int:
         """Post a full ladder (both sides) for a market. Returns number of orders placed."""
         try:
             if self.risk.is_halted():
                 return 0
             if market.market_id in self._killed_ladders:
                 return 0
+            # Don't re-create a ladder for a market that already has fills
+            # (e.g. after boost cancelled the ladder state but positions remain)
+            try:
+                pos = self.positions.positions.get(market.market_id)
+                if pos is not None and (pos.up_qty > 0 or pos.dn_qty > 0):
+                    return 0
+            except (TypeError, AttributeError):
+                pass
             if not self.risk.can_open_position(self.positions.active_position_count()):
                 return 0
 
@@ -476,9 +543,34 @@ class LadderManager:
                             market.market_id, best_ask_up, best_ask_dn)
                 return 0
 
-            # Budget split: 50/50 — whale data shows no evidence of budget skewing
-            budget_up = budget / 2.0
-            budget_dn = budget / 2.0
+            # Budget split: spot-aware skew based on BTC delta
+            reduce_thresh = self.cfg.spot_delta_reduce_threshold
+            skip_thresh = self.cfg.spot_delta_skip_threshold
+            abs_delta = abs(spot_delta)
+
+            if abs_delta >= skip_thresh:
+                if spot_delta > 0:  # BTC up -> DN losing
+                    budget_up = budget
+                    budget_dn = 0.0
+                else:
+                    budget_up = 0.0
+                    budget_dn = budget
+                logger.info("SPOT SKIP: %s delta=%.3f%% — skipping %s side",
+                            market.market_id, spot_delta * 100, "DN" if spot_delta > 0 else "UP")
+            elif abs_delta >= reduce_thresh:
+                losing_frac = 0.5 * (1.0 - (abs_delta - reduce_thresh) / (skip_thresh - reduce_thresh))
+                winning_frac = 1.0 - losing_frac
+                if spot_delta > 0:
+                    budget_up = budget * winning_frac
+                    budget_dn = budget * losing_frac
+                else:
+                    budget_up = budget * losing_frac
+                    budget_dn = budget * winning_frac
+                logger.info("SPOT SKEW: %s delta=%.3f%% — UP=$%.0f DN=$%.0f",
+                            market.market_id, spot_delta * 100, budget_up, budget_dn)
+            else:
+                budget_up = budget / 2.0
+                budget_dn = budget / 2.0
 
             up_rungs = build_ladder_rungs(
                 best_ask_up, budget_up,
@@ -575,6 +667,10 @@ class LadderManager:
                 current_ask_dn=best_ask_dn,
                 timeframe_sec=market.timeframe_sec,
             )
+
+            # Skip if no rungs could be built on either side
+            if not up_rungs and not dn_rungs:
+                return 0
 
             # Log pair cost for monitoring
             if up_rungs and dn_rungs:
@@ -833,9 +929,13 @@ class LadderManager:
                 heavy_side = Side.UP if up_qty > dn_qty else Side.DOWN
                 if state.heavy_side_locked != heavy_side.value:
                     state.heavy_side_locked = heavy_side.value
+                    # Cancel the heavy side's resting orders immediately
+                    # to stop further accumulation
+                    cancelled = self.tracker.cancel_side(mid, heavy_side)
+                    self.executor.cancel_batch(cancelled)
                     logger.info(
-                        "IMBALANCE LOCK: %s — %s side locked (UP=%.0f DN=%.0f)",
-                        mid, heavy_side.value, up_qty, dn_qty,
+                        "IMBALANCE LOCK: %s — %s side locked, cancelled %d resting orders (UP=%.0f DN=%.0f)",
+                        mid, heavy_side.value, len(cancelled), up_qty, dn_qty,
                     )
 
                 if state.imbalance_alert_at is None:
@@ -859,18 +959,30 @@ class LadderManager:
 
         return acted
 
-    def check_loss_cap(self, spot_prices: dict[str, float]) -> list[str]:
+    def check_loss_cap(self, spot_prices: dict[str, float], window_open_prices: dict[str, float] | None = None) -> list[str]:
         """Cancel remaining orders on positions whose one-sided loss exceeds threshold.
 
         For one-sided positions, the max loss is the total cost basis. If that exceeds
         max_loss_per_position, cancel remaining orders to prevent further accumulation.
+        When window_open_prices is provided and spot moves against the one-sided position,
+        the effective max loss is tightened by spot_loss_cap_multiplier.
         Returns list of market_ids where orders were cancelled.
         """
-        max_loss = self.positions.bankroll * 0.03  # 3% of bankroll per position
+        max_loss = self.positions.bankroll * 0.05  # 5% of bankroll per position
         if max_loss < 5.0:
             max_loss = 5.0
         acted = []
+        now = time.time()
         for mid, state in list(self.ladders.items()):
+            # Grace period: don't kill a ladder that was just boosted — give rungs time to fill
+            if state.boosted_at > 0 and now - state.boosted_at < 60.0:
+                continue
+
+            # Check position manager first (includes force-buy credits)
+            pos = self.positions.positions.get(mid)
+            if pos is not None and pos.up_qty > 0 and pos.dn_qty > 0:
+                continue  # two-sided (possibly via force-buy), pair cost protects us
+
             up_qty = self.tracker.filled_qty(mid, Side.UP)
             dn_qty = self.tracker.filled_qty(mid, Side.DOWN)
             up_cost = self.tracker.filled_cost(mid, Side.UP)
@@ -883,7 +995,22 @@ class LadderManager:
                 continue  # no fills yet
 
             cost_basis = up_cost + dn_cost
-            if cost_basis > max_loss:
+
+            # Tighten loss cap when spot confirms the losing direction
+            effective_max_loss = max_loss
+            if window_open_prices is not None:
+                current = spot_prices.get(state.asset, 0.0)
+                open_price = window_open_prices.get(mid, 0.0)
+                if current > 0 and open_price > 0:
+                    delta = (current - open_price) / open_price
+                    spot_against = (
+                        (up_qty > 0 and dn_qty == 0 and delta < -self.cfg.spot_delta_reduce_threshold) or
+                        (dn_qty > 0 and up_qty == 0 and delta > self.cfg.spot_delta_reduce_threshold)
+                    )
+                    if spot_against:
+                        effective_max_loss = max_loss * self.cfg.spot_loss_cap_multiplier
+
+            if cost_basis > effective_max_loss:
                 cancelled = self.cancel_ladder(mid)
                 # Remove ladder state so reprice_if_needed won't iterate it
                 del self.ladders[mid]
@@ -891,7 +1018,7 @@ class LadderManager:
                 self._killed_ladders.add(mid)
                 logger.warning(
                     "LOSS CAP: %s — one-sided cost $%.2f > max $%.2f, cancelled %d orders",
-                    mid, cost_basis, max_loss, cancelled,
+                    mid, cost_basis, effective_max_loss, cancelled,
                 )
                 acted.append(mid)
         return acted
