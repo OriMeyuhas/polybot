@@ -220,16 +220,21 @@ class LadderManager:
             now = time.time()
             count = 0
 
+            # GTD expiration: orders auto-cancel at window close minus safety buffer
+            expiration = int(market.close_epoch - self.cfg.no_trade_final_sec)
+
             # Build batch order list for UP side
             up_order_dicts = [
                 {"token_id": market.up_token_id, "price": price, "size": size,
-                 "market_id": market.market_id, "side": Side.UP}
+                 "market_id": market.market_id, "side": Side.UP,
+                 "expiration": expiration}
                 for price, size in up_rungs
             ]
             # Build batch order list for DN side
             dn_order_dicts = [
                 {"token_id": market.dn_token_id, "price": price, "size": size,
-                 "market_id": market.market_id, "side": Side.DOWN}
+                 "market_id": market.market_id, "side": Side.DOWN,
+                 "expiration": expiration}
                 for price, size in dn_rungs
             ]
 
@@ -452,9 +457,11 @@ class LadderManager:
                             lp.rungs, lp.spacing, lp.width, lp.size_skew,
                             tick_size=tick_size,
                         )
+                        reprice_expiration = int(market.close_epoch - self.cfg.no_trade_final_sec)
                         up_order_dicts = [
                             {"token_id": market.up_token_id, "price": price, "size": size,
-                             "market_id": mid, "side": Side.UP}
+                             "market_id": mid, "side": Side.UP,
+                             "expiration": reprice_expiration}
                             for price, size in up_rungs
                         ]
                         for record in self.executor.place_batch_limit_buys(up_order_dicts):
@@ -489,9 +496,11 @@ class LadderManager:
                             lp.rungs, lp.spacing, lp.width, lp.size_skew,
                             tick_size=tick_size,
                         )
+                        reprice_expiration = int(market.close_epoch - self.cfg.no_trade_final_sec)
                         dn_order_dicts = [
                             {"token_id": market.dn_token_id, "price": price, "size": size,
-                             "market_id": mid, "side": Side.DOWN}
+                             "market_id": mid, "side": Side.DOWN,
+                             "expiration": reprice_expiration}
                             for price, size in dn_rungs
                         ]
                         for record in self.executor.place_batch_limit_buys(dn_order_dicts):

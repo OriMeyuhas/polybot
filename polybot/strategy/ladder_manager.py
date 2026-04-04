@@ -197,7 +197,7 @@ class LadderManager:
         # Elapsed fraction check
         if market.timeframe_sec <= 0:
             return None
-        force_buy_pct = getattr(self.cfg, "force_buy_elapsed_pct", 0.70)
+        force_buy_pct = self.cfg.force_buy_elapsed_pct
         elapsed_frac = (now - market.open_epoch) / market.timeframe_sec
         if elapsed_frac < force_buy_pct:
             return None
@@ -223,7 +223,7 @@ class LadderManager:
             light_token = market.up_token_id
 
         # Require minimum fills on heavy side (aligned with imbalance detection)
-        min_heavy = getattr(self.cfg, "imbalance_min_heavy_fills", 3)
+        min_heavy = self.cfg.imbalance_min_heavy_fills
         heavy_side_enum = Side.UP if up_qty >= dn_qty else Side.DOWN
         if self.tracker.filled_count(mid, heavy_side_enum) < min_heavy:
             return None
@@ -259,7 +259,7 @@ class LadderManager:
 
         # Pair cost guard
         heavy_vwap = heavy_cost / heavy_qty if heavy_qty > 0 else 0
-        force_buy_max = getattr(self.cfg, "force_buy_max_pair_cost", 0.88)
+        force_buy_max = self.cfg.force_buy_max_pair_cost
         hypothetical_pair_cost = heavy_vwap + estimated_avg_price
         if hypothetical_pair_cost >= force_buy_max:
             # Pair can't be completed profitably — kill the ladder to stop bleeding
@@ -316,6 +316,12 @@ class LadderManager:
             mid, light_side.value, deficit, best_ask, hypothetical_pair_cost,
         )
 
+        if deficit > 50:
+            logger.warning(
+                "FORCE-BUY LARGE: %s deficit=%.0f shares — may only partially fill",
+                mid, deficit,
+            )
+
         return {
             "side": light_side,
             "price": estimated_avg_price,
@@ -371,14 +377,14 @@ class LadderManager:
         if market.timeframe_sec <= 0:
             return 0
         elapsed_frac = (now - market.open_epoch) / market.timeframe_sec
-        boost_pct = getattr(self.cfg, "boost_elapsed_pct", 0.20)
+        boost_pct = self.cfg.boost_elapsed_pct
         if elapsed_frac < boost_pct:
             return 0
 
         # Determine heavy and light sides by filled count
         up_count = self.tracker.filled_count(mid, Side.UP)
         dn_count = self.tracker.filled_count(mid, Side.DOWN)
-        min_heavy = getattr(self.cfg, "imbalance_min_heavy_fills", 3)
+        min_heavy = self.cfg.imbalance_min_heavy_fills
 
         if up_count >= min_heavy and dn_count == 0:
             heavy_side = Side.UP
@@ -398,8 +404,12 @@ class LadderManager:
                 (heavy_side == Side.DOWN and spot_delta < 0)
             )
             if not spot_toward_heavy:
-                logger.info("SPOT GATE BOOST: %s delta=%.3f%% away from heavy=%s, skip",
-                             mid, spot_delta * 100, heavy_side.value)
+                if not hasattr(self, '_spot_gate_logged'):
+                    self._spot_gate_logged = set()
+                if mid not in self._spot_gate_logged:
+                    logger.info("SPOT GATE BOOST: %s delta=%.3f%% away from heavy=%s, skip",
+                                 mid, spot_delta * 100, heavy_side.value)
+                    self._spot_gate_logged.add(mid)
                 return 0
 
         # Cancel BOTH sides' resting orders:
@@ -457,10 +467,12 @@ class LadderManager:
         if not new_rungs:
             return 0
 
-        # Place orders
+        # Place orders with GTD expiration
+        expiration = int(market.close_epoch - self.cfg.no_trade_final_sec)
         order_dicts = [
             {"token_id": light_token, "price": price, "size": size,
-             "market_id": mid, "side": light_side}
+             "market_id": mid, "side": light_side,
+             "expiration": expiration}
             for price, size in new_rungs
         ]
         count = 0
@@ -543,6 +555,19 @@ class LadderManager:
                             market.market_id, best_ask_up, best_ask_dn)
                 return 0
 
+            # Fix market-creation artifact: early-window books show best_ask=$0.99
+            # (initial seed liquidity). Use midpoint as anchor instead — real market
+            # makers populate both sides with tight spreads within seconds.
+            if best_ask_up >= 0.90:
+                mid_up = self.executor.get_midpoint(market.up_token_id)
+                if mid_up and 0.01 < mid_up < 0.99:
+                    best_ask_up = mid_up + tick_size
+            if best_ask_dn >= 0.90:
+                mid_dn = self.executor.get_midpoint(market.dn_token_id)
+                if mid_dn and 0.01 < mid_dn < 0.99:
+                    best_ask_dn = mid_dn + tick_size
+
+
             # Budget split: spot-aware skew based on BTC delta
             reduce_thresh = self.cfg.spot_delta_reduce_threshold
             skip_thresh = self.cfg.spot_delta_skip_threshold
@@ -596,10 +621,16 @@ class LadderManager:
                 ) / sum(s for _, s in top3_dn)
                 top3_pair = top3_up_vwap + top3_dn_vwap
                 if top3_pair > lp.max_pair_cost:
-                    logger.info(
-                        "Pair cost guard: %s top-3 VWAP %.4f > %.4f (fee-inclusive), skipping",
-                        market.market_id, top3_pair, lp.max_pair_cost,
-                    )
+                    if not hasattr(self, '_pc_guard_logged'):
+                        self._pc_guard_logged = {}
+                    now_t = time.time()
+                    last_log = self._pc_guard_logged.get(market.market_id, 0)
+                    if now_t - last_log > 60:
+                        logger.info(
+                            "Pair cost guard: %s top-3 VWAP %.4f > %.4f (fee-inclusive), skipping",
+                            market.market_id, top3_pair, lp.max_pair_cost,
+                        )
+                        self._pc_guard_logged[market.market_id] = now_t
                     return 0
                 # Trim individual top rungs whose fee-inclusive price pair exceeds ceiling
                 while len(up_rungs) > 1 and len(dn_rungs) > 1 and (
@@ -615,16 +646,21 @@ class LadderManager:
             now = time.time()
             count = 0
 
+            # GTD expiration: orders auto-cancel at window close minus safety buffer
+            expiration = int(market.close_epoch - self.cfg.no_trade_final_sec)
+
             # Build batch order list for UP side
             up_order_dicts = [
                 {"token_id": market.up_token_id, "price": price, "size": size,
-                 "market_id": market.market_id, "side": Side.UP}
+                 "market_id": market.market_id, "side": Side.UP,
+                 "expiration": expiration}
                 for price, size in up_rungs
             ]
             # Build batch order list for DN side
             dn_order_dicts = [
                 {"token_id": market.dn_token_id, "price": price, "size": size,
-                 "market_id": market.market_id, "side": Side.DOWN}
+                 "market_id": market.market_id, "side": Side.DOWN,
+                 "expiration": expiration}
                 for price, size in dn_rungs
             ]
 
@@ -746,6 +782,7 @@ class LadderManager:
             )
             order.status = "filled"
             order.filled = fill_qty
+            order.credited_to_pm = fill_qty
             logger.info("FILL: %s %s %.1f @ $%.2f on %s",
                          order.side.value, order.token_id[:16],
                          fill_qty, order.price, order.market_id)
@@ -833,9 +870,11 @@ class LadderManager:
                             # Pair cost guard: trim rungs whose price + other side VWAP > max_pair_cost
                             if dn_filled_vwap > 0 and up_rungs:
                                 up_rungs = [(p, s) for p, s in up_rungs if p + dn_filled_vwap <= lp.max_pair_cost]
+                            reprice_expiration = int(market.close_epoch - self.cfg.no_trade_final_sec)
                             up_order_dicts = [
                                 {"token_id": market.up_token_id, "price": price, "size": size,
-                                 "market_id": mid, "side": Side.UP}
+                                 "market_id": mid, "side": Side.UP,
+                                 "expiration": reprice_expiration}
                                 for price, size in up_rungs
                             ]
                             for record in self.executor.place_batch_limit_buys(up_order_dicts):
@@ -854,6 +893,12 @@ class LadderManager:
                         state.anchor_dn = best_ask_dn
                         logger.info("REPRICE SKIP DN: %s locked heavy side", mid)
                     else:
+                        # Flush uncredited partial fills before cancelling the side
+                        for order, delta in self.tracker.flush_uncredited(mid):
+                            if order.side == Side.DOWN:
+                                self.positions.update_position(
+                                    order.market_id, order.side, delta, self._fill_cost(order.price, delta),
+                                )
                         cancelled = self.tracker.cancel_side(mid, Side.DOWN)
                         self.executor.cancel_batch(cancelled)
 
@@ -867,9 +912,11 @@ class LadderManager:
                             # Pair cost guard: trim rungs whose price + other side VWAP > max_pair_cost
                             if up_filled_vwap > 0 and dn_rungs:
                                 dn_rungs = [(p, s) for p, s in dn_rungs if p + up_filled_vwap <= lp.max_pair_cost]
+                            reprice_expiration = int(market.close_epoch - self.cfg.no_trade_final_sec)
                             dn_order_dicts = [
                                 {"token_id": market.dn_token_id, "price": price, "size": size,
-                                 "market_id": mid, "side": Side.DOWN}
+                                 "market_id": mid, "side": Side.DOWN,
+                                 "expiration": reprice_expiration}
                                 for price, size in dn_rungs
                             ]
                             for record in self.executor.place_batch_limit_buys(dn_order_dicts):
@@ -913,7 +960,7 @@ class LadderManager:
                 self.tracker.filled_count(mid, Side.UP),
                 self.tracker.filled_count(mid, Side.DOWN),
             )
-            min_heavy_fills = getattr(self.cfg, "imbalance_min_heavy_fills", 3)
+            min_heavy_fills = self.cfg.imbalance_min_heavy_fills
             if heavy_count < min_heavy_fills:
                 continue  # not enough fills to judge imbalance
 
@@ -957,6 +1004,40 @@ class LadderManager:
                 # Clear any previous alert
                 state.imbalance_alert_at = None
 
+            # Early one-sided kill: if 100% one-sided and >25% of window elapsed, kill immediately
+            # Data shows 95.5% of one-sided fills are adverse selection — cut losses fast
+            min_qty_check = min(up_qty, dn_qty)
+            if min_qty_check == 0 and max_qty > 0:
+                elapsed_since_post = now_epoch - state.posted_at
+                if elapsed_since_post > state.timeframe_sec * 0.25:
+                    heavy_cost = self.tracker.filled_cost(mid, Side.UP if up_qty > dn_qty else Side.DOWN)
+                    if heavy_cost > 3.0:  # at least $3 at risk
+                        self.cancel_ladder(mid)
+                        if mid in self.ladders:
+                            del self.ladders[mid]
+                        self._killed_ladders.add(mid)
+                        logger.warning(
+                            "ONE-SIDED ABORT: %s — 100%% one-sided at %.0f%% elapsed (UP=%.0f DN=%.0f cost=$%.2f), killed",
+                            mid, (elapsed_since_post / state.timeframe_sec) * 100, up_qty, dn_qty, heavy_cost,
+                        )
+                        acted.append(mid)
+                        continue
+
+            # Extreme imbalance kill: ratio > 5 with significant cost → kill immediately
+            min_qty = min(up_qty, dn_qty)
+            if min_qty > 0:
+                ratio = max_qty / min_qty
+                heavy_cost = self.tracker.filled_cost(mid, Side.UP if up_qty > dn_qty else Side.DOWN)
+                if ratio > 5.0 and heavy_cost > self.positions.bankroll * 0.02:
+                    self.cancel_ladder(mid)
+                    del self.ladders[mid]
+                    self._killed_ladders.add(mid)
+                    logger.warning(
+                        "EXTREME IMBALANCE KILL: %s — ratio %.1f:1 (UP=%.0f DN=%.0f) cost=$%.2f, killed",
+                        mid, ratio, up_qty, dn_qty, heavy_cost,
+                    )
+                    acted.append(mid)
+
         return acted
 
     def check_loss_cap(self, spot_prices: dict[str, float], window_open_prices: dict[str, float] | None = None) -> list[str]:
@@ -981,7 +1062,10 @@ class LadderManager:
             # Check position manager first (includes force-buy credits)
             pos = self.positions.positions.get(mid)
             if pos is not None and pos.up_qty > 0 and pos.dn_qty > 0:
-                continue  # two-sided (possibly via force-buy), pair cost protects us
+                ratio = max(pos.up_qty, pos.dn_qty) / min(pos.up_qty, pos.dn_qty)
+                if ratio < 3.0:
+                    continue  # truly two-sided, pair cost protects us
+                # else: highly imbalanced (e.g. 319:5), treat as one-sided and check loss cap
 
             up_qty = self.tracker.filled_qty(mid, Side.UP)
             dn_qty = self.tracker.filled_qty(mid, Side.DOWN)
@@ -990,7 +1074,10 @@ class LadderManager:
 
             # Only check one-sided positions (the risky ones)
             if up_qty > 0 and dn_qty > 0:
-                continue  # two-sided, pair cost protects us
+                ratio = max(up_qty, dn_qty) / min(up_qty, dn_qty)
+                if ratio < 3.0:
+                    continue  # truly two-sided, pair cost protects us
+                # else: highly imbalanced, treat as one-sided and check loss cap
             if up_qty == 0 and dn_qty == 0:
                 continue  # no fills yet
 

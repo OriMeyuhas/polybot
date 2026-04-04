@@ -61,6 +61,7 @@ class OrderExecutor:
         size: float,
         market_id: str,
         side: Side,
+        expiration: int = 0,
     ) -> OrderRecord:
         record = OrderRecord(
             market_id=market_id,
@@ -84,6 +85,7 @@ class OrderExecutor:
                 price=price,
                 size=size,
                 side=BUY,
+                expiration=expiration,
             )
             signed = self.client.create_order(order_args)
             resp = self.client.post_order(signed, orderType=OrderType.GTC)
@@ -234,6 +236,7 @@ class OrderExecutor:
                     size=order["size"],
                     market_id=order["market_id"],
                     side=order["side"],
+                    expiration=order.get("expiration", 0),
                 )
                 results.append(record)
             except ClobApiError as exc:
@@ -252,6 +255,7 @@ class OrderExecutor:
                     price=order["price"],
                     size=order["size"],
                     side=BUY,
+                    expiration=order.get("expiration", 0),
                 )
                 signed = self.client.create_order(order_args)
                 signed_orders.append(

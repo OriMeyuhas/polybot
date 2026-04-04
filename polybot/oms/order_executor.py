@@ -111,11 +111,14 @@ class OrderExecutor:
         size: float,
         market_id: str,
         side: Side,
+        expiration: int = 0,
     ) -> OrderRecord:
         """Place a single limit buy and return an OrderRecord.
 
         Tick size validation is applied to *price* before submission.
         Raw exceptions are wrapped into ClobApiError via _make_clob_error().
+        When *expiration* is a positive Unix timestamp the order auto-cancels
+        at that time (GTD — Good-Til-Date).
         """
         tick = _get_tick_size(self.client, token_id)
         validated_price = round_to_tick(price, tick)
@@ -134,6 +137,7 @@ class OrderExecutor:
             price=validated_price,
             size=size,
             side=BUY,
+            expiration=expiration,
         )
 
         try:
@@ -303,6 +307,20 @@ class OrderExecutor:
             return float(book.asks[0].price)
         return None
 
+    def get_midpoint(self, token_id: str) -> float | None:
+        """Return CLOB midpoint for a token, or None."""
+        try:
+            import httpx
+            resp = httpx.get(
+                f"https://clob.polymarket.com/midpoint?token_id={token_id}",
+                timeout=3.0,
+            )
+            if resp.status_code == 200:
+                return float(resp.json().get("mid", 0))
+        except Exception:
+            pass
+        return None
+
     # ------------------------------------------------------------------
     # Batch operations
     # ------------------------------------------------------------------
@@ -331,6 +349,7 @@ class OrderExecutor:
                         size=order["size"],
                         market_id=order["market_id"],
                         side=order["side"],
+                        expiration=order.get("expiration", 0),
                     )
                     results.append(record)
                 except ClobApiError as exc:
