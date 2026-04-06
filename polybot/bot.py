@@ -12,7 +12,8 @@ import random
 import time
 from collections import deque
 
-from polybot.config import BotConfig, get_trading_rules
+from polybot.config import BotConfig, get_trading_rules, filter_rules_by_config
+from polybot.data.data_recorder import DataRecorder
 from polybot.data.price_feed import MultiAssetPriceFeed
 from polybot.data.rtds_chainlink import RTDSChainlinkPriceFeed
 from polybot.data.book_manager import BookManager
@@ -22,9 +23,11 @@ from polybot.data.gamma import discover_crypto_updown_markets, to_market_window
 from polybot.oms.clob_client import create_clob_client
 from polybot.oms.order_executor import OrderExecutor
 from polybot.oms.heartbeat import Heartbeat
+from polybot.strategy.fair_value import p_fair_up, certainty as fv_certainty
 from polybot.strategy.ladder_manager import LadderManager
 from polybot.strategy.order_tracker import OrderTracker
 from polybot.strategy.position_manager import PositionManager
+from polybot.strategy.vol_estimator import VolEstimator
 from polybot.risk_manager import RiskManager
 from polybot.tick_size_cache import TickSizeCache
 from polybot.redeemer import Redeemer
@@ -47,25 +50,40 @@ class Bot:
         self.running = False
         self.mode = "dry_run" if cfg.dry_run else "live"
 
+        # Vol estimators (one per asset — fed by Binance ticks)
+        self._vol_estimators: dict[str, VolEstimator] = {
+            asset: VolEstimator(
+                min_samples=cfg.vol_min_samples,
+                fallback_vol_annual=cfg.vol_fallback_annual,
+            )
+            for asset in cfg.assets
+        }
+
+        # Data recorder (must be created before components that use it)
+        self.data_recorder = DataRecorder(data_dir="data")
+
         # Data layer
         self.price_feed = MultiAssetPriceFeed(
             assets=cfg.assets,
             coingecko_ids=cfg.coingecko_ids,
             ws_base_url=cfg.binance_ws_url,
             fallback_interval_sec=cfg.binance_fallback_interval_sec,
+            on_tick=self._on_price_tick,
         )
-        self.book_manager = BookManager()
+        self.book_manager = BookManager(data_recorder=self.data_recorder)
         self.market_ws = MarketWSClient(
             url="wss://ws-subscriptions-clob.polymarket.com/ws/market",
             on_message=self.book_manager.process_message,
             ping_interval_sec=cfg.market_ws_ping_sec,
         )
         self.midpoint_poller = ClobMidpointPoller()
-        self.rtds_feed = RTDSChainlinkPriceFeed()
+        self.rtds_feed = RTDSChainlinkPriceFeed(
+            on_tick=lambda asset, price, src: self.data_recorder.log_price(time.time(), asset, price, src)
+        )
 
         # OMS
         self.clob_client = create_clob_client(cfg, book_manager=self.book_manager)
-        self.order_executor = OrderExecutor(cfg, self.clob_client)
+        self.order_executor = OrderExecutor(cfg, self.clob_client, data_recorder=self.data_recorder)
         self.heartbeat = Heartbeat(
             cfg.heartbeat_interval_sec,
             cfg.heartbeat_max_failures,
@@ -128,6 +146,7 @@ class Bot:
         self._connection_loss_at: float = 0.0
         self._cancel_only_reason: str = ""
         self._price_stale_logged: bool = False
+        self._last_strategy_log_ts: dict[str, float] = {}  # market_id -> last log ts
 
     @staticmethod
     def _derive_wallet_address(cfg: BotConfig) -> str | None:
@@ -252,6 +271,12 @@ class Bot:
         if self._tasks:
             await asyncio.wait(self._tasks, timeout=5.0)
         self._tasks.clear()
+
+        # Close data recorder
+        try:
+            self.data_recorder.close()
+        except Exception:
+            pass
 
         self.gui_state.update(running=False)
         logger.info(
@@ -625,9 +650,13 @@ class Bot:
                        if m.market_id not in self._settled_markets]
         market_map = {m.market_id: m for m in active_list}
 
+        fair_values: dict[str, tuple[float, float]] = {}
+
         if not self._cancel_only_mode and not price_stale:
             # Apply bankroll-adaptive position limits
-            rules = get_trading_rules(self.cfg.assets, self.position_manager.bankroll)
+            rules = filter_rules_by_config(
+                get_trading_rules(self.cfg.assets, self.position_manager.bankroll), self.cfg
+            )
             self.risk._max_concurrent_override = rules.max_concurrent
 
             # Overleverage protection (live mode only)
@@ -640,6 +669,11 @@ class Bot:
                     "OVERLEVERAGED: wallet $%.2f < resting orders $%.2f — skipping new ladders",
                     self._wallet_balance, self.ladder_manager.resting_order_cost(),
                 )
+
+            # Compute fair values for all active markets
+            if self.cfg.fair_value_enabled:
+                for market in active_list:
+                    fair_values[market.market_id] = self.compute_fair_value(market)
 
             # Post ladders on new markets (active + pre-open)
             if not overleveraged:
@@ -654,18 +688,20 @@ class Bot:
 
                     count = 0
                     pre_open = False
+                    fv_up, fv_vol = fair_values.get(market.market_id, (0.5, None))
 
                     if market.is_pre_open(now):
-                        # Pre-open: books are live, skip timing/elapsed guards
                         pre_open = True
                         sd = self.compute_spot_delta(market.asset, market.market_id)
                         count = await asyncio.to_thread(
-                            self.ladder_manager.post_ladder_pre_open, market, sd
+                            self.ladder_manager.post_ladder_pre_open, market, sd,
+                            fair_up=fv_up, vol_annualized=fv_vol,
                         )
                     elif market.is_active(now):
                         sd = self.compute_spot_delta(market.asset, market.market_id)
                         count = await asyncio.to_thread(
-                            self.ladder_manager.post_ladder, market, sd
+                            self.ladder_manager.post_ladder, market, sd,
+                            fair_up=fv_up, vol_annualized=fv_vol,
                         )
 
                     if count > 0:
@@ -709,6 +745,11 @@ class Bot:
                 if not market:
                     continue
                 side_label = "UP" if order.side == Side.UP else "DN"
+                self.data_recorder.log_order(
+                    time.time(), "fill", market.market_id,
+                    side_label, order.price, order.size,
+                    order.order_id, "detected",
+                )
                 self._record_activity(
                     "FILL", market.asset,
                     f"{side_label} {order.size:.0f}@${order.price:.2f} on {market.market_id}",
@@ -724,52 +765,60 @@ class Bot:
                     except Exception:
                         pass
 
-        # Imbalance guard
-        await asyncio.to_thread(self.ladder_manager.check_imbalance, now)
+        # Fair value: cancel losing side's resting orders when certainty > 70%
+        for market in active_list:
+            if market.is_active(now) and self.ladder_manager.has_ladder(market.market_id):
+                fv_up, _ = fair_values.get(market.market_id, (0.5, None))
+                cancelled = await asyncio.to_thread(
+                    self.ladder_manager.cancel_losing_side_orders, market, fair_up=fv_up
+                )
+                if cancelled > 0:
+                    losing = "DN" if fv_up > 0.5 else "UP"
+                    self._record_activity(
+                        "FV_CANCEL", market.asset,
+                        f"cancelled {cancelled} {losing} resting orders (certainty {fv_certainty(fv_up)*100:.0f}%) on {market.market_id}",
+                    )
+
+        # Imbalance lock DISABLED — data shows lock + boost + chase INVERTS the imbalance
+        # instead of fixing it. 32/100 settlements affected, -$136 drag. The pair math works
+        # when both sides fill naturally. FV cancel at 60% is the only protection needed.
+        # See: polybot/tasks/lessons.md, researcher imbalance_lock_analysis.md
 
         # Loss cap: cancel remaining orders on one-sided positions exceeding 3% bankroll
         await asyncio.to_thread(self.ladder_manager.check_loss_cap, self.spot_prices, self.window_open_prices)
 
-        # Phase D: Boost light side ladder
+        # Boost DISABLED — floods light side with 16-22 rungs after lock, causing 3:1 inversion
+        # chase_pair DISABLED — same problem, adds 6+ rungs on top of boost
+        # Force-buy DISABLED — data shows 67% net harmful
+
+        # Directional buy: late-window high-certainty purchase of winning side
         for market in active_list:
             if market.is_active(now) and self.ladder_manager.has_ladder(market.market_id):
-                sd = self.compute_spot_delta(market.asset, market.market_id)
-                boosted = await asyncio.to_thread(
-                    self.ladder_manager.boost_light_side, market, now, sd
+                fv_up, _ = fair_values.get(market.market_id, (0.5, None))
+                dir_result = await asyncio.to_thread(
+                    self.ladder_manager.directional_buy, market, now, fair_up=fv_up
                 )
-                if boosted > 0:
+                if dir_result:
                     self._record_activity(
-                        "BOOST", market.asset,
-                        f"reanchored light side with {boosted} new rungs on {market.market_id}",
+                        "DIRECTIONAL", market.asset,
+                        f"buying {dir_result['side'].value} {dir_result['qty']:.0f} @ ${dir_result['price']:.3f} "
+                        f"(EV=${dir_result['ev_per_share']:.3f}) on {market.market_id}",
                     )
 
-        # Phase B: Pair completion — late-window force-buy of unfilled side
+        # Exit: sell losing one-sided positions (certainty-based when FV enabled)
         for market in active_list:
-            if self.ladder_manager.is_killed(market.market_id):
-                continue
             if market.is_active(now) and self.ladder_manager.has_ladder(market.market_id):
-                sd = self.compute_spot_delta(market.asset, market.market_id)
-                result = await asyncio.to_thread(
-                    self.ladder_manager.try_complete_pair, market, now, sd
+                fv_up, _ = fair_values.get(market.market_id, (0.5, None))
+                exit_result = await asyncio.to_thread(
+                    self.ladder_manager.sell_losing_side, market, now, fair_up=fv_up
                 )
-                if result:
+                if exit_result:
                     self._record_activity(
-                        "PAIR_COMPLETE", market.asset,
-                        f"bought {result['side'].value} @${result['price']:.3f} pair_cost=${result['pair_cost']:.3f}",
+                        "EXIT", market.asset,
+                        f"selling {exit_result['side'].value} {exit_result['qty']:.0f} @ ${exit_result['price']:.3f} on {market.market_id}",
                     )
-                    # Log real book state at force-buy time
-                    if self.cfg.dry_run and getattr(self, '_trading_active', False):
-                        try:
-                            token_id = market.up_token_id if result['side'] == Side.UP else market.dn_token_id
-                            market_logger.log_force_buy(
-                                market.market_id, market.asset,
-                                result['side'].value, result['price'],
-                                result['qty'], result['pair_cost'], token_id,
-                            )
-                        except Exception:
-                            pass
 
-        # Cancel rungs on expiring windows
+        # Cancel rungs on expiring windows (hold winning side near expiry if high certainty)
         for market in active_list:
             if (
                 market.is_active(now)
@@ -792,6 +841,9 @@ class Bot:
         # Cleanup expired window snapshots
         self._cleanup_expired_windows(now)
 
+        # Strategy state logging (every 5 seconds per market)
+        self._log_strategy_states(now, active_list, fair_values if not self._cancel_only_mode and not price_stale else {})
+
         # Update GUI
         self.gui_state.update(**self.build_state_snapshot())
 
@@ -805,7 +857,9 @@ class Bot:
             # Build slug patterns from bankroll-adaptive trading rules
             _ASSET_LONG = {"BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana", "XRP": "xrp"}
             _TF_LABELS = {300: "5m", 900: "15m", 3600: "1h"}
-            rules = get_trading_rules(self.cfg.assets, self.position_manager.bankroll)
+            rules = filter_rules_by_config(
+                get_trading_rules(self.cfg.assets, self.position_manager.bankroll), self.cfg
+            )
             tradeable = rules.assets
             if len(tradeable) < len(self.cfg.assets) or len(rules.timeframes) < 3:
                 tf_names = [_TF_LABELS.get(tf, f"{tf}s") for tf in rules.timeframes]
@@ -856,6 +910,12 @@ class Bot:
                 departed = old_ids - new_ids
                 if arrived:
                     logger.info("NEW WINDOWS: %s", ", ".join(arrived))
+                    for mid in arrived:
+                        mw = new_markets[mid]
+                        self.data_recorder.log_market_event(
+                            time.time(), "discovered", mid, mw.asset, mw.timeframe_sec,
+                            {"open_epoch": mw.open_epoch, "close_epoch": mw.close_epoch},
+                        )
                 if departed:
                     logger.info("EXPIRED WINDOWS: %s", ", ".join(departed))
                     # Cache departing markets so orphaned positions can still be settled
@@ -863,6 +923,11 @@ class Bot:
                         old_mkt = self._active_markets.get(mid)
                         if old_mkt and mid not in self._expired_market_cache:
                             self._expired_market_cache[mid] = old_mkt
+                        if old_mkt:
+                            self.data_recorder.log_market_event(
+                                time.time(), "dropped", mid, old_mkt.asset, old_mkt.timeframe_sec,
+                                {"open_epoch": old_mkt.open_epoch, "close_epoch": old_mkt.close_epoch},
+                            )
                 self._active_markets = new_markets
 
             # Collect tokens still needed for pending settlements
@@ -1042,7 +1107,12 @@ class Bot:
                 self._settled_wins += 1
             elif pnl < 0:
                 self._settled_losses += 1
-            if min(pos.up_qty, pos.dn_qty) > 0:
+            # Only report pair_cost when position is reasonably balanced (< 3:1 ratio)
+            min_qty = min(pos.up_qty, pos.dn_qty)
+            max_qty = max(pos.up_qty, pos.dn_qty)
+            is_balanced = min_qty > 0 and (max_qty / min_qty) < 3.0
+            pair_cost_val = round(pos.pair_cost(), 3) if is_balanced else None
+            if is_balanced:
                 self._settled_pair_costs.append(pos.pair_cost())
 
             # Only update bankroll from PnL in paper mode.
@@ -1068,7 +1138,7 @@ class Bot:
                 "revenue": round(pos.up_cost + pos.dn_cost + pnl, 2),
                 "winning": round(winning, 2),
                 "losing": round(losing, 2),
-                "pair_cost": round(pos.pair_cost(), 3) if min(pos.up_qty, pos.dn_qty) > 0 else None,
+                "pair_cost": pair_cost_val,
             }
             self._record_activity("SETTLE", market.asset, detail, pnl=pnl, meta=settle_meta)
 
@@ -1085,7 +1155,7 @@ class Bot:
                 "up_qty": round(pos.up_qty, 1),
                 "dn_qty": round(pos.dn_qty, 1),
                 "total_cost": round(pos.up_cost + pos.dn_cost, 2),
-                "pair_cost": round(pos.pair_cost(), 3) if min(pos.up_qty, pos.dn_qty) > 0 else None,
+                "pair_cost": pair_cost_val,
             })
             self._pnl_series.append({
                 "ts": time.time(),
@@ -1118,6 +1188,20 @@ class Bot:
                 [market.up_token_id, market.dn_token_id],
             )
 
+            # Log market settlement event (inside pos block so pnl is available)
+            try:
+                self.data_recorder.log_market_event(
+                    time.time(), "settled", mid, market.asset, market.timeframe_sec,
+                    {
+                        "open_epoch": market.open_epoch,
+                        "close_epoch": market.close_epoch,
+                        "outcome": normalized,
+                        "pnl": round(pnl, 4),
+                    },
+                )
+            except Exception:
+                pass
+
         self.position_manager.complete_settlement(mid)
         self.position_manager.remove_position(mid)
         self._expired_market_cache.pop(mid, None)
@@ -1149,16 +1233,22 @@ class Bot:
             logger.debug("Settlement log write failed: %s", e)
 
     def _dry_run_resolve(self, market: MarketWindow) -> str:
-        """In dry-run mode, resolve using the last known spot delta.
+        """In dry-run mode, resolve using CLOB midpoint (matches Polymarket's Chainlink oracle).
 
-        Always returns an outcome — paper mode should never block on stale prices.
+        Primary: if UP midpoint > 0.5, outcome is UP (market agrees).
+        Fallback: Binance spot delta if midpoints unavailable.
         """
-        age = self.price_feed.get_price_age(market.asset)
-        if age is not None and age > self.cfg.price_stale_sec:
-            logger.info(
-                "DRY_RUN_RESOLVE: %s price age=%.1fs (stale) — using last known delta for %s",
-                market.asset, age, market.market_id,
-            )
+        # Primary: use CLOB midpoint — this converges to Chainlink resolution
+        up_mid = self.midpoint_poller.get_mid(market.up_token_id)
+        if up_mid is not None:
+            up_mid_f = float(up_mid)
+            if up_mid_f > 0.5:
+                return "UP"
+            elif up_mid_f < 0.5:
+                return "DOWN"
+            # exactly 0.5 — fall through to spot delta
+
+        # Fallback: Binance spot delta
         delta = self.compute_spot_delta(market.asset, market.market_id)
         if delta > 0:
             return "UP"
@@ -1299,12 +1389,113 @@ class Bot:
         """Compute unrealized PnL across all open positions. Returns 0.0 for now."""
         return 0.0
 
+    def _log_strategy_states(self, now: int, active_list: list, fair_values: dict):
+        """Log strategy state for each active market, throttled to every 5 seconds."""
+        try:
+            now_f = float(now)
+            for market in active_list:
+                mid = market.market_id
+                last = self._last_strategy_log_ts.get(mid, 0)
+                if now_f - last < 5.0:
+                    continue
+                self._last_strategy_log_ts[mid] = now_f
+
+                pos = self.position_manager.positions.get(mid)
+                fv_up, fv_vol = fair_values.get(mid, (0.5, None))
+
+                # Count resting orders per side
+                resting_up = len(self.order_tracker.get_resting_side(mid, Side.UP))
+                resting_dn = len(self.order_tracker.get_resting_side(mid, Side.DN))
+
+                elapsed_pct = 0.0
+                if market.timeframe_sec > 0:
+                    elapsed_pct = market.elapsed(now) / market.timeframe_sec
+
+                data = {
+                    "p_up": round(fv_up, 4),
+                    "certainty": round(fv_certainty(fv_up), 4),
+                    "vol": round(fv_vol, 4) if fv_vol is not None else None,
+                    "phase": self._get_strategy_phase(market),
+                    "up_qty": round(pos.up_qty, 2) if pos else 0,
+                    "dn_qty": round(pos.dn_qty, 2) if pos else 0,
+                    "up_cost": round(pos.up_cost, 2) if pos else 0,
+                    "dn_cost": round(pos.dn_cost, 2) if pos else 0,
+                    "resting_up": resting_up,
+                    "resting_dn": resting_dn,
+                    "spot_price": self.spot_prices.get(market.asset, 0.0),
+                    "spot_delta": self.compute_spot_delta(market.asset, mid),
+                    "elapsed_pct": round(elapsed_pct, 3),
+                    "bankroll": round(self.position_manager.bankroll, 2),
+                }
+                self.data_recorder.log_strategy_state(now_f, mid, market.asset, data)
+        except Exception:
+            pass  # never crash the bot on logging
+
     def compute_spot_delta(self, asset: str, market_id: str) -> float:
         current = self.spot_prices.get(asset, 0.0)
         open_price = self.window_open_prices.get(market_id, 0.0)
         if open_price <= 0:
             return 0.0
         return (current - open_price) / open_price
+
+    def _on_price_tick(self, asset: str, price) -> None:
+        """Feed price ticks to vol estimator and data recorder."""
+        now = time.time()
+        ve = self._vol_estimators.get(asset)
+        if ve:
+            ve.push(now, price)
+        self.data_recorder.log_price(now, asset, float(price), "binance")
+
+    def compute_fair_value(self, market) -> tuple[float, float]:
+        """Return (p_up, vol_annualized) for the given market window.
+
+        PTB fallback chain: market.price_to_beat → window_open_prices.
+        Returns (0.5, fallback_vol) when data is insufficient.
+        """
+        fallback_vol = self.cfg.vol_fallback_annual
+
+        # Get Price to Beat
+        ptb = None
+        if hasattr(market, 'price_to_beat') and market.price_to_beat:
+            try:
+                ptb = float(market.price_to_beat)
+                if ptb <= 0:
+                    ptb = None
+            except (ValueError, TypeError):
+                ptb = None
+        if ptb is None:
+            ptb = self.window_open_prices.get(market.market_id)
+        if ptb is None or ptb <= 0:
+            return (0.5, fallback_vol)
+
+        # Get current price
+        current = self.spot_prices.get(market.asset, 0.0)
+        if current <= 0:
+            return (0.5, fallback_vol)
+
+        # Get vol
+        ve = self._vol_estimators.get(market.asset)
+        vol = ve.vol_annualized(self.cfg.vol_window_sec) if ve else fallback_vol
+
+        # Get seconds left
+        now = int(time.time())
+        secs_left = market.remaining(now)
+
+        p_up = p_fair_up(ptb, current, secs_left, vol)
+        return (p_up, vol)
+
+    def _get_strategy_phase(self, market) -> str:
+        """Return 'bilateral', 'skewed', or 'directional' based on elapsed fraction."""
+        now = int(time.time())
+        if market.timeframe_sec <= 0:
+            return "bilateral"
+        elapsed_frac = market.elapsed(now) / market.timeframe_sec
+        if elapsed_frac < self.cfg.skew_phase_pct:
+            return "bilateral"
+        elif elapsed_frac < self.cfg.directional_phase_pct:
+            return "skewed"
+        else:
+            return "directional"
 
     def _snapshot_window_open_prices(self):
         """Capture open prices for each new market window.
@@ -1666,6 +1857,15 @@ class Bot:
                     or self.window_open_prices.get(mkt.market_id, 0)
                 ),
             }
+
+            # Fair value data
+            if self.cfg.fair_value_enabled:
+                fv_up, fv_vol = self.compute_fair_value(mkt)
+                info["fair_value_up"] = round(fv_up, 4)
+                info["fair_value_vol"] = round(fv_vol, 4) if fv_vol else None
+                info["fair_value_certainty"] = round(fv_certainty(fv_up), 4)
+                info["strategy_phase"] = self._get_strategy_phase(mkt)
+
             active_markets_info.append(info)
 
         # Sort by asset name, then timeframe, then status (active before pre_open/upcoming)

@@ -1,4 +1,5 @@
 """Multi-market order book manager — tracks books for multiple token IDs."""
+import logging
 import time
 
 from polybot.data.book import (
@@ -9,15 +10,30 @@ from polybot.data.book import (
     apply_tick_size_change,
 )
 
+logger = logging.getLogger(__name__)
+
 
 class BookManager:
     """Manages OrderBook instances keyed by token/asset ID."""
 
-    def __init__(self) -> None:
+    def __init__(self, data_recorder=None) -> None:
         self._books: dict[str, OrderBook] = {}
+        self._data_recorder = data_recorder
 
     def get_book(self, token_id: str) -> OrderBook | None:
         return self._books.get(token_id)
+
+    def set_active_tokens(self, token_ids: list[str]) -> None:
+        """Replace the active token set: add new books, remove stale ones."""
+        new_set = set(token_ids)
+        # Add new
+        for tid in token_ids:
+            if tid not in self._books:
+                self._books[tid] = OrderBook(asset_id=tid, market="")
+        # Remove stale
+        stale = set(self._books.keys()) - new_set
+        for tid in stale:
+            del self._books[tid]
 
     def update_assets(self, token_ids: list[str]) -> None:
         """Add books for new token IDs; preserve existing ones."""
@@ -51,6 +67,14 @@ class BookManager:
         else:
             ts = time.time()
 
+        # Log book updates to data recorder
+        if self._data_recorder and event_type in ("book", "price_change", "last_trade_price"):
+            try:
+                aid = str(msg.get("asset_id", ""))
+                self._data_recorder.log_book_update(ts, aid, event_type, msg)
+            except Exception:
+                pass
+
         if event_type == "book":
             aid = str(msg.get("asset_id", ""))
             if aid in self._books:
@@ -76,3 +100,39 @@ class BookManager:
             aid = str(msg.get("asset_id", ""))
             if aid in self._books:
                 apply_last_trade(self._books[aid], msg)
+            # Also log as a separate trade event
+            if self._data_recorder:
+                try:
+                    side = (msg.get("side") or "").upper()
+                    price = float(msg.get("price", 0))
+                    size = float(msg.get("size", 0))
+                    self._data_recorder.log_trade(ts, aid, side, price, size)
+                except Exception:
+                    pass
+
+    async def seed_book_http(self, token_id: str, clob_host: str) -> bool:
+        """Fetch initial book snapshot via HTTP for a token that has no data yet."""
+        book = self._books.get(token_id)
+        if book is not None and book.asks:
+            return True  # already have data
+        try:
+            import httpx
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(
+                    f"{clob_host}/book",
+                    params={"token_id": token_id},
+                    timeout=5,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if token_id not in self._books:
+                        self._books[token_id] = OrderBook(asset_id=token_id, market="")
+                    apply_book_snapshot(self._books[token_id], data, time.time())
+                    logger.info("HTTP book seed: %s — %d asks, %d bids",
+                                token_id[:16],
+                                len(self._books[token_id].asks),
+                                len(self._books[token_id].bids))
+                    return True
+        except Exception as e:
+            logger.debug("HTTP book seed failed for %s: %s", token_id[:16], e)
+        return False

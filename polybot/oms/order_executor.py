@@ -38,6 +38,8 @@ except ImportError:
 
     BUY = "BUY"
 
+SELL = "SELL"
+
 from polybot.config import BotConfig
 from polybot.errors import ClobApiError
 from polybot.tick_size_cache import round_to_tick
@@ -96,9 +98,10 @@ class OrderExecutor:
         its own client.
     """
 
-    def __init__(self, cfg: BotConfig, clob_client: Any) -> None:
+    def __init__(self, cfg: BotConfig, clob_client: Any, data_recorder=None) -> None:
         self.cfg = cfg
         self.client = clob_client
+        self._data_recorder = data_recorder
 
     # ------------------------------------------------------------------
     # Single-order operations
@@ -166,6 +169,77 @@ class OrderExecutor:
             market_id,
             record.status,
         )
+        if self._data_recorder:
+            self._data_recorder.log_order(
+                time.time(), "post", market_id, side.value,
+                validated_price, size, record.order_id, "ladder",
+            )
+        return record
+
+    def place_limit_sell(
+        self,
+        token_id: str,
+        price: float,
+        size: float,
+        market_id: str,
+        side: Side,
+        expiration: int = 0,
+    ) -> OrderRecord:
+        """Place a single limit sell and return an OrderRecord.
+
+        Used for exiting losing one-sided positions mid-window.
+        Tick size validation is applied to *price* before submission.
+        """
+        tick = _get_tick_size(self.client, token_id)
+        validated_price = round_to_tick(price, tick)
+
+        record = OrderRecord(
+            market_id=market_id,
+            side=side,
+            price=validated_price,
+            size=size,
+            timestamp=time.time(),
+        )
+
+        order_args = OrderArgs(
+            token_id=token_id,
+            price=validated_price,
+            size=size,
+            side=SELL,
+            expiration=expiration,
+        )
+
+        try:
+            signed = self.client.create_order(order_args)
+            resp = self.client.post_order(signed, orderType="GTC")
+        except ClobApiError:
+            raise
+        except Exception as e:
+            raise _make_clob_error(e) from e
+
+        if not resp.get("success", True):
+            raise ClobApiError(
+                f"Sell order rejected: {resp.get('errorMsg', resp)}",
+                status_code=None,
+            )
+
+        record.order_id = resp.get("orderID", "")
+        record.status = resp.get("status", "unknown")
+
+        logger.info(
+            "SELL ORDER PLACED: %s %s %.2f x %.1f on %s -> %s",
+            side.value,
+            token_id[:16],
+            validated_price,
+            size,
+            market_id,
+            record.status,
+        )
+        if self._data_recorder:
+            self._data_recorder.log_order(
+                time.time(), "post", market_id, side.value,
+                validated_price, size, record.order_id, "sell",
+            )
         return record
 
     def get_open_orders(self) -> list[dict]:
@@ -216,6 +290,10 @@ class OrderExecutor:
         except Exception as e:
             raise _make_clob_error(e) from e
         logger.debug("ORDER CANCELLED: %s", order_id)
+        if self._data_recorder:
+            self._data_recorder.log_order(
+                time.time(), "cancel", "", "", 0, 0, order_id, "cancel",
+            )
         return True
 
     def cancel_all(self) -> bool:
