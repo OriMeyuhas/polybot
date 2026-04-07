@@ -73,32 +73,32 @@ class BotConfig:
     # Assets
     assets: tuple = ("BTC", "ETH", "SOL", "XRP")
 
-    # Ladder parameters — 15m (whale-calibrated: 109K trades, 897 markets, 830 settlements)
-    ladder_rungs: int = 31
+    # Ladder parameters — 15m (balanced: wide enough for margin, tight enough for fills)
+    ladder_rungs: int = 15
     ladder_spacing: float = 0.01
-    ladder_width: float = 0.41
-    ladder_size_skew: float = 1.0
-    max_pair_cost: float = 0.93   # combined UP+DN VWAP ceiling (whale data: >0.92 loses money)
+    ladder_width: float = 0.15
+    ladder_size_skew: float = 2.0   # 2x weight on expensive rungs (fill first on both sides)
+    max_pair_cost: float = 0.93     # need >7c margin per pair to absorb excess shares
     position_size_fraction: float = 0.05
 
     # Ladder parameters — 5m overrides
-    ladder_rungs_5m: int = 22
+    ladder_rungs_5m: int = 8
     ladder_spacing_5m: float = 0.01
-    ladder_width_5m: float = 0.29
-    ladder_size_skew_5m: float = 1.0
+    ladder_width_5m: float = 0.08
+    ladder_size_skew_5m: float = 2.0
     max_pair_cost_5m: float = 0.93
     position_size_fraction_5m: float = 0.021
 
-    # Ladder parameters — 1h overrides
-    ladder_rungs_1h: int = 22
+    # Ladder parameters — 1h overrides (wider for margin, more time to fill)
+    ladder_rungs_1h: int = 20
     ladder_spacing_1h: float = 0.01
-    ladder_width_1h: float = 0.42
-    ladder_size_skew_1h: float = 1.0
-    max_pair_cost_1h: float = 0.93
+    ladder_width_1h: float = 0.20
+    ladder_size_skew_1h: float = 2.0
+    max_pair_cost_1h: float = 0.96
     position_size_fraction_1h: float = 0.03
 
     # Shared ladder / risk parameters
-    reprice_threshold: float = 0.05
+    reprice_threshold: float = 0.05  # reprice when book moves 5c (less churn = better queue position)
     max_imbalance_ratio: float = 0.60
     imbalance_timeout_sec: int = 120
     # Heartbeat
@@ -125,7 +125,7 @@ class BotConfig:
     no_trade_final_sec: int = 60
 
     # Polling
-    poll_interval_ms: int = 500
+    poll_interval_ms: int = 200  # 200ms tick — competitive minimum for adverse selection defense
     market_discovery_interval_sec: int = 15
     balance_poll_sec: float = 60.0
 
@@ -142,8 +142,8 @@ class BotConfig:
 
     # Mock client tuning
     mock_base_fill_rate: float = 0.03
-    # Polymarket maker fee rate (crypto up/down markets: 1.56%)
-    maker_fee_rate: float = 0.0156
+    # Polymarket maker fee rate — makers pay 0% (only takers pay fees)
+    maker_fee_rate: float = 0.0
     web_port: int = 8080
     start_paused: bool = False
 
@@ -162,8 +162,37 @@ class BotConfig:
     # Pair recovery parameters
     boost_elapsed_pct: float = 0.20       # Phase D: min fraction of window elapsed before boost
     force_buy_elapsed_pct: float = 0.70   # Phase B: min fraction of window elapsed before force-buy
-    force_buy_max_pair_cost: float = 0.88 # Phase B: pair cost ceiling for forced buy
-    imbalance_min_heavy_fills: int = 3    # Min fully filled orders on heavy side before imbalance fires
+    force_buy_max_pair_cost: float = 0.83 # Phase B: pair cost ceiling for forced buy
+    imbalance_min_heavy_fills: int = 1    # Min fully filled orders on heavy side before imbalance fires
+
+    # Fair value model — binary option pricing for intelligent budget skewing and exits
+    fair_value_enabled: bool = True
+    vol_window_sec: int = 300            # rolling window for vol estimation (seconds)
+    vol_fallback_annual: float = 0.50    # fallback annual vol when not enough data
+    vol_min_samples: int = 30            # min 1-sec bars before trusting vol estimate
+    skew_phase_pct: float = 0.30         # start skewing budget at 30% elapsed
+    directional_phase_pct: float = 0.70  # enter directional mode at 70% elapsed
+    certainty_exit_threshold: float = 0.30    # sell losing side when certainty < 30% (conservative)
+    certainty_hold_threshold: float = 0.95    # hold to settlement when certainty >= 95%
+    certainty_directional_threshold: float = 0.92  # buy winning side when >= 92% (near-certain only)
+    directional_max_ask: float = 0.75    # max price for directional buy (need real discount)
+    max_budget_skew: float = 0.80        # max fraction of budget on one side
+
+    # Exit capability — sell losing one-sided positions mid-window (whale exits 12.8% of trades)
+    exit_enabled: bool = True
+    exit_elapsed_pct: float = 0.55       # min elapsed fraction before considering exit
+    exit_min_loss_ratio: float = 3.0     # heavy/light ratio to qualify as "losing"
+    exit_target_price: float = 0.35      # target sell price (whale avg exit = $0.35)
+    exit_min_price: float = 0.15         # won't sell below this (too much slippage)
+
+    # Reactive pairing — chase pair completion when one side fills
+    reactive_pairing_enabled: bool = True
+    reactive_chase_width: float = 0.10   # width of chase ladder (tight, near midpoint)
+    reactive_chase_budget_pct: float = 0.50  # fraction of remaining budget for chase
+
+    # Inventory-aware quoting — bias unfilled side closer to midpoint
+    inventory_skew_enabled: bool = True
+    inventory_skew_max: float = 0.60     # max fraction of budget for light side (vs 0.50 default)
 
     # Spot-awareness parameters
     spot_delta_reduce_threshold: float = 0.0015  # 0.15% — reduce losing side budget
@@ -200,14 +229,14 @@ class BotConfig:
                 max_pair_cost=self.max_pair_cost,
                 position_size_fraction=base_fraction,
             )
-        # 1h+ — whale data: 1h is most profitable per market ($31.71 avg), give 1.5x budget
+        # 1h+ — our data confirms: 1h has best balance rate and biggest profits, give 2x budget
         return LadderParams(
             rungs=min(auto_rungs, self.ladder_rungs_1h),
             spacing=self.ladder_spacing_1h,
             width=self.ladder_width_1h,
             size_skew=self.ladder_size_skew_1h,
             max_pair_cost=self.max_pair_cost_1h,
-            position_size_fraction=base_fraction * 1.5,
+            position_size_fraction=base_fraction * 2.0,
         )
 
 
@@ -235,6 +264,18 @@ def validate_live_config(cfg: BotConfig) -> list[str]:
         errors.append(f"boost_elapsed_pct={cfg.boost_elapsed_pct} must be < force_buy_elapsed_pct={cfg.force_buy_elapsed_pct}")
     if cfg.force_buy_elapsed_pct >= 0.95:
         errors.append(f"force_buy_elapsed_pct={cfg.force_buy_elapsed_pct} must be < 0.95")
+    # Fair value validation
+    if cfg.skew_phase_pct >= cfg.directional_phase_pct:
+        errors.append(
+            f"skew_phase_pct={cfg.skew_phase_pct} must be < directional_phase_pct={cfg.directional_phase_pct}"
+        )
+    if cfg.certainty_exit_threshold >= cfg.certainty_hold_threshold:
+        errors.append(
+            f"certainty_exit_threshold={cfg.certainty_exit_threshold} must be < "
+            f"certainty_hold_threshold={cfg.certainty_hold_threshold}"
+        )
+    if not (0.5 <= cfg.max_budget_skew <= 0.95):
+        errors.append(f"max_budget_skew={cfg.max_budget_skew} must be in [0.50, 0.95]")
     # Spot-awareness validation
     if cfg.spot_delta_reduce_threshold <= 0:
         errors.append(f"spot_delta_reduce_threshold={cfg.spot_delta_reduce_threshold} must be > 0")
@@ -298,6 +339,26 @@ def get_trading_rules(enabled_assets: tuple[str, ...], bankroll: float) -> Tradi
     )
 
 
+def filter_rules_by_config(rules: TradingRules, cfg: "BotConfig") -> TradingRules:
+    """Filter trading rules timeframes by the trade_5m/trade_15m/trade_1h config flags."""
+    allowed = set()
+    if cfg.trade_5m:
+        allowed.add(300)
+    if cfg.trade_15m:
+        allowed.add(900)
+    if cfg.trade_1h:
+        allowed.add(3600)
+    filtered = tuple(t for t in rules.timeframes if t in allowed)
+    if not filtered:
+        filtered = (900,)  # fallback to 15m if everything disabled
+    return TradingRules(
+        assets=rules.assets,
+        timeframes=filtered,
+        max_concurrent=rules.max_concurrent,
+        position_fraction=rules.position_fraction,
+    )
+
+
 def effective_assets(enabled_assets: tuple[str, ...], bankroll: float) -> tuple[str, ...]:
     """Convenience wrapper — returns just the asset list from trading rules."""
     return get_trading_rules(enabled_assets, bankroll).assets
@@ -324,23 +385,23 @@ def load_bot_config() -> BotConfig:
         api_secret=os.getenv("API_SECRET", ""),
         api_passphrase=os.getenv("API_PASSPHRASE", ""),
         binance_ws_url=os.getenv("BINANCE_WS_URL", "wss://stream.binance.com:9443/ws"),
-        ladder_rungs=int(os.getenv("LADDER_RUNGS", "31")),
+        ladder_rungs=int(os.getenv("LADDER_RUNGS", "15")),
         ladder_spacing=float(os.getenv("LADDER_SPACING", "0.01")),
-        ladder_width=float(os.getenv("LADDER_WIDTH", "0.41")),
-        ladder_size_skew=float(os.getenv("LADDER_SIZE_SKEW", "1.0")),
-        max_pair_cost=float(os.getenv("MAX_PAIR_COST", "0.90")),
+        ladder_width=float(os.getenv("LADDER_WIDTH", "0.15")),
+        ladder_size_skew=float(os.getenv("LADDER_SIZE_SKEW", "2.0")),
+        max_pair_cost=float(os.getenv("MAX_PAIR_COST", "0.93")),
         position_size_fraction=float(os.getenv("POSITION_SIZE_FRACTION", "0.05")),
         ladder_rungs_5m=int(os.getenv("LADDER_RUNGS_5M", "23")),
         ladder_spacing_5m=float(os.getenv("LADDER_SPACING_5M", "0.01")),
         ladder_width_5m=float(os.getenv("LADDER_WIDTH_5M", "0.29")),
-        ladder_size_skew_5m=float(os.getenv("LADDER_SIZE_SKEW_5M", "1.0")),
-        max_pair_cost_5m=float(os.getenv("MAX_PAIR_COST_5M", "0.90")),
+        ladder_size_skew_5m=float(os.getenv("LADDER_SIZE_SKEW_5M", "2.0")),
+        max_pair_cost_5m=float(os.getenv("MAX_PAIR_COST_5M", "0.93")),
         position_size_fraction_5m=float(os.getenv("POSITION_SIZE_FRACTION_5M", "0.021")),
-        ladder_rungs_1h=int(os.getenv("LADDER_RUNGS_1H", "22")),
+        ladder_rungs_1h=int(os.getenv("LADDER_RUNGS_1H", "20")),
         ladder_spacing_1h=float(os.getenv("LADDER_SPACING_1H", "0.01")),
-        ladder_width_1h=float(os.getenv("LADDER_WIDTH_1H", "0.42")),
-        ladder_size_skew_1h=float(os.getenv("LADDER_SIZE_SKEW_1H", "1.0")),
-        max_pair_cost_1h=float(os.getenv("MAX_PAIR_COST_1H", "0.90")),
+        ladder_width_1h=float(os.getenv("LADDER_WIDTH_1H", "0.20")),
+        ladder_size_skew_1h=float(os.getenv("LADDER_SIZE_SKEW_1H", "2.0")),
+        max_pair_cost_1h=float(os.getenv("MAX_PAIR_COST_1H", "0.96")),
         position_size_fraction_1h=float(os.getenv("POSITION_SIZE_FRACTION_1H", "0.03")),
         reprice_threshold=float(os.getenv("REPRICE_THRESHOLD", "0.05")),
         max_imbalance_ratio=float(os.getenv("MAX_IMBALANCE_RATIO", "0.60")),
@@ -355,12 +416,12 @@ def load_bot_config() -> BotConfig:
         max_concurrent_positions=int(os.getenv("MAX_CONCURRENT_POSITIONS", "8")),
         max_daily_drawdown_pct=float(os.getenv("MAX_DAILY_DRAWDOWN_PCT", "0.05")),
         no_trade_final_sec=int(os.getenv("NO_TRADE_FINAL_SEC", "60")),
-        poll_interval_ms=int(os.getenv("BOT_POLL_INTERVAL_MS", "500")),
+        poll_interval_ms=int(os.getenv("BOT_POLL_INTERVAL_MS", "200")),
         balance_poll_sec=float(os.getenv("BALANCE_POLL_SEC", "60.0")),
         log_level=os.getenv("LOG_LEVEL", "ERROR"),
         dry_run=os.getenv("DRY_RUN", "true").lower() in ("true", "1", "yes"),
         mock_base_fill_rate=float(os.getenv("MOCK_BASE_FILL_RATE", "0.03")),
-        maker_fee_rate=float(os.getenv("MAKER_FEE_RATE", "0.0156")),
+        maker_fee_rate=float(os.getenv("MAKER_FEE_RATE", "0.0")),
         web_port=int(os.getenv("WEB_PORT", "8080")),
         start_paused=os.getenv("START_PAUSED", "false").lower() in ("true", "1", "yes"),
         binance_fallback_interval_sec=float(os.getenv("BINANCE_FALLBACK_INTERVAL_SEC", "2.0")),
@@ -373,8 +434,29 @@ def load_bot_config() -> BotConfig:
         trade_1h=os.getenv("TRADE_1H", "true").lower() in ("true", "1", "yes"),
         boost_elapsed_pct=float(os.getenv("BOOST_ELAPSED_PCT", "0.20")),
         force_buy_elapsed_pct=float(os.getenv("FORCE_BUY_ELAPSED_PCT", "0.70")),
-        force_buy_max_pair_cost=float(os.getenv("FORCE_BUY_MAX_PAIR_COST", "0.88")),
-        imbalance_min_heavy_fills=int(os.getenv("IMBALANCE_MIN_HEAVY_FILLS", "3")),
+        force_buy_max_pair_cost=float(os.getenv("FORCE_BUY_MAX_PAIR_COST", "0.83")),
+        imbalance_min_heavy_fills=int(os.getenv("IMBALANCE_MIN_HEAVY_FILLS", "1")),
+        fair_value_enabled=os.getenv("FAIR_VALUE_ENABLED", "true").lower() in ("true", "1", "yes"),
+        vol_window_sec=int(os.getenv("VOL_WINDOW_SEC", "300")),
+        vol_fallback_annual=float(os.getenv("VOL_FALLBACK_ANNUAL", "0.50")),
+        vol_min_samples=int(os.getenv("VOL_MIN_SAMPLES", "30")),
+        skew_phase_pct=float(os.getenv("SKEW_PHASE_PCT", "0.30")),
+        directional_phase_pct=float(os.getenv("DIRECTIONAL_PHASE_PCT", "0.70")),
+        certainty_exit_threshold=float(os.getenv("CERTAINTY_EXIT_THRESHOLD", "0.30")),
+        certainty_hold_threshold=float(os.getenv("CERTAINTY_HOLD_THRESHOLD", "0.95")),
+        certainty_directional_threshold=float(os.getenv("CERTAINTY_DIRECTIONAL_THRESHOLD", "0.92")),
+        directional_max_ask=float(os.getenv("DIRECTIONAL_MAX_ASK", "0.75")),
+        max_budget_skew=float(os.getenv("MAX_BUDGET_SKEW", "0.80")),
+        exit_enabled=os.getenv("EXIT_ENABLED", "true").lower() in ("true", "1", "yes"),
+        exit_elapsed_pct=float(os.getenv("EXIT_ELAPSED_PCT", "0.55")),
+        exit_min_loss_ratio=float(os.getenv("EXIT_MIN_LOSS_RATIO", "3.0")),
+        exit_target_price=float(os.getenv("EXIT_TARGET_PRICE", "0.35")),
+        exit_min_price=float(os.getenv("EXIT_MIN_PRICE", "0.15")),
+        reactive_pairing_enabled=os.getenv("REACTIVE_PAIRING_ENABLED", "true").lower() in ("true", "1", "yes"),
+        reactive_chase_width=float(os.getenv("REACTIVE_CHASE_WIDTH", "0.10")),
+        reactive_chase_budget_pct=float(os.getenv("REACTIVE_CHASE_BUDGET_PCT", "0.50")),
+        inventory_skew_enabled=os.getenv("INVENTORY_SKEW_ENABLED", "true").lower() in ("true", "1", "yes"),
+        inventory_skew_max=float(os.getenv("INVENTORY_SKEW_MAX", "0.60")),
         spot_delta_reduce_threshold=float(os.getenv("SPOT_DELTA_REDUCE_THRESHOLD", "0.0015")),
         spot_delta_skip_threshold=float(os.getenv("SPOT_DELTA_SKIP_THRESHOLD", "0.005")),
         spot_gate_force_buy_threshold=float(os.getenv("SPOT_GATE_FORCE_BUY_THRESHOLD", "0.003")),

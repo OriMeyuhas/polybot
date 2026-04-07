@@ -13,13 +13,14 @@ from polybot.order_executor import OrderExecutor
 from polybot.order_tracker import OrderTracker, TrackedOrder
 from polybot.position_manager import PositionManager
 from polybot.risk_manager import RiskManager
+from polybot.strategy.fair_value import certainty as fv_certainty
 from polybot.tick_size_cache import round_to_tick
 from polybot.types import MarketWindow, Side
 
 logger = logging.getLogger(__name__)
 
 
-MIN_REPRICE_INTERVAL = 5.0  # seconds between reprices for the same market
+MIN_REPRICE_INTERVAL = 10.0  # seconds between reprices — stay in queue for fills
 
 
 @dataclass
@@ -41,6 +42,9 @@ class LadderState:
     timeframe_sec: int = 900
     force_buy_done: bool = False  # True after a force-buy has been placed
     boosted_at: float = 0.0  # timestamp when boost fired — loss cap grace period
+    exit_done: bool = False  # True after exit sell placed
+    chase_done: bool = False  # True after reactive chase pair placed
+    directional_done: bool = False  # True after directional buy placed
 
 
 MIN_ORDER_SIZE = 5.0  # Polymarket minimum for GTC orders
@@ -96,7 +100,6 @@ def build_ladder_rungs(
 
     # Offset anchor by 1 tick so top rung is passive (best_ask - tick_size), not marketable
     anchor = max(tick_size, best_ask - width - tick_size)
-    # Spread rungs evenly across the width with the effective count
     effective_spacing = spacing if effective_rungs == rungs else width / max(effective_rungs, 1)
     prices = [round_to_tick(anchor + i * effective_spacing, tick_size) for i in range(effective_rungs)]
     # Clamp prices to valid range using tick_size as floor/ceiling
@@ -161,9 +164,9 @@ class LadderManager:
         """Return True if this market's ladder was killed by check_loss_cap."""
         return market_id in self._killed_ladders
 
-    def post_ladder_pre_open(self, market: MarketWindow, spot_delta: float = 0.0) -> int:
+    def post_ladder_pre_open(self, market: MarketWindow, spot_delta: float = 0.0, fair_up: float = 0.5, vol_annualized: float | None = None) -> int:
         """Post ladder for pre-open markets. Delegates to post_ladder."""
-        return self.post_ladder(market, spot_delta=spot_delta)
+        return self.post_ladder(market, spot_delta=spot_delta, fair_up=fair_up, vol_annualized=vol_annualized)
 
     def try_complete_pair(self, market: MarketWindow, now: float = 0, spot_delta: float = 0.0) -> dict | None:
         """Phase B: Force-buy the light side to complete a one-sided position.
@@ -328,6 +331,394 @@ class LadderManager:
             "qty": deficit,
             "pair_cost": hypothetical_pair_cost,
         }
+
+    def sell_losing_side(self, market: MarketWindow, now: float, fair_up: float = 0.5) -> dict | None:
+        """Exit a losing one-sided position by selling shares mid-window.
+
+        Whale data shows 12.8% of trades are exits at avg $0.35, 55% elapsed.
+        Instead of holding to settlement (lose 100% on losers), we sell at a loss
+        that's smaller than the expected settlement loss.
+
+        Returns dict with {side, price, qty, recovered} or None.
+        """
+        if not self.cfg.exit_enabled:
+            return None
+
+        mid = market.market_id
+        if mid in self._killed_ladders:
+            return None
+
+        state = self.ladders.get(mid)
+        if state is None:
+            return None
+
+        # Already exited
+        if getattr(state, 'exit_done', False):
+            return None
+
+        # Check position first (needed for certainty-based exit check)
+        pos = self.positions.positions.get(mid)
+        if pos is None:
+            return None
+
+        up_qty = pos.up_qty
+        dn_qty = pos.dn_qty
+
+        if up_qty <= 0 and dn_qty <= 0:
+            return None
+
+        # Need significant imbalance to qualify as "losing"
+        max_qty = max(up_qty, dn_qty)
+        min_qty = min(up_qty, dn_qty)
+        if min_qty > 0 and max_qty / min_qty < self.cfg.exit_min_loss_ratio:
+            return None  # position is reasonably balanced
+        if min_qty > 0:
+            return None  # has some fills on both sides, not a clear loser
+
+        if market.timeframe_sec <= 0:
+            return None
+
+        # Exit trigger: certainty-based (when fair value enabled) or elapsed-based (fallback)
+        elapsed_frac = (now - market.open_epoch) / market.timeframe_sec
+        if self.cfg.fair_value_enabled and fair_up != 0.5:
+            # Compute certainty for the side we hold
+            held_is_up = up_qty > dn_qty
+            held_certainty = fair_up if held_is_up else (1.0 - fair_up)
+            if held_certainty >= self.cfg.certainty_exit_threshold:
+                return None  # model still thinks our side can win
+            # Model says we're losing — exit regardless of elapsed
+            logger.info("FV EXIT: %s — held %s certainty=%.1f%% < %.0f%% threshold",
+                        mid, "UP" if held_is_up else "DN",
+                        held_certainty * 100, self.cfg.certainty_exit_threshold * 100)
+        else:
+            # Fallback: elapsed-based trigger
+            if elapsed_frac < self.cfg.exit_elapsed_pct:
+                return None
+
+        # Determine the losing side (one-sided = the side we hold)
+        if up_qty > dn_qty:
+            sell_side = Side.UP
+            sell_token = market.up_token_id
+            sell_qty = up_qty
+        else:
+            sell_side = Side.DOWN
+            sell_token = market.dn_token_id
+            sell_qty = dn_qty
+
+        # Get current midpoint to set sell price
+        sell_midpoint = self.executor.get_midpoint(sell_token)
+        if sell_midpoint is None:
+            return None
+
+        # Don't sell if midpoint is too low (would recover almost nothing)
+        if sell_midpoint < self.cfg.exit_min_price:
+            return None
+
+        # Sell at midpoint (passive limit sell — sit at the bid)
+        sell_price = max(self.cfg.exit_min_price, sell_midpoint - 0.01)
+
+        # Cancel remaining resting orders first
+        cancelled = self.tracker.cancel_side(mid, sell_side)
+        self.executor.cancel_batch(cancelled)
+        # Also cancel other side since we're exiting
+        other_side = Side.DOWN if sell_side == Side.UP else Side.UP
+        cancelled_other = self.tracker.cancel_side(mid, other_side)
+        self.executor.cancel_batch(cancelled_other)
+
+        # Place sell order with GTD expiration
+        expiration = int(market.close_epoch - self.cfg.no_trade_final_sec)
+        try:
+            record = self.executor.place_limit_sell(
+                sell_token, sell_price, sell_qty, mid, sell_side,
+                expiration=expiration,
+            )
+        except ClobApiError:
+            return None
+
+        # Track the sell order
+        if record.order_id:
+            self.tracker.add(TrackedOrder(
+                order_id=record.order_id,
+                market_id=mid,
+                token_id=sell_token,
+                side=sell_side,
+                price=sell_price,
+                size=sell_qty,
+                placed_at=now,
+            ))
+
+        state.exit_done = True
+        recovered = sell_price * sell_qty
+        logger.info(
+            "EXIT SELL: %s — selling %s %.0f @ $%.3f (midpoint=$%.3f), recovering ~$%.2f",
+            mid, sell_side.value, sell_qty, sell_price, sell_midpoint, recovered,
+        )
+
+        return {
+            "side": sell_side,
+            "price": sell_price,
+            "qty": sell_qty,
+            "recovered": recovered,
+        }
+
+    def chase_pair(self, market: MarketWindow, now: float, fair_up: float = 0.5) -> int:
+        """Reactive pairing: when one side fills, immediately post tight orders on the other side.
+
+        Instead of waiting for the normal ladder to fill both sides, we actively
+        chase pair completion by posting orders near midpoint on the unfilled side.
+
+        Returns number of chase orders placed.
+        """
+        if not self.cfg.reactive_pairing_enabled:
+            return 0
+
+        mid = market.market_id
+        if mid in self._killed_ladders:
+            return 0
+
+        state = self.ladders.get(mid)
+        if state is None:
+            return 0
+
+        # Already boosted or chased — don't double up
+        if getattr(state, 'chase_done', False):
+            return 0
+
+        # Need at least one fill on one side and zero on the other
+        up_count = self.tracker.filled_count(mid, Side.UP)
+        dn_count = self.tracker.filled_count(mid, Side.DOWN)
+
+        if up_count == 0 and dn_count == 0:
+            return 0  # no fills yet
+        if up_count > 0 and dn_count > 0:
+            return 0  # already have fills on both sides
+
+        # Wait a bit after first fill to see if the other side fills naturally
+        # (at least 10% of window or 30 seconds, whichever is less)
+        first_fill_wait = min(market.timeframe_sec * 0.10, 30.0)
+        if up_count > 0:
+            first_fill_time = self._first_fill_time(mid, Side.UP)
+        else:
+            first_fill_time = self._first_fill_time(mid, Side.DOWN)
+        if first_fill_time and now - first_fill_time < first_fill_wait:
+            return 0
+
+        # Determine chase side (the unfilled side)
+        if up_count > 0 and dn_count == 0:
+            chase_side = Side.DOWN
+            chase_token = market.dn_token_id
+        else:
+            chase_side = Side.UP
+            chase_token = market.up_token_id
+
+        # Fair value guard: only chase the winning side to complete a profitable pair
+        if self.cfg.fair_value_enabled and fair_up != 0.5:
+            cert = fv_certainty(fair_up)
+            if cert > 0.60:
+                winning_side = Side.UP if fair_up > 0.5 else Side.DOWN
+                if chase_side != winning_side:
+                    logger.info("FV CHASE SKIP: %s — chase side %s is the LOSING side (P(UP)=%.1f%%)",
+                                mid, chase_side.value, fair_up * 100)
+                    return 0
+
+        # Get current best ask for the chase side
+        try:
+            best_ask = self.executor.get_best_ask(chase_token)
+        except ClobApiError:
+            return 0
+        if best_ask is None or best_ask <= 0:
+            return 0
+
+        # Use midpoint if best_ask looks like market creation artifact
+        if best_ask >= 0.90:
+            mid_price = self.executor.get_midpoint(chase_token)
+            if mid_price and 0.01 < mid_price < 0.99:
+                best_ask = mid_price + 0.01
+
+        # Budget: fraction of remaining budget for this side
+        lp = self.cfg.get_ladder_params(market.timeframe_sec, current_bankroll=self.positions.bankroll)
+        total_budget = min(
+            lp.position_size_fraction * self.positions.bankroll,
+            self.positions.bankroll - self.total_committed(),
+        )
+        chase_filled_cost = self.tracker.filled_cost(mid, chase_side)
+        side_budget = max(0, total_budget / 2.0 - chase_filled_cost)
+        side_budget *= self.cfg.reactive_chase_budget_pct
+        if side_budget < MIN_ORDER_SIZE * 0.5:
+            return 0
+
+        tick_size = self.tick_cache.get_tick_size(market.condition_id, token_id=market.up_token_id) if self.tick_cache else 0.01
+
+        # Build tight chase ladder near midpoint
+        chase_rungs = build_ladder_rungs(
+            best_ask, side_budget,
+            max(5, lp.rungs // 3),  # fewer rungs, tighter
+            lp.spacing,
+            self.cfg.reactive_chase_width,
+            lp.size_skew,
+            tick_size=tick_size,
+            fee_rate=self.fee_rate,
+        )
+
+        # Pair cost guard on chase rungs
+        filled_side = Side.UP if up_count > 0 else Side.DOWN
+        filled_qty = self.tracker.filled_qty(mid, filled_side)
+        filled_cost = self.tracker.filled_cost(mid, filled_side)
+        if filled_qty > 0:
+            filled_vwap = filled_cost / filled_qty
+            chase_rungs = [
+                (p, s) for p, s in chase_rungs
+                if p + filled_vwap <= lp.max_pair_cost
+            ]
+
+        if not chase_rungs:
+            return 0
+
+        # Place chase orders with GTD expiration
+        expiration = int(market.close_epoch - self.cfg.no_trade_final_sec)
+        order_dicts = [
+            {"token_id": chase_token, "price": price, "size": size,
+             "market_id": mid, "side": chase_side,
+             "expiration": expiration}
+            for price, size in chase_rungs
+        ]
+        count = 0
+        place_time = time.time()
+        for record in self.executor.place_batch_limit_buys(order_dicts):
+            if record.status != "error":
+                self.tracker.add(TrackedOrder(
+                    order_id=record.order_id,
+                    market_id=mid,
+                    token_id=chase_token,
+                    side=chase_side,
+                    price=record.price,
+                    size=record.size,
+                    placed_at=place_time,
+                ))
+                count += 1
+
+        state.chase_done = True
+        logger.info(
+            "CHASE PAIR: %s — posted %d tight rungs on %s side (width=%.2f, budget=$%.2f)",
+            mid, count, chase_side.value, self.cfg.reactive_chase_width, side_budget,
+        )
+        return count
+
+    def directional_buy(self, market: MarketWindow, now: float, fair_up: float = 0.5) -> dict | None:
+        """Late-window directional buy of the near-certain winning side.
+
+        When certainty is high (>85%) late in the window, buy the winning side
+        at a discount — it will settle at $1.00. This is the polytrader-style edge
+        applied within our market-making framework.
+
+        Returns dict with {side, price, qty, ev_per_share} or None.
+        """
+        if not self.cfg.fair_value_enabled:
+            return None
+
+        mid = market.market_id
+        if mid in self._killed_ladders:
+            return None
+
+        state = self.ladders.get(mid)
+        if state is None:
+            return None
+
+        # Already did a directional buy
+        if getattr(state, 'directional_done', False):
+            return None
+
+        # Elapsed check: must be in directional phase
+        if market.timeframe_sec <= 0:
+            return None
+        elapsed_frac = (now - market.open_epoch) / market.timeframe_sec
+        if elapsed_frac < self.cfg.directional_phase_pct:
+            return None
+
+        # Certainty check
+        cert = fv_certainty(fair_up)
+        if cert < self.cfg.certainty_directional_threshold:
+            return None
+
+        # Determine winning side
+        if fair_up > 0.5:
+            buy_side = Side.UP
+            buy_token = market.up_token_id
+            p_fair = fair_up
+        else:
+            buy_side = Side.DOWN
+            buy_token = market.dn_token_id
+            p_fair = 1.0 - fair_up
+
+        # Get best ask for winning side
+        try:
+            best_ask = self.executor.get_best_ask(buy_token)
+        except ClobApiError:
+            return None
+        if best_ask is None or best_ask <= 0:
+            return None
+
+        # Price guard: don't overpay
+        if best_ask > self.cfg.directional_max_ask:
+            return None
+
+        # EV check: p_fair - ask must exceed fee buffer (2c)
+        fee_buffer = 0.02
+        ev_per_share = p_fair - best_ask - fee_buffer
+        if ev_per_share <= 0:
+            return None
+
+        # Budget: use remaining available capital
+        lp = self.cfg.get_ladder_params(market.timeframe_sec, current_bankroll=self.positions.bankroll)
+        available = self.positions.bankroll - self.total_committed()
+        budget = min(lp.position_size_fraction * self.positions.bankroll * 0.5, available)
+        if budget < MIN_ORDER_SIZE * best_ask:
+            return None
+
+        qty = budget / best_ask
+        if qty < MIN_ORDER_SIZE:
+            return None
+
+        # Place order with GTD expiration
+        expiration = int(market.close_epoch - self.cfg.no_trade_final_sec)
+        try:
+            record = self.executor.place_limit_buy(
+                buy_token, best_ask, qty, mid, buy_side,
+                expiration=expiration,
+            )
+        except ClobApiError:
+            return None
+
+        if record.order_id:
+            self.tracker.add(TrackedOrder(
+                order_id=record.order_id,
+                market_id=mid,
+                token_id=buy_token,
+                side=buy_side,
+                price=best_ask,
+                size=qty,
+                placed_at=now,
+            ))
+
+        state.directional_done = True
+        logger.info(
+            "DIRECTIONAL BUY: %s — %s %.0f @ $%.3f (P=%.1f%%, EV=$%.3f)",
+            mid, buy_side.value, qty, best_ask, p_fair * 100, ev_per_share,
+        )
+
+        return {
+            "side": buy_side,
+            "price": best_ask,
+            "qty": qty,
+            "ev_per_share": ev_per_share,
+        }
+
+    def _first_fill_time(self, market_id: str, side: Side) -> float | None:
+        """Return timestamp of the first fill on this side, or None."""
+        for order in self.tracker.orders.values():
+            if order.market_id == market_id and order.side == side and order.status == "filled":
+                return order.placed_at
+        return None
 
     def resting_order_cost(self) -> float:
         """Fee-inclusive cost of resting (unfilled) orders across all ladders.
@@ -505,13 +896,25 @@ class LadderManager:
         )
         return count
 
-    def post_ladder(self, market: MarketWindow, spot_delta: float = 0.0) -> int:
+    def post_ladder(self, market: MarketWindow, spot_delta: float = 0.0, fair_up: float = 0.5, vol_annualized: float | None = None) -> int:
         """Post a full ladder (both sides) for a market. Returns number of orders placed."""
         try:
             if self.risk.is_halted():
                 return 0
             if market.market_id in self._killed_ladders:
                 return 0
+            # Late-window guard: if <20% of window remaining, only enter if FV
+            # is confident enough to pick the winning side. Blind two-sided
+            # ladders this late won't pair — guaranteed one-sided loss.
+            _now = int(time.time())
+            if market.timeframe_sec > 0 and market.close_epoch > _now:
+                remaining_frac = market.remaining(_now) / market.timeframe_sec
+                if remaining_frac < 0.20:
+                    cert = fv_certainty(fair_up) if self.cfg.fair_value_enabled else 0.0
+                    if cert < 0.60:
+                        logger.info("SKIP LADDER: %s — %.0f%% remaining, certainty only %.0f%% (need 60%%), too risky",
+                                    market.market_id, remaining_frac * 100, cert * 100)
+                        return 0
             # Don't re-create a ladder for a market that already has fills
             # (e.g. after boost cancelled the ladder state but positions remain)
             try:
@@ -568,43 +971,69 @@ class LadderManager:
                     best_ask_dn = mid_dn + tick_size
 
 
-            # Budget split: spot-aware skew based on BTC delta
-            reduce_thresh = self.cfg.spot_delta_reduce_threshold
-            skip_thresh = self.cfg.spot_delta_skip_threshold
-            abs_delta = abs(spot_delta)
+            # Vol-aware width: scale ladder width by realized vol
+            effective_width = lp.width
+            if self.cfg.fair_value_enabled and vol_annualized is not None and vol_annualized > 0:
+                vol_ratio = vol_annualized / self.cfg.vol_fallback_annual
+                width_factor = max(0.6, min(1.5, vol_ratio))
+                effective_width = lp.width * width_factor
 
-            if abs_delta >= skip_thresh:
-                if spot_delta > 0:  # BTC up -> DN losing
+            # FV gate: if certainty > 80% at posting time, skip the losing side entirely.
+            # Threshold raised from 0.60 to 0.80 — 60% gate fired too often (76-84% loss
+            # rate on 452 zero-fill one-sided windows). Only block posting when very confident.
+            # FV cancel (0.60) still cleans up AFTER posting. Late-window guard (0.60) unchanged.
+            cert = fv_certainty(fair_up) if self.cfg.fair_value_enabled else 0.0
+            if cert >= 0.80:
+                if fair_up > 0.5:
+                    # UP is winning — don't post DN
                     budget_up = budget
                     budget_dn = 0.0
+                    logger.info("FV GATE: %s certainty %.0f%% UP — skipping DN side",
+                                market.market_id, cert * 100)
                 else:
+                    # DN is winning — don't post UP
                     budget_up = 0.0
                     budget_dn = budget
-                logger.info("SPOT SKIP: %s delta=%.3f%% — skipping %s side",
-                            market.market_id, spot_delta * 100, "DN" if spot_delta > 0 else "UP")
-            elif abs_delta >= reduce_thresh:
-                losing_frac = 0.5 * (1.0 - (abs_delta - reduce_thresh) / (skip_thresh - reduce_thresh))
-                winning_frac = 1.0 - losing_frac
-                if spot_delta > 0:
-                    budget_up = budget * winning_frac
-                    budget_dn = budget * losing_frac
-                else:
-                    budget_up = budget * losing_frac
-                    budget_dn = budget * winning_frac
-                logger.info("SPOT SKEW: %s delta=%.3f%% — UP=$%.0f DN=$%.0f",
-                            market.market_id, spot_delta * 100, budget_up, budget_dn)
+                    logger.info("FV GATE: %s certainty %.0f%% DN — skipping UP side",
+                                market.market_id, cert * 100)
             else:
-                budget_up = budget / 2.0
-                budget_dn = budget / 2.0
+                # Spot-delta based skew (mild, defensive only)
+                reduce_thresh = self.cfg.spot_delta_reduce_threshold
+                skip_thresh = self.cfg.spot_delta_skip_threshold
+                abs_delta = abs(spot_delta)
+
+                if abs_delta >= skip_thresh:
+                    if spot_delta > 0:
+                        budget_up = budget
+                        budget_dn = 0.0
+                    else:
+                        budget_up = 0.0
+                        budget_dn = budget
+                    logger.info("SPOT SKIP: %s delta=%.3f%% — skipping %s side",
+                                market.market_id, spot_delta * 100, "DN" if spot_delta > 0 else "UP")
+                elif abs_delta >= reduce_thresh:
+                    losing_frac = 0.5 * (1.0 - (abs_delta - reduce_thresh) / (skip_thresh - reduce_thresh))
+                    winning_frac = 1.0 - losing_frac
+                    if spot_delta > 0:
+                        budget_up = budget * winning_frac
+                        budget_dn = budget * losing_frac
+                    else:
+                        budget_up = budget * losing_frac
+                        budget_dn = budget * winning_frac
+                    logger.info("SPOT SKEW: %s delta=%.3f%% — UP=$%.0f DN=$%.0f",
+                                market.market_id, spot_delta * 100, budget_up, budget_dn)
+                else:
+                    budget_up = budget / 2.0
+                    budget_dn = budget / 2.0
 
             up_rungs = build_ladder_rungs(
                 best_ask_up, budget_up,
-                lp.rungs, lp.spacing, lp.width, lp.size_skew,
+                lp.rungs, lp.spacing, effective_width, lp.size_skew,
                 tick_size=tick_size,
             )
             dn_rungs = build_ladder_rungs(
                 best_ask_dn, budget_dn,
-                lp.rungs, lp.spacing, lp.width, lp.size_skew,
+                lp.rungs, lp.spacing, effective_width, lp.size_skew,
                 tick_size=tick_size,
             )
 
@@ -760,11 +1189,14 @@ class LadderManager:
         if result["orphaned"]:
             self.executor.cancel_batch(result["orphaned"])
 
+        # One-side cap check removed: _check_one_side_cap fired destructively in Cycles 9/10
+
         return result["filled"]
 
     def process_paper_fills(self, paper_fills: list[dict]) -> list[TrackedOrder]:
         """Process pre-simulated fills from PaperClobClient.tick().
-        Used in paper mode instead of check_fills to avoid reconcile misdetection."""
+        Used in paper mode instead of check_fills to avoid reconcile misdetection.
+        Handles both BUY fills (add to position) and SELL fills (reduce position)."""
         if not paper_fills:
             return []
 
@@ -777,16 +1209,34 @@ class LadderManager:
             if order.status == "filled":
                 continue
             fill_qty = order.size
-            self.positions.update_position(
-                order.market_id, order.side, fill_qty, self._fill_cost(order.price, fill_qty),
-            )
+            fill_side_raw = fill.get("side", "BUY").upper()
+
+            if fill_side_raw == "SELL":
+                # SELL fill: reduce position and recover capital
+                proceeds = order.price * fill_qty
+                self.positions.reduce_position(
+                    order.market_id, order.side, fill_qty, proceeds,
+                )
+                # Credit recovered capital to bankroll
+                self.positions.bankroll += proceeds
+                logger.info("SELL FILL: %s %s %.1f @ $%.2f on %s (recovered $%.2f)",
+                             order.side.value, order.token_id[:16],
+                             fill_qty, order.price, order.market_id, proceeds)
+            else:
+                # BUY fill: add to position
+                self.positions.update_position(
+                    order.market_id, order.side, fill_qty, self._fill_cost(order.price, fill_qty),
+                )
+                logger.info("FILL: %s %s %.1f @ $%.2f on %s",
+                             order.side.value, order.token_id[:16],
+                             fill_qty, order.price, order.market_id)
+
             order.status = "filled"
             order.filled = fill_qty
             order.credited_to_pm = fill_qty
-            logger.info("FILL: %s %s %.1f @ $%.2f on %s",
-                         order.side.value, order.token_id[:16],
-                         fill_qty, order.price, order.market_id)
             filled.append(order)
+
+        # One-side cap check removed: _check_one_side_cap fired destructively in Cycles 9/10
 
         return filled
 
@@ -830,8 +1280,8 @@ class LadderManager:
             # Budget for reprice: only the REMAINING unfilled portion
             total_budget = self.positions.bankroll * lp.position_size_fraction
             available = self.positions.bankroll - self.total_committed()
-            budget_per_side = min(total_budget / 2.0, max(0, available / 2.0))
-            if budget_per_side < 1.0:
+            half_budget = min(total_budget / 2.0, max(0, available / 2.0))
+            if half_budget < 1.0:
                 continue
 
             try:
@@ -842,6 +1292,31 @@ class LadderManager:
                 dn_filled_cost = self.tracker.filled_cost(mid, Side.DOWN)
                 up_filled_vwap = up_filled_cost / up_filled_qty if up_filled_qty > 0 else 0
                 dn_filled_vwap = dn_filled_cost / dn_filled_qty if dn_filled_qty > 0 else 0
+
+                # Auto-lock heavy side: if fills are imbalanced (>3:1 or only one
+                # side filled), treat the heavy side as locked so reprice won't
+                # keep feeding it.  This fires BEFORE the one-side-cap grace
+                # period, closing the gap that allowed 48 DN fills with 0 UP.
+                if state.heavy_side_locked is None:
+                    _max_f = max(up_filled_qty, dn_filled_qty)
+                    _min_f = min(up_filled_qty, dn_filled_qty)
+                    if _max_f >= MIN_ORDER_SIZE and (_min_f == 0 or _max_f / _min_f > 3.0):
+                        heavy = "UP" if up_filled_qty > dn_filled_qty else "DOWN"
+                        state.heavy_side_locked = heavy
+                        logger.info("REPRICE AUTO-LOCK %s: %s (fills %.0f:%.0f)", mid, heavy, up_filled_qty, dn_filled_qty)
+
+                # Inventory-aware: skew budget toward the lighter side
+                if self.cfg.inventory_skew_enabled and up_filled_qty != dn_filled_qty:
+                    skew_max = self.cfg.inventory_skew_max
+                    if up_filled_qty > dn_filled_qty:
+                        budget_up_side = half_budget * (1.0 - skew_max) / 0.5
+                        budget_dn_side = half_budget * skew_max / 0.5
+                    else:
+                        budget_up_side = half_budget * skew_max / 0.5
+                        budget_dn_side = half_budget * (1.0 - skew_max) / 0.5
+                else:
+                    budget_up_side = half_budget
+                    budget_dn_side = half_budget
 
                 if up_moved:
                     if state.heavy_side_locked == "UP":
@@ -860,7 +1335,7 @@ class LadderManager:
                         self.executor.cancel_batch(cancelled)
 
                         # Only budget for unfilled portion of this side
-                        side_budget = max(0, budget_per_side - up_filled_cost)
+                        side_budget = max(0, budget_up_side - up_filled_cost)
                         if side_budget >= 1.0:
                             up_rungs = build_ladder_rungs(
                                 best_ask_up, side_budget,
@@ -902,7 +1377,7 @@ class LadderManager:
                         cancelled = self.tracker.cancel_side(mid, Side.DOWN)
                         self.executor.cancel_batch(cancelled)
 
-                        side_budget = max(0, budget_per_side - dn_filled_cost)
+                        side_budget = max(0, budget_dn_side - dn_filled_cost)
                         if side_budget >= 1.0:
                             dn_rungs = build_ladder_rungs(
                                 best_ask_dn, side_budget,
@@ -937,6 +1412,58 @@ class LadderManager:
                 continue
 
         return repriced
+
+    def cancel_losing_side_orders(self, market: MarketWindow, fair_up: float = 0.5) -> int:
+        """Cancel resting orders on the side that fair value says is losing.
+
+        When certainty > 70%, the market has moved enough that one side is
+        likely to lose. Cancel that side's resting orders to prevent further
+        adverse fills. This is PREVENTIVE (stop new fills) not reactive (sell held).
+
+        Returns number of cancelled orders.
+        """
+        if not self.cfg.fair_value_enabled:
+            return 0
+        if fair_up == 0.5:
+            return 0
+
+        mid = market.market_id
+        state = self.ladders.get(mid)
+        if state is None:
+            return 0
+        if mid in self._killed_ladders:
+            return 0
+
+        cert = fv_certainty(fair_up)
+        if cert < 0.60:
+            return 0  # not certain enough to act
+
+        # Determine losing side
+        if fair_up > 0.5:
+            losing_side = Side.DOWN  # UP is winning, DN is losing
+        else:
+            losing_side = Side.UP
+
+        # Guard: if we already locked the OTHER side, don't flip — that would
+        # cancel both sides and guarantee one-sided exposure regardless of outcome.
+        if state.heavy_side_locked is not None and state.heavy_side_locked != losing_side.value:
+            return 0
+
+        # Cancel losing side resting orders
+        cancelled = self.tracker.cancel_side(mid, losing_side)
+        if not cancelled:
+            return 0
+
+        self.executor.cancel_batch(cancelled)
+
+        # Lock the losing side so reprice doesn't repost
+        state.heavy_side_locked = losing_side.value
+
+        logger.info(
+            "FV CANCEL LOSING: %s — certainty %.0f%%, cancelled %d %s resting orders",
+            mid, cert * 100, len(cancelled), losing_side.value,
+        )
+        return len(cancelled)
 
     def check_imbalance(self, now_epoch: int) -> list[str]:
         """Check fill imbalance on all ladders. Returns list of market_ids where action was taken."""
@@ -1160,9 +1687,10 @@ class LadderManager:
             self.cleanup_ladder(mid)
 
     def _check_one_side_cap(self, market_id: str) -> None:
-        """Cancel heavy side resting orders when fill ratio > 3:1 AND heavy qty > 5.
+        """Cancel heavy side resting orders when fills become imbalanced.
 
-        Called after fill detection and explicitly to prevent runaway one-sided exposure.
+        Triggers at 2:1 ratio to prevent runaway one-sided exposure.
+        Called after fill detection on every tick.
         """
         state = self.ladders.get(market_id)
         if state is None:
@@ -1177,8 +1705,16 @@ class LadderManager:
         max_qty = max(up_qty, dn_qty)
         min_qty = min(up_qty, dn_qty)
 
-        # Need heavy side > 5 contracts AND ratio > 3:1
-        if max_qty <= 5:
+        # Grace period: don't cap within first 5% of window — give BOTH sides
+        # time to get their first fill before judging imbalance.
+        # 15m = 45s grace, 1h = 180s grace
+        grace_sec = state.timeframe_sec * 0.05
+        now = time.time()
+        if now - state.posted_at < grace_sec:
+            return
+
+        # Trigger: ratio > 3:1 after grace period
+        if max_qty < MIN_ORDER_SIZE:
             return
         if min_qty > 0 and max_qty / min_qty <= 3.0:
             return
