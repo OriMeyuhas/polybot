@@ -45,6 +45,7 @@ class LadderState:
     exit_done: bool = False  # True after exit sell placed
     chase_done: bool = False  # True after reactive chase pair placed
     directional_done: bool = False  # True after directional buy placed
+    throttle_heavy_side: Side | None = None  # Set when imbalance > 0.30 but both sides have fills
 
 
 MIN_ORDER_SIZE = 5.0  # Polymarket minimum for GTC orders
@@ -1026,6 +1027,25 @@ class LadderManager:
                     budget_up = budget / 2.0
                     budget_dn = budget / 2.0
 
+            # Paired imbalance throttle: halve the heavy-side budget when throttle is active.
+            # throttle_heavy_side is set by check_imbalance() when imbalance > 30% with fills
+            # on both sides. This slows accumulation on the runaway side without killing it.
+            existing_state = self.ladders.get(market.market_id)
+            if existing_state is not None and existing_state.throttle_heavy_side is not None:
+                throttle_side = existing_state.throttle_heavy_side
+                if throttle_side == Side.UP:
+                    budget_up = budget_up * 0.5
+                    logger.info(
+                        "THROTTLE APPLIED: %s — UP budget halved to $%.1f (heavy=UP)",
+                        market.market_id, budget_up,
+                    )
+                elif throttle_side == Side.DOWN:
+                    budget_dn = budget_dn * 0.5
+                    logger.info(
+                        "THROTTLE APPLIED: %s — DN budget halved to $%.1f (heavy=DN)",
+                        market.market_id, budget_dn,
+                    )
+
             up_rungs = build_ladder_rungs(
                 best_ask_up, budget_up,
                 lp.rungs, lp.spacing, effective_width, lp.size_skew,
@@ -1530,6 +1550,29 @@ class LadderManager:
             else:
                 # Clear any previous alert
                 state.imbalance_alert_at = None
+
+            # Paired imbalance throttle: both sides have fills but ratio is skewed.
+            # Unlike the lock (which fires only when light_count == 0), this guard fires
+            # when light_count > 0 but imbalance is still > 30%.
+            # Example: 172 UP vs 77 DN — imbalance = 0.55 — the old guard missed this.
+            # When active, post_ladder halves the heavy-side budget so accumulation slows.
+            if light_count > 0:
+                heavy_side = Side.UP if up_qty > dn_qty else Side.DOWN
+                if imbalance > 0.30:
+                    if state.throttle_heavy_side != heavy_side:
+                        state.throttle_heavy_side = heavy_side
+                        logger.info(
+                            "THROTTLE SET: %s — heavy=%s imbalance=%.0f%% (UP=%.0f DN=%.0f), "
+                            "halving heavy-side budget on next post",
+                            mid, heavy_side.value, imbalance * 100, up_qty, dn_qty,
+                        )
+                elif imbalance < 0.25 and state.throttle_heavy_side is not None:
+                    # Hysteresis: clear throttle only when imbalance drops well below 0.30
+                    logger.info(
+                        "THROTTLE CLEARED: %s — imbalance=%.0f%% recovered (UP=%.0f DN=%.0f)",
+                        mid, imbalance * 100, up_qty, dn_qty,
+                    )
+                    state.throttle_heavy_side = None
 
             # Early one-sided kill: if 100% one-sided and >25% of window elapsed, kill immediately
             # Data shows 95.5% of one-sided fills are adverse selection — cut losses fast
