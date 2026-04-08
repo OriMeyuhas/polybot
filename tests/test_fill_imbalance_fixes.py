@@ -93,8 +93,9 @@ class TestRepricePreservesImbalanceState:
 # ---------- Task 3: reprice respects heavy_side_locked ----------
 
 class TestRepriceRespectsHeavySideLock:
-    def test_reprice_skips_locked_up_side(self):
-        """When heavy_side_locked='UP', reprice must not post new UP orders."""
+    def test_reprice_posts_up_even_when_locked_up(self):
+        """After AUTO-LOCK removal, reprice must post UP orders even when
+        heavy_side_locked='UP'. The pair cost guard (not the lock) limits rungs."""
         cfg = _cfg(reprice_threshold=0.01)
         lm = _make_manager(cfg)
         market = _market()
@@ -108,7 +109,6 @@ class TestRepriceRespectsHeavySideLock:
         state.heavy_side_locked = "UP"
         lm.ladders[market.market_id] = state
 
-        # Track what sides get orders placed
         placed_sides = []
         original_place = lm.executor.place_batch_limit_buys
 
@@ -121,13 +121,12 @@ class TestRepriceRespectsHeavySideLock:
 
         lm.reprice_if_needed({market.market_id: market})
 
-        # Should not have placed any UP orders
-        assert Side.UP not in placed_sides
-        # Anchor should still update so we don't re-trigger
-        assert lm.ladders[market.market_id].anchor_up == 0.46  # mock best_ask
+        # Must post UP orders despite heavy_side_locked="UP"
+        assert Side.UP in placed_sides
 
-    def test_reprice_skips_locked_dn_side(self):
-        """When heavy_side_locked='DOWN', reprice must not post new DN orders."""
+    def test_reprice_posts_dn_even_when_locked_dn(self):
+        """After AUTO-LOCK removal, reprice must post DN orders even when
+        heavy_side_locked='DOWN'."""
         cfg = _cfg(reprice_threshold=0.01)
         lm = _make_manager(cfg)
         market = _market()
@@ -153,11 +152,13 @@ class TestRepriceRespectsHeavySideLock:
 
         lm.reprice_if_needed({market.market_id: market})
 
-        assert Side.DOWN not in placed_sides
-        assert lm.ladders[market.market_id].anchor_dn == 0.46
+        # Must post DN orders despite heavy_side_locked="DOWN"
+        assert Side.DOWN in placed_sides
 
-    def test_reprice_allows_unlocked_side(self):
-        """When heavy_side_locked is None, both sides reprice normally."""
+    def test_reprice_does_not_set_heavy_side_locked(self):
+        """After AUTO-LOCK removal, reprice_if_needed must NEVER set
+        heavy_side_locked — that is now exclusively the job of
+        check_imbalance(), cancel_losing_side_orders(), and _check_one_side_cap()."""
         cfg = _cfg(reprice_threshold=0.01)
         lm = _make_manager(cfg)
         market = _market()
@@ -170,20 +171,20 @@ class TestRepriceRespectsHeavySideLock:
         )
         lm.ladders[market.market_id] = state
 
-        placed_sides = []
-        original_place = lm.executor.place_batch_limit_buys
-
-        def tracking_place(orders):
-            for o in orders:
-                placed_sides.append(o["side"])
-            return original_place(orders)
-
-        lm.executor.place_batch_limit_buys = tracking_place
+        # Simulate heavy UP fills (>= MIN_ORDER_SIZE, 0 DN) — the old trigger condition
+        from polybot.order_tracker import TrackedOrder
+        for i in range(6):
+            lm.tracker.add(TrackedOrder(
+                order_id=f"up_{i}", market_id=market.market_id,
+                token_id="tok_up", side=Side.UP,
+                price=0.45, size=1.0, placed_at=1000.0,
+            ))
+            lm.tracker.update_fill(f"up_{i}", 1.0)
 
         lm.reprice_if_needed({market.market_id: market})
 
-        assert Side.UP in placed_sides
-        assert Side.DOWN in placed_sides
+        # heavy_side_locked must still be None — reprice no longer sets it
+        assert lm.ladders[market.market_id].heavy_side_locked is None
 
 
 class TestImbalanceSetsLock:

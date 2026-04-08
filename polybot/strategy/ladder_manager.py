@@ -1313,18 +1313,6 @@ class LadderManager:
                 up_filled_vwap = up_filled_cost / up_filled_qty if up_filled_qty > 0 else 0
                 dn_filled_vwap = dn_filled_cost / dn_filled_qty if dn_filled_qty > 0 else 0
 
-                # Auto-lock heavy side: if fills are imbalanced (>3:1 or only one
-                # side filled), treat the heavy side as locked so reprice won't
-                # keep feeding it.  This fires BEFORE the one-side-cap grace
-                # period, closing the gap that allowed 48 DN fills with 0 UP.
-                if state.heavy_side_locked is None:
-                    _max_f = max(up_filled_qty, dn_filled_qty)
-                    _min_f = min(up_filled_qty, dn_filled_qty)
-                    if _max_f >= MIN_ORDER_SIZE and (_min_f == 0 or _max_f / _min_f > 3.0):
-                        heavy = "UP" if up_filled_qty > dn_filled_qty else "DOWN"
-                        state.heavy_side_locked = heavy
-                        logger.info("REPRICE AUTO-LOCK %s: %s (fills %.0f:%.0f)", mid, heavy, up_filled_qty, dn_filled_qty)
-
                 # Inventory-aware: skew budget toward the lighter side
                 if self.cfg.inventory_skew_enabled and up_filled_qty != dn_filled_qty:
                     skew_max = self.cfg.inventory_skew_max
@@ -1339,90 +1327,80 @@ class LadderManager:
                     budget_dn_side = half_budget
 
                 if up_moved:
-                    if state.heavy_side_locked == "UP":
-                        # UP is the locked heavy side — update anchor but don't repost
-                        state.anchor_up = best_ask_up
-                        logger.info("REPRICE SKIP UP: %s locked heavy side", mid)
-                    else:
-                        # Flush uncredited partial fills before cancelling the side
-                        for order, delta in self.tracker.flush_uncredited(mid):
-                            if order.side == Side.UP:
-                                self.positions.update_position(
-                                    order.market_id, order.side, delta, self._fill_cost(order.price, delta),
-                                )
-                        # Cancel unfilled UP rungs and repost
-                        cancelled = self.tracker.cancel_side(mid, Side.UP)
-                        self.executor.cancel_batch(cancelled)
-
-                        # Only budget for unfilled portion of this side
-                        side_budget = max(0, budget_up_side - up_filled_cost)
-                        if side_budget >= 1.0:
-                            up_rungs = build_ladder_rungs(
-                                best_ask_up, side_budget,
-                                lp.rungs, lp.spacing, lp.width, lp.size_skew,
-                                tick_size=tick_size,
+                    # Flush uncredited partial fills before cancelling the side
+                    for order, delta in self.tracker.flush_uncredited(mid):
+                        if order.side == Side.UP:
+                            self.positions.update_position(
+                                order.market_id, order.side, delta, self._fill_cost(order.price, delta),
                             )
-                            # Pair cost guard: trim rungs whose price + other side VWAP > max_pair_cost
-                            if dn_filled_vwap > 0 and up_rungs:
-                                up_rungs = [(p, s) for p, s in up_rungs if p + dn_filled_vwap <= lp.max_pair_cost]
-                            reprice_expiration = int(market.close_epoch - self.cfg.no_trade_final_sec)
-                            up_order_dicts = [
-                                {"token_id": market.up_token_id, "price": price, "size": size,
-                                 "market_id": mid, "side": Side.UP,
-                                 "expiration": reprice_expiration}
-                                for price, size in up_rungs
-                            ]
-                            for record in self.executor.place_batch_limit_buys(up_order_dicts):
-                                if record.status != "error":
-                                    self.tracker.add(TrackedOrder(
-                                        order_id=record.order_id,
-                                        market_id=mid, token_id=market.up_token_id,
-                                        side=Side.UP, price=record.price, size=record.size,
-                                        placed_at=now,
-                                    ))
-                        state.anchor_up = best_ask_up
+                    # Cancel unfilled UP rungs and repost
+                    cancelled = self.tracker.cancel_side(mid, Side.UP)
+                    self.executor.cancel_batch(cancelled)
+
+                    # Only budget for unfilled portion of this side
+                    side_budget = max(0, budget_up_side - up_filled_cost)
+                    if side_budget >= 1.0:
+                        up_rungs = build_ladder_rungs(
+                            best_ask_up, side_budget,
+                            lp.rungs, lp.spacing, lp.width, lp.size_skew,
+                            tick_size=tick_size,
+                        )
+                        # Pair cost guard: trim rungs whose price + other side VWAP > max_pair_cost
+                        if dn_filled_vwap > 0 and up_rungs:
+                            up_rungs = [(p, s) for p, s in up_rungs if p + dn_filled_vwap <= lp.max_pair_cost]
+                        reprice_expiration = int(market.close_epoch - self.cfg.no_trade_final_sec)
+                        up_order_dicts = [
+                            {"token_id": market.up_token_id, "price": price, "size": size,
+                             "market_id": mid, "side": Side.UP,
+                             "expiration": reprice_expiration}
+                            for price, size in up_rungs
+                        ]
+                        for record in self.executor.place_batch_limit_buys(up_order_dicts):
+                            if record.status != "error":
+                                self.tracker.add(TrackedOrder(
+                                    order_id=record.order_id,
+                                    market_id=mid, token_id=market.up_token_id,
+                                    side=Side.UP, price=record.price, size=record.size,
+                                    placed_at=now,
+                                ))
+                    state.anchor_up = best_ask_up
 
                 if dn_moved:
-                    if state.heavy_side_locked == "DOWN":
-                        # DN is the locked heavy side — update anchor but don't repost
-                        state.anchor_dn = best_ask_dn
-                        logger.info("REPRICE SKIP DN: %s locked heavy side", mid)
-                    else:
-                        # Flush uncredited partial fills before cancelling the side
-                        for order, delta in self.tracker.flush_uncredited(mid):
-                            if order.side == Side.DOWN:
-                                self.positions.update_position(
-                                    order.market_id, order.side, delta, self._fill_cost(order.price, delta),
-                                )
-                        cancelled = self.tracker.cancel_side(mid, Side.DOWN)
-                        self.executor.cancel_batch(cancelled)
-
-                        side_budget = max(0, budget_dn_side - dn_filled_cost)
-                        if side_budget >= 1.0:
-                            dn_rungs = build_ladder_rungs(
-                                best_ask_dn, side_budget,
-                                lp.rungs, lp.spacing, lp.width, lp.size_skew,
-                                tick_size=tick_size,
+                    # Flush uncredited partial fills before cancelling the side
+                    for order, delta in self.tracker.flush_uncredited(mid):
+                        if order.side == Side.DOWN:
+                            self.positions.update_position(
+                                order.market_id, order.side, delta, self._fill_cost(order.price, delta),
                             )
-                            # Pair cost guard: trim rungs whose price + other side VWAP > max_pair_cost
-                            if up_filled_vwap > 0 and dn_rungs:
-                                dn_rungs = [(p, s) for p, s in dn_rungs if p + up_filled_vwap <= lp.max_pair_cost]
-                            reprice_expiration = int(market.close_epoch - self.cfg.no_trade_final_sec)
-                            dn_order_dicts = [
-                                {"token_id": market.dn_token_id, "price": price, "size": size,
-                                 "market_id": mid, "side": Side.DOWN,
-                                 "expiration": reprice_expiration}
-                                for price, size in dn_rungs
-                            ]
-                            for record in self.executor.place_batch_limit_buys(dn_order_dicts):
-                                if record.status != "error":
-                                    self.tracker.add(TrackedOrder(
-                                        order_id=record.order_id,
-                                        market_id=mid, token_id=market.dn_token_id,
-                                        side=Side.DOWN, price=record.price, size=record.size,
-                                        placed_at=now,
-                                    ))
-                        state.anchor_dn = best_ask_dn
+                    cancelled = self.tracker.cancel_side(mid, Side.DOWN)
+                    self.executor.cancel_batch(cancelled)
+
+                    side_budget = max(0, budget_dn_side - dn_filled_cost)
+                    if side_budget >= 1.0:
+                        dn_rungs = build_ladder_rungs(
+                            best_ask_dn, side_budget,
+                            lp.rungs, lp.spacing, lp.width, lp.size_skew,
+                            tick_size=tick_size,
+                        )
+                        # Pair cost guard: trim rungs whose price + other side VWAP > max_pair_cost
+                        if up_filled_vwap > 0 and dn_rungs:
+                            dn_rungs = [(p, s) for p, s in dn_rungs if p + up_filled_vwap <= lp.max_pair_cost]
+                        reprice_expiration = int(market.close_epoch - self.cfg.no_trade_final_sec)
+                        dn_order_dicts = [
+                            {"token_id": market.dn_token_id, "price": price, "size": size,
+                             "market_id": mid, "side": Side.DOWN,
+                             "expiration": reprice_expiration}
+                            for price, size in dn_rungs
+                        ]
+                        for record in self.executor.place_batch_limit_buys(dn_order_dicts):
+                            if record.status != "error":
+                                self.tracker.add(TrackedOrder(
+                                    order_id=record.order_id,
+                                    market_id=mid, token_id=market.dn_token_id,
+                                    side=Side.DOWN, price=record.price, size=record.size,
+                                    placed_at=now,
+                                ))
+                    state.anchor_dn = best_ask_dn
 
                 # Note: do NOT reset imbalance_accepted here — reprice should not undo imbalance guard
                 repriced += 1
