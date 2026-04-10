@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from polybot.config import BotConfig
 from polybot.errors import ClobApiError
@@ -46,6 +46,7 @@ class LadderState:
     chase_done: bool = False  # True after reactive chase pair placed
     directional_done: bool = False  # True after directional buy placed
     throttle_heavy_side: Side | None = None  # Set when imbalance > 0.30 but both sides have fills
+    fv_cancel_history: list = field(default_factory=list)  # epoch timestamps of recent FV cancels
 
 
 MIN_ORDER_SIZE = 5.0  # Polymarket minimum for GTC orders
@@ -1433,7 +1434,7 @@ class LadderManager:
             return 0
 
         cert = fv_certainty(fair_up)
-        if cert < 0.60:
+        if cert < 0.75:
             return 0  # not certain enough to act
 
         # Determine losing side
@@ -1447,12 +1448,29 @@ class LadderManager:
         if state.heavy_side_locked is not None and state.heavy_side_locked != losing_side.value:
             return 0
 
+        # FV cancel circuit breaker: if FV has cancelled 3+ times in 60s, kill the ladder.
+        # This prevents the FV-cancel/reprice ping-pong loop that causes $15+ losses.
+        now_ts = time.time()
+        state.fv_cancel_history = [t for t in state.fv_cancel_history if now_ts - t <= 60.0]
+        if len(state.fv_cancel_history) >= 3:
+            logger.warning(
+                "FV CANCEL CIRCUIT BREAKER: market=%s fired %d times in 60s, killing ladder",
+                mid, len(state.fv_cancel_history),
+            )
+            all_cancelled = self.tracker.cancel_market(mid)
+            self.executor.cancel_batch(all_cancelled)
+            self._killed_ladders.add(mid)
+            return 0
+
         # Cancel losing side resting orders
         cancelled = self.tracker.cancel_side(mid, losing_side)
         if not cancelled:
             return 0
 
         self.executor.cancel_batch(cancelled)
+
+        # Record this cancel in history for circuit breaker tracking
+        state.fv_cancel_history.append(now_ts)
 
         # Lock the losing side so reprice doesn't repost
         state.heavy_side_locked = losing_side.value

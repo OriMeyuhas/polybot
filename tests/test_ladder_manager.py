@@ -466,3 +466,122 @@ class TestClearCancelledLadders:
         mgr.clear_cancelled_ladders()
         assert "m1" not in mgr.ladders
         assert "m2" in mgr.ladders
+
+
+# ── Proposal #47: FV cancel circuit breaker ──────────────────────────────────
+
+class TestFvCancelCircuitBreaker:
+    """Tests for the FV-cancel circuit breaker added by Proposal #47."""
+
+    def _make_mgr_with_ladder(self, cfg, mock_clob):
+        """Create a LadderManager with a pre-seeded ladder and resting orders."""
+        from polybot.ladder_manager import LadderState
+        from polybot.order_tracker import TrackedOrder
+        import time as _time
+
+        mgr = _make_manager(cfg, mock_clob)
+        mid = market_id = "btc-15m-100"
+        now = int(_time.time())
+        mw = MarketWindow(
+            market_id=mid, condition_id="0xabc", asset="BTC",
+            timeframe_sec=900, up_token_id="tok_up", dn_token_id="tok_dn",
+            open_epoch=now - 100, close_epoch=now + 800,
+        )
+        state = LadderState(
+            market_id=mid, asset="BTC",
+            anchor_up=0.45, anchor_dn=0.48,
+            posted_at=float(now - 100),
+            timeframe_sec=900,
+            up_token_id="tok_up",
+            dn_token_id="tok_dn",
+        )
+        mgr.ladders[mid] = state
+
+        # Add 10 UP orders so cancels return non-empty each call
+        for i in range(10):
+            mgr.tracker.add(TrackedOrder(
+                order_id=f"up_{i}", market_id=mid, token_id="tok_up",
+                side=Side.UP, price=0.45 - i * 0.01, size=5.0,
+                placed_at=float(now),
+            ))
+        return mgr, mw, mid, state
+
+    def test_circuit_breaker_fires_after_3_cancels_in_60s(self, cfg, mock_clob):
+        """After 3 FV cancels within 60s, the 4th call kills the ladder.
+
+        Circuit breaker: if history has >= 3 entries (from prior calls), kill whole ladder.
+        Each successful cancel appends to history. Kill fires on the call that sees >= 3 entries.
+        """
+        import time as _time
+
+        mgr, mw, mid, state = self._make_mgr_with_ladder(cfg, mock_clob)
+        # Use fair_up=0.12 -> certainty=0.88 > 0.75 threshold, UP is losing side
+
+        def _replenish_and_reset(batch_name):
+            from polybot.order_tracker import TrackedOrder
+            for i in range(5):
+                mgr.tracker.add(TrackedOrder(
+                    order_id=f"{batch_name}_{i}", market_id=mid, token_id="tok_up",
+                    side=Side.UP, price=0.44 - i * 0.01, size=5.0,
+                    placed_at=_time.time(),
+                ))
+            state.heavy_side_locked = None  # reset lock to allow next cancel
+
+        # Call 1 → history has 0 before, breaker skips, cancel succeeds, history=[t1]
+        mgr.cancel_losing_side_orders(mw, fair_up=0.12)
+        assert mid not in mgr._killed_ladders
+        assert len(state.fv_cancel_history) == 1
+
+        _replenish_and_reset("b2")
+        # Call 2 → history has 1 before, breaker skips, cancel succeeds, history=[t1,t2]
+        mgr.cancel_losing_side_orders(mw, fair_up=0.12)
+        assert mid not in mgr._killed_ladders
+        assert len(state.fv_cancel_history) == 2
+
+        _replenish_and_reset("b3")
+        # Call 3 → history has 2 before, breaker skips, cancel succeeds, history=[t1,t2,t3]
+        mgr.cancel_losing_side_orders(mw, fair_up=0.12)
+        assert mid not in mgr._killed_ladders
+        assert len(state.fv_cancel_history) == 3
+
+        _replenish_and_reset("b4")
+        # Call 4 → history has 3 before → circuit breaker fires → kills ladder
+        result = mgr.cancel_losing_side_orders(mw, fair_up=0.12)
+        assert mid in mgr._killed_ladders, (
+            "Ladder should be killed when fv_cancel_history reaches 3 entries within 60s"
+        )
+        assert result == 0, "Circuit breaker returns 0 (whole-ladder kill, not per-side cancel)"
+
+    def test_circuit_breaker_does_not_fire_if_cancels_sparse(self, cfg, mock_clob):
+        """3 cancels spread over 180s should NOT trigger the breaker."""
+        import time as _time
+
+        mgr, mw, mid, state = self._make_mgr_with_ladder(cfg, mock_clob)
+
+        # Manually seed history with 2 old timestamps (>60s ago) and 0 recent
+        state.fv_cancel_history = [_time.time() - 120.0, _time.time() - 90.0]
+
+        # One fresh cancel: after pruning, only 1 recent entry total
+        mgr.cancel_losing_side_orders(mw, fair_up=0.12)
+
+        # Should NOT be killed — only 1 recent cancel
+        assert mid not in mgr._killed_ladders, "Should not kill after 1 recent cancel (2 old pruned)"
+
+    def test_circuit_breaker_prunes_old_history(self, cfg, mock_clob):
+        """Entries older than 60s must be pruned before checking the threshold."""
+        import time as _time
+
+        mgr, mw, mid, state = self._make_mgr_with_ladder(cfg, mock_clob)
+
+        # Plant 5 old entries (>60s) — these should be pruned
+        old_ts = _time.time() - 90.0
+        state.fv_cancel_history = [old_ts] * 5
+
+        # Call once — should prune old entries, then add 1 fresh
+        mgr.cancel_losing_side_orders(mw, fair_up=0.12)
+
+        # After the call, history has only the 1 fresh entry (old 5 were pruned)
+        assert len(state.fv_cancel_history) == 1, (
+            f"Expected 1 entry after pruning 5 old ones, got {len(state.fv_cancel_history)}"
+        )
+        assert mid not in mgr._killed_ladders, "Should not kill after prune left only 1 recent"
