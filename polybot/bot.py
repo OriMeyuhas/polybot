@@ -127,6 +127,7 @@ class Bot:
         self._last_discovery_time = 0.0
         self._last_status_time = 0.0
         self._snapped_windows: set[str] = set()
+        self._ptb_logged: set[str] = set()  # markets where PTB source was already logged
         self._settled_markets: set[str] = set()  # markets that have been settled — no more trading
         self._settled_wins = 0
         self._settled_losses = 0
@@ -1405,7 +1406,7 @@ class Bot:
 
                 # Count resting orders per side
                 resting_up = len(self.order_tracker.get_resting_side(mid, Side.UP))
-                resting_dn = len(self.order_tracker.get_resting_side(mid, Side.DN))
+                resting_dn = len(self.order_tracker.get_resting_side(mid, Side.DOWN))
 
                 elapsed_pct = 0.0
                 if market.timeframe_sec > 0:
@@ -1428,8 +1429,8 @@ class Bot:
                     "bankroll": round(self.position_manager.bankroll, 2),
                 }
                 self.data_recorder.log_strategy_state(now_f, mid, market.asset, data)
-        except Exception:
-            pass  # never crash the bot on logging
+        except Exception as e:
+            logger.debug("strategy_log failed: %s", e, exc_info=True)  # never crash the bot on logging
 
     def compute_spot_delta(self, asset: str, market_id: str) -> float:
         current = self.spot_prices.get(asset, 0.0)
@@ -1449,24 +1450,52 @@ class Bot:
     def compute_fair_value(self, market) -> tuple[float, float]:
         """Return (p_up, vol_annualized) for the given market window.
 
-        PTB fallback chain: market.price_to_beat → window_open_prices.
+        PTB fallback chain: Chainlink RTDS → market.price_to_beat → window_open_prices.
+        Chainlink is authoritative because Polymarket resolves on Chainlink, not Binance.
         Returns (0.5, fallback_vol) when data is insufficient.
         """
         fallback_vol = self.cfg.vol_fallback_annual
 
-        # Get Price to Beat
+        # Get Price to Beat — prefer Chainlink (resolution source)
         ptb = None
-        if hasattr(market, 'price_to_beat') and market.price_to_beat:
+        ptb_source = None
+
+        # 1. Chainlink RTDS historical lookup at window open
+        if hasattr(market, 'open_epoch') and market.open_epoch:
+            cl_price = self.rtds_feed.price_at_timestamp(market.asset, market.open_epoch)
+            if cl_price is not None and float(cl_price) > 0:
+                ptb = float(cl_price)
+                ptb_source = "chainlink"
+
+        # 2. Gamma API price_to_beat
+        if ptb is None and hasattr(market, 'price_to_beat') and market.price_to_beat:
             try:
                 ptb = float(market.price_to_beat)
                 if ptb <= 0:
                     ptb = None
+                else:
+                    ptb_source = "gamma"
             except (ValueError, TypeError):
                 ptb = None
+
+        # 3. Binance spot snapshot at window open
         if ptb is None:
             ptb = self.window_open_prices.get(market.market_id)
+            if ptb is not None and ptb > 0:
+                ptb_source = "binance"
+
         if ptb is None or ptb <= 0:
             return (0.5, fallback_vol)
+
+        # Log PTB source once per market for monitoring
+        if market.market_id not in self._ptb_logged:
+            self._ptb_logged.add(market.market_id)
+            binance_snap = self.window_open_prices.get(market.market_id, 0.0)
+            diff = ptb - binance_snap if binance_snap > 0 else 0.0
+            logger.info(
+                "PTB SOURCE: %s src=%s ptb=$%.2f (binance=$%.2f, diff=$%.2f)",
+                market.market_id, ptb_source, ptb, binance_snap, diff,
+            )
 
         # Get current price
         current = self.spot_prices.get(market.asset, 0.0)
@@ -1548,8 +1577,8 @@ class Bot:
         now = int(time.time())
         for market in list(self._active_markets.values()):
             if market.market_id in self._snapped_windows:
-                # Already snapped — try to upgrade with Binance candle if we only have spot
-                pass
+                # Already snapped — no need to re-fetch
+                continue
             else:
                 if not market.is_active(now):
                     continue
@@ -1580,6 +1609,7 @@ class Bot:
         stale = self._snapped_windows - active_ids
         for mid in stale:
             self._snapped_windows.discard(mid)
+            self._ptb_logged.discard(mid)
             self.window_open_prices.pop(mid, None)
 
         # Clean up settled market markers when markets leave active list
