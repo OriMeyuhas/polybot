@@ -1194,6 +1194,8 @@ class LadderManager:
                 logger.info("FILL: %s %s %.1f @ $%.2f on %s",
                              order.side.value, order.token_id[:16],
                              fill_qty, order.price, order.market_id)
+                # Synchronous one-sided abort immediately after crediting each live fill
+                self.check_one_sided_abort(order.market_id)
 
         for order in result["partial"]:
             # Credit the newly matched quantity
@@ -1256,6 +1258,12 @@ class LadderManager:
             order.filled = fill_qty
             order.credited_to_pm = fill_qty
             filled.append(order)
+
+            # Synchronous one-sided abort: check immediately after crediting each fill
+            # so adverse bursts are caught within the same tick. Only fires on BUY fills
+            # (SELL fills reduce the position, can't build a one-sided BUY imbalance).
+            if fill_side_raw == "BUY":
+                self.check_one_sided_abort(order.market_id)
 
         # One-side cap check removed: _check_one_side_cap fired destructively in Cycles 9/10
 
@@ -1605,6 +1613,61 @@ class LadderManager:
                     acted.append(mid)
 
         return acted
+
+    def check_one_sided_abort(self, market_id: str) -> bool:
+        """Kill-and-walk-away guard for synchronous fill-time calls.
+
+        Called immediately after each fill is credited so adverse bursts are caught
+        within the same tick rather than waiting for the main polling loop.
+
+        Triggers on EITHER condition:
+        - 100% one-sided AND total cost > 1% of bankroll (early burst detection)
+        - Ratio > 3:1 AND total cost > $10.0 (accumulating imbalance)
+
+        Does NOT re-enable lock / boost / chase — kill-and-walk-away only.
+        Returns True if the ladder was killed, False otherwise.
+        """
+        if market_id in self._killed_ladders:
+            return False
+        if market_id not in self.ladders:
+            return False
+
+        up_qty = self.tracker.filled_qty(market_id, Side.UP)
+        dn_qty = self.tracker.filled_qty(market_id, Side.DOWN)
+        if up_qty + dn_qty < 1.0:
+            return False
+
+        up_cost = self.tracker.filled_cost(market_id, Side.UP)
+        dn_cost = self.tracker.filled_cost(market_id, Side.DOWN)
+        total_cost = up_cost + dn_cost
+
+        bankroll = self.positions.bankroll
+        cost_threshold_pct = bankroll * 0.01  # 1% of bankroll
+
+        triggered = False
+        # Condition 1: 100% one-sided with any meaningful cost
+        if (up_qty == 0 or dn_qty == 0) and total_cost > cost_threshold_pct:
+            triggered = True
+
+        # Condition 2: ratio > 3:1 with absolute minimum $10 at risk
+        if not triggered:
+            min_qty = min(up_qty, dn_qty)
+            max_qty = max(up_qty, dn_qty)
+            if min_qty > 0 and max_qty / min_qty > 3.0 and total_cost > 10.0:
+                triggered = True
+
+        if triggered:
+            logger.warning(
+                "ONE-SIDED ABORT: market=%s up=%.1f dn=%.1f cost=$%.2f — killing ladder",
+                market_id, up_qty, dn_qty, total_cost,
+            )
+            self.cancel_ladder(market_id)
+            if market_id in self.ladders:
+                del self.ladders[market_id]
+            self._killed_ladders.add(market_id)
+            return True
+
+        return False
 
     def check_loss_cap(self, spot_prices: dict[str, float], window_open_prices: dict[str, float] | None = None) -> list[str]:
         """Cancel remaining orders on positions whose one-sided loss exceeds threshold.

@@ -610,3 +610,165 @@ class TestFvCancelCircuitBreaker:
             f"Expected 1 entry after pruning 5 old ones, got {len(state.fv_cancel_history)}"
         )
         assert mid not in mgr._killed_ladders, "Should not kill after prune left only 1 recent"
+
+
+# ---------------------------------------------------------------------------
+# Fix #50 — check_one_sided_abort: kill-and-walk-away synchronous guard
+# ---------------------------------------------------------------------------
+
+def _seed_fills(mgr, market_id: str, up_fills: list[tuple[str, float, float]],
+                dn_fills: list[tuple[str, float, float]]) -> None:
+    """Helper: seed filled orders on both sides.
+
+    Each entry is (order_id, price, qty).  Orders are added as fully filled.
+    """
+    from polybot.strategy.order_tracker import TrackedOrder
+    for oid, price, qty in up_fills:
+        mgr.tracker.add(TrackedOrder(
+            order_id=oid, market_id=market_id,
+            token_id="tok_up", side=Side.UP,
+            price=price, size=qty, placed_at=1000.0,
+        ))
+        mgr.tracker.update_fill(oid, qty)
+    for oid, price, qty in dn_fills:
+        mgr.tracker.add(TrackedOrder(
+            order_id=oid, market_id=market_id,
+            token_id="tok_dn", side=Side.DOWN,
+            price=price, size=qty, placed_at=1000.0,
+        ))
+        mgr.tracker.update_fill(oid, qty)
+
+
+def _add_resting_order(mgr, market_id: str, side: Side, oid: str = "rest_1") -> None:
+    from polybot.strategy.order_tracker import TrackedOrder
+    token = "tok_up" if side == Side.UP else "tok_dn"
+    mgr.tracker.add(TrackedOrder(
+        order_id=oid, market_id=market_id,
+        token_id=token, side=side,
+        price=0.45, size=10.0, placed_at=1000.0,
+    ))
+
+
+class TestOneSidedAbort:
+    """Tests for LadderManager.check_one_sided_abort() — Fix #50."""
+
+    def _make_mgr_with_ladder(self, cfg, mock_clob, bankroll=500.0):
+        from polybot.ladder_manager import LadderState
+        mgr = _make_manager(cfg, mock_clob, bankroll=bankroll)
+        mid = "btc-15m-123"
+        mgr.ladders[mid] = LadderState(
+            market_id=mid, asset="BTC",
+            anchor_up=0.45, anchor_dn=0.45, posted_at=1000.0,
+        )
+        return mgr, mid
+
+    def test_fires_on_100pct_one_sided_with_cost_above_1pct_bankroll(self, cfg, mock_clob):
+        """100% one-sided + cost $25 on $500 bankroll (>1%) → kills ladder."""
+        mgr, mid = self._make_mgr_with_ladder(cfg, mock_clob, bankroll=500.0)
+        # up_qty=50, dn_qty=0, cost ≈ 50*0.50=$25 (>1% of $500=$5)
+        _seed_fills(mgr, mid, [("u1", 0.50, 50.0)], [])
+        _add_resting_order(mgr, mid, Side.UP, "rest_up")
+
+        result = mgr.check_one_sided_abort(mid)
+
+        assert result is True
+        assert mid in mgr._killed_ladders
+        # All resting orders should be cancelled/cancelling
+        rest = mgr.tracker.orders.get("rest_up")
+        assert rest is None or rest.status in ("cancelled", "cancelling")
+
+    def test_fires_on_3_to_1_ratio(self, cfg, mock_clob):
+        """ratio 51:8.5 ≈ 6:1 > 3:1, cost=$28 > $10 → kills."""
+        mgr, mid = self._make_mgr_with_ladder(cfg, mock_clob, bankroll=500.0)
+        # up_qty=51 @ 0.46 ≈ $23.46, dn_qty=8.5 @ 0.47 ≈ $4, total ≈ $28
+        _seed_fills(mgr, mid,
+                    [("u1", 0.46, 51.0)],
+                    [("d1", 0.47, 8.5)])
+        _add_resting_order(mgr, mid, Side.UP, "rest_2")
+
+        result = mgr.check_one_sided_abort(mid)
+
+        assert result is True
+        assert mid in mgr._killed_ladders
+
+    def test_does_not_fire_below_cost_threshold(self, cfg, mock_clob):
+        """100% one-sided but cost only $2 (<1% of $500=$5) → no kill."""
+        mgr, mid = self._make_mgr_with_ladder(cfg, mock_clob, bankroll=500.0)
+        # up_qty=10 @ 0.20 = $2
+        _seed_fills(mgr, mid, [("u1", 0.20, 10.0)], [])
+
+        result = mgr.check_one_sided_abort(mid)
+
+        assert result is False
+        assert mid not in mgr._killed_ladders
+
+    def test_does_not_fire_on_balanced_fills(self, cfg, mock_clob):
+        """up_qty=40, dn_qty=35, total $40 — balanced, no abort."""
+        mgr, mid = self._make_mgr_with_ladder(cfg, mock_clob, bankroll=500.0)
+        _seed_fills(mgr, mid,
+                    [("u1", 0.50, 40.0)],
+                    [("d1", 0.50, 35.0)])
+
+        result = mgr.check_one_sided_abort(mid)
+
+        assert result is False
+        assert mid not in mgr._killed_ladders
+
+    def test_abort_cancels_all_resting_orders(self, cfg, mock_clob):
+        """After abort, all resting orders for that market are cancelled."""
+        mgr, mid = self._make_mgr_with_ladder(cfg, mock_clob, bankroll=500.0)
+        _seed_fills(mgr, mid, [("u1", 0.50, 50.0)], [])
+        # Add multiple resting orders (UP and DN)
+        _add_resting_order(mgr, mid, Side.UP, "rest_up_1")
+        _add_resting_order(mgr, mid, Side.UP, "rest_up_2")
+        _add_resting_order(mgr, mid, Side.DOWN, "rest_dn_1")
+
+        mgr.check_one_sided_abort(mid)
+
+        assert mid in mgr._killed_ladders
+        for oid in ("rest_up_1", "rest_up_2", "rest_dn_1"):
+            order = mgr.tracker.orders.get(oid)
+            assert order is None or order.status in ("cancelled", "cancelling"), \
+                f"Expected {oid} cancelled, got {order.status if order else 'None'}"
+
+    def test_no_op_when_already_killed(self, cfg, mock_clob):
+        """No-op if market_id already in _killed_ladders."""
+        mgr, mid = self._make_mgr_with_ladder(cfg, mock_clob, bankroll=500.0)
+        mgr._killed_ladders.add(mid)
+        _seed_fills(mgr, mid, [("u1", 0.50, 100.0)], [])
+
+        result = mgr.check_one_sided_abort(mid)
+
+        assert result is False  # already killed, skip
+
+    def test_no_op_for_missing_ladder(self, cfg, mock_clob):
+        """Returns False if market_id not in self.ladders."""
+        mgr = _make_manager(cfg, mock_clob, bankroll=500.0)
+        result = mgr.check_one_sided_abort("nonexistent-market")
+        assert result is False
+
+    def test_process_paper_fills_triggers_abort(self, cfg, mock_clob):
+        """process_paper_fills() calls check_one_sided_abort() per BUY fill with the correct market_id."""
+        from unittest.mock import patch
+        from polybot.ladder_manager import LadderState
+        from polybot.strategy.order_tracker import TrackedOrder
+
+        mgr = _make_manager(cfg, mock_clob, bankroll=500.0)
+        mid = "btc-15m-abort-test"
+        mgr.ladders[mid] = LadderState(
+            market_id=mid, asset="BTC",
+            anchor_up=0.45, anchor_dn=0.45, posted_at=1000.0,
+        )
+        # Register a resting BUY order in the tracker
+        order = TrackedOrder(
+            order_id="paper-abc123", market_id=mid,
+            token_id="tok_up", side=Side.UP,
+            price=0.45, size=10.0, placed_at=1000.0,
+        )
+        mgr.tracker.add(order)
+
+        with patch.object(mgr, "check_one_sided_abort", wraps=mgr.check_one_sided_abort) as mock_abort:
+            paper_fills = [{"id": "paper-abc123", "side": "BUY"}]
+            mgr.process_paper_fills(paper_fills)
+            # check_one_sided_abort must have been called with the market_id of the fill
+            mock_abort.assert_called_once_with(mid)
