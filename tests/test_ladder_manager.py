@@ -567,6 +567,31 @@ class TestFvCancelCircuitBreaker:
         # Should NOT be killed — only 1 recent cancel
         assert mid not in mgr._killed_ladders, "Should not kill after 1 recent cancel (2 old pruned)"
 
+    def test_threshold_is_75pct(self, mock_clob):
+        """cancel_losing_side_orders must NOT fire at cert < 0.75 (Proposal #48).
+
+        Note: _make_mgr_with_ladder seeds UP orders.  fair_up=0.20 -> UP is losing
+        side, so cancel_side(Side.UP) returns the seeded orders.
+        """
+        fv_cfg = BotConfig(
+            private_key="0xfake", api_key="key", api_secret="secret", api_passphrase="pass",
+            ladder_rungs=8, ladder_spacing=0.02, ladder_width=0.10, ladder_size_skew=2.0,
+            reprice_threshold=0.02, max_imbalance_ratio=0.60, imbalance_timeout_sec=30,
+            fair_value_enabled=True,
+        )
+
+        # Test: fair_up=0.20 -> certainty=80% >= 0.75 -> UP is losing -> should cancel UP orders
+        mgr, mw, mid, state = self._make_mgr_with_ladder(fv_cfg, mock_clob)
+        result = mgr.cancel_losing_side_orders(mw, fair_up=0.20)
+        assert result > 0, "Should cancel at 80% certainty (above 0.75 threshold)"
+
+        # Test: fair_up=0.26 -> certainty=74% -> below 0.75 threshold -> should NOT cancel
+        mgr2, mw2, mid2, state2 = self._make_mgr_with_ladder(fv_cfg, mock_clob)
+        result2 = mgr2.cancel_losing_side_orders(mw2, fair_up=0.26)
+        assert result2 == 0, (
+            f"Should NOT cancel at 74% certainty (threshold is 0.75), got result={result2}"
+        )
+
     def test_circuit_breaker_prunes_old_history(self, cfg, mock_clob):
         """Entries older than 60s must be pruned before checking the threshold."""
         import time as _time
