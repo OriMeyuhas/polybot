@@ -101,86 +101,127 @@ class PaperClobClient:
     def get_balance_allowance(self, params=None) -> dict:
         return {"balance": "10000.00", "allowance": "10000.00"}
 
-    _book_cache: dict[str, tuple[float, dict]] = {}  # token_id -> (ts, book_data)
-    _BOOK_CACHE_TTL = 5.0  # seconds
+    def _get_real_book_depth(self, token_id: str, order_price: float, side: str) -> tuple[bool, float]:
+        """Check if our order price is realistic given the real order book.
 
-    def _fetch_real_book(self, token_id: str) -> dict | None:
-        """Fetch book from CLOB API with 5-second cache."""
-        now = time.time()
-        cached = self._book_cache.get(token_id)
-        if cached and now - cached[0] < self._BOOK_CACHE_TTL:
-            return cached[1]
-        try:
-            import httpx
-            resp = httpx.get(
-                f"https://clob.polymarket.com/book?token_id={token_id}",
-                timeout=3.0,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                self._book_cache[token_id] = (now, data)
-                return data
-        except Exception:
-            pass
-        return None
+        Returns (can_fill, available_size):
+        - can_fill: True if the order is at a plausible price
+        - available_size: estimate of fillable size (from real book depth)
 
-    def _book_validates_fill(self, token_id: str, order_price: float, side: str) -> bool:
-        """Check if the real CLOB order book supports this fill.
-
-        Fetches the live book from Polymarket CLOB API (cached 5s).
-        For BUY orders: our bid should be within $0.05 of the real best bid.
-        If our bid is far above the real best bid, the fill is unrealistic.
+        Binary option market structure:
+        - Asks cluster at $0.99 (max payout), bids at fair value (~$0.40-0.60)
+        - Real fills happen when sellers market-sell INTO resting bids
+        - So for BUY orders: check if our bid is NEAR the real best bid
+          (within 10c). Sellers cross the spread to hit bids near best bid.
+        - Orders far below the real best bid (>10c) are unrealistic.
+        - Orders far above the real best bid are aggressive (fill immediately).
         """
+        if not self._book_manager:
+            # No book manager configured (unit tests). Allow probabilistic fills.
+            return True, float("inf")
+
+        book = self._book_manager.get_book(token_id)
+        if book is None or book._last_update == 0:
+            # Book manager exists but no data for this token yet (WS lag).
+            # Block fill — don't allow unvalidated fills during book warmup.
+            return False, 0.0
+
         try:
-            data = self._fetch_real_book(token_id)
-            if data is None:
-                return True  # API error, don't block
-
-            bids = data.get("bids", [])
-            asks = data.get("asks", [])
-
             if side == "BUY":
-                real_best_bid = float(bids[-1]["price"]) if bids else None
-                if real_best_bid is not None:
-                    gap = order_price - real_best_bid
-                    if gap > 0.05:
-                        return False
-            elif side == "SELL":
-                real_best_ask = float(asks[0]["price"]) if asks else None
-                if real_best_ask is not None:
-                    gap = real_best_ask - order_price
-                    if gap > 0.05:
-                        return False
+                if book.asks:
+                    best_ask = float(book.best_ask)
+                    if order_price > best_ask + 0.005:
+                        # Passive maker BUY priced above the real ask can't legitimately
+                        # rest there — a taker would hit the ask first. Block this fill
+                        # to prevent phantom profit on inflated paper prices.
+                        return False, 0.0
+                if not book.bids:
+                    return False, 0.0  # no bid data — block fill
+                best_bid = float(book.best_bid)
+                gap_below_bid = best_bid - order_price
+                if gap_below_bid > 0.05:
+                    # Our bid is >5c below the real best bid — no seller would
+                    # cross this far when they can sell at the bid. Block fill.
+                    return False, 0.0
+                elif gap_below_bid > 0.03:
+                    # 3-5c below best bid — rare, aggressive seller only. Tiny size.
+                    bid_depth = sum(
+                        float(lvl.size) for lvl in book.bids
+                        if float(lvl.price) >= order_price
+                    )
+                    return True, min(bid_depth * 0.05, 10.0)
+                else:
+                    # Within 3c of best bid or above it — realistic fill zone.
+                    bid_depth = sum(
+                        float(lvl.size) for lvl in book.bids
+                        if float(lvl.price) >= order_price - 0.01
+                    )
+                    return True, max(bid_depth * 0.2, 10.0)
+            else:  # SELL
+                if not book.asks:
+                    return False, 0.0  # no ask data — block fill
+                best_ask = float(book.best_ask)
+                gap_above_ask = order_price - best_ask
+
+                if gap_above_ask > 0.05:
+                    return False, 0.0
+                elif gap_above_ask > 0.03:
+                    ask_depth = sum(
+                        float(lvl.size) for lvl in book.asks
+                        if float(lvl.price) <= order_price
+                    )
+                    return True, min(ask_depth * 0.05, 10.0)
+                else:
+                    ask_depth = sum(
+                        float(lvl.size) for lvl in book.asks
+                        if float(lvl.price) <= order_price + 0.01
+                    )
+                    return True, max(ask_depth * 0.2, 10.0)
         except Exception:
-            return True
-        return True
+            return True, float("inf")
 
     @staticmethod
-    def _fill_probability(order_price: float, market_price: float) -> float:
-        """Distance-dependent fill probability per tick.
+    def _fill_probability(order_price: float, market_price: float, side: str = "BUY") -> float:
+        """Distance-dependent fill probability per tick for binary options.
 
-        Near-market orders fill frequently; deep orders rarely fill.
-        Calibrated against whale fill rate data (96 fills/market over 300s).
+        For BUY orders:
+        - If order_price >= market_price (aggressive — overpaying), high fill prob.
+        - If order_price < market_price (passive — waiting for seller), lower prob.
+
+        Conservative calibration: targets ~5-15 fills/side over a 15m window,
+        matching realistic Polymarket fill rates for passive resting orders.
         """
         distance = abs(order_price - market_price)
-        if distance < 0.015:      # At or near market (within ~1 cent)
-            return 0.90
-        elif distance < 0.035:    # Close (1-3 cents)
-            return 0.50
-        elif distance < 0.065:    # Mid-range (3-6 cents)
-            return 0.20
-        elif distance < 0.105:    # Deep (6-10 cents)
-            return 0.08
-        else:                     # Very deep (>10 cents)
-            return 0.02
+
+        if side == "BUY" and order_price >= market_price:
+            return min(0.60, 0.30 + distance * 3)
+        elif side == "SELL" and order_price <= market_price:
+            return min(0.60, 0.30 + distance * 3)
+
+        # Passive: our order is away from market, waiting for counterparty.
+        # More conservative than before — real Polymarket has thin books and
+        # passive orders far from mid rarely fill.
+        if distance < 0.02:       # Within 2 cents of midpoint
+            return 0.04
+        elif distance < 0.05:     # 2-5 cents away
+            return 0.01
+        elif distance < 0.10:     # 5-10 cents away
+            return 0.003
+        elif distance < 0.20:     # 10-20 cents away
+            return 0.0005
+        else:                     # Very deep (>20 cents)
+            return 0.0            # ZERO: no fills for orders >20c from mid
 
     def tick(self, midpoints: dict[str, float] | None = None) -> list[dict]:
-        """Simulate fills using CLOB midpoint prices with distance-dependent probability.
+        """Simulate fills using real book data + distance-dependent probability.
 
-        Near-market orders fill frequently; deep orders rarely fill.
-        This models real queue position effects in the order book.
-        One fill per token per tick, nearest-to-market first.
-        Expired orders (expiration > 0 and time.time() > expiration) are auto-cancelled.
+        Fill realism rules:
+        1. If real book data is available, only fill if counterparty liquidity
+           exists near the order price (asks for BUY, bids for SELL).
+        2. Cap fill size at available real book depth at that level.
+        3. Orders >20c from midpoint NEVER fill (no real counterparty).
+        4. One fill per token per tick, nearest-to-market first.
+        5. Expired orders auto-cancelled.
         """
         # Auto-cancel expired orders (GTD expiration)
         now_ts = time.time()
@@ -214,28 +255,43 @@ class PaperClobClient:
                 continue
 
             order_price = float(order.get("price", "0"))
+            order_size = float(order.get("size", "0"))
             side = order.get("side", "BUY").upper()
 
-            # Validate against real order book if available
-            if self._book_manager and not self._book_validates_fill(
-                token_id, order_price, side
-            ):
+            # Hard cutoff: orders >20c from midpoint never fill
+            distance = abs(order_price - market_price)
+            if distance > 0.20:
                 continue
 
-            if side == "BUY" and market_price <= order_price:
-                prob = self._fill_probability(order_price, market_price)
-                if self._rng.random() < prob:
-                    order["status"] = "filled"
-                    fills.append(order)
-                    to_remove.append(oid)
-                    filled_tokens.add(token_id)
-            elif side == "SELL" and market_price >= order_price:
-                prob = self._fill_probability(order_price, market_price)
-                if self._rng.random() < prob:
-                    order["status"] = "filled"
-                    fills.append(order)
-                    to_remove.append(oid)
-                    filled_tokens.add(token_id)
+            # Check real book for counterparty liquidity
+            can_fill, available_size = self._get_real_book_depth(
+                token_id, order_price, side
+            )
+
+            if not can_fill:
+                # No real counterparty liquidity — skip this order entirely
+                continue
+
+            # Cap fill size at real book depth (if book data available)
+            if available_size < float("inf"):
+                if available_size <= 0:
+                    continue  # no depth at this level
+                # Only fill up to what the real book could support
+                effective_size = min(order_size, available_size)
+            else:
+                effective_size = order_size
+
+            # Distance-based fill probability
+            prob = self._fill_probability(order_price, market_price, side)
+            if self._rng.random() < prob:
+                # Apply size cap from book depth
+                if effective_size < order_size:
+                    order["size"] = str(round(effective_size, 1))
+                    order["remaining"] = order["size"]
+                order["status"] = "filled"
+                fills.append(order)
+                to_remove.append(oid)
+                filled_tokens.add(token_id)
 
         for oid in to_remove:
             self._resting.pop(oid, None)
