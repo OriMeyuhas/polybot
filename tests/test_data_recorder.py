@@ -162,6 +162,8 @@ def test_market_event_logged(tmp_path):
         "open_epoch": 1700000000,
         "close_epoch": 1700000900,
         "price_to_beat": 69325.0,
+        "up_token_id": "tok_up_abc123",
+        "dn_token_id": "tok_dn_abc123",
     }
     recorder.log_market_event(1700000000.0, "discovered", "btc-15m-123", "BTC", 900, metadata)
 
@@ -173,6 +175,32 @@ def test_market_event_logged(tmp_path):
     assert record["asset"] == "BTC"
     assert record["timeframe_sec"] == 900
     assert record["metadata"]["open_epoch"] == 1700000000
+    # Proposal #46: token IDs must be present for replay validator join
+    assert record["metadata"]["up_token_id"] == "tok_up_abc123"
+    assert record["metadata"]["dn_token_id"] == "tok_dn_abc123"
+    recorder.close()
+
+
+def test_market_event_discovered_includes_token_ids(tmp_path):
+    """Regression: bot.py 'discovered' events must include up/dn token IDs (Proposal #46)."""
+    from polybot.data.data_recorder import DataRecorder
+    recorder = DataRecorder(data_dir=tmp_path)
+
+    # Simulate what bot.py now emits for a 'discovered' event
+    metadata = {
+        "open_epoch": 1700000000,
+        "close_epoch": 1700000900,
+        "up_token_id": "0xabcdef1234567890",
+        "dn_token_id": "0x0987654321fedcba",
+    }
+    recorder.log_market_event(1700000000.0, "discovered", "btc-15m-456", "BTC", 900, metadata)
+
+    log_file = list(tmp_path.glob("market_event_log_*.jsonl"))
+    record = json.loads(log_file[0].read_text().strip())
+    assert "up_token_id" in record["metadata"], "up_token_id missing from discovered event"
+    assert "dn_token_id" in record["metadata"], "dn_token_id missing from discovered event"
+    assert record["metadata"]["up_token_id"] == "0xabcdef1234567890"
+    assert record["metadata"]["dn_token_id"] == "0x0987654321fedcba"
     recorder.close()
 
 

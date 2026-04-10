@@ -915,7 +915,12 @@ class Bot:
                         mw = new_markets[mid]
                         self.data_recorder.log_market_event(
                             time.time(), "discovered", mid, mw.asset, mw.timeframe_sec,
-                            {"open_epoch": mw.open_epoch, "close_epoch": mw.close_epoch},
+                            {
+                                "open_epoch": mw.open_epoch,
+                                "close_epoch": mw.close_epoch,
+                                "up_token_id": mw.up_token_id,
+                                "dn_token_id": mw.dn_token_id,
+                            },
                         )
                 if departed:
                     logger.info("EXPIRED WINDOWS: %s", ", ".join(departed))
@@ -927,7 +932,12 @@ class Bot:
                         if old_mkt:
                             self.data_recorder.log_market_event(
                                 time.time(), "dropped", mid, old_mkt.asset, old_mkt.timeframe_sec,
-                                {"open_epoch": old_mkt.open_epoch, "close_epoch": old_mkt.close_epoch},
+                                {
+                                    "open_epoch": old_mkt.open_epoch,
+                                    "close_epoch": old_mkt.close_epoch,
+                                    "up_token_id": old_mkt.up_token_id,
+                                    "dn_token_id": old_mkt.dn_token_id,
+                                },
                             )
                 self._active_markets = new_markets
 
