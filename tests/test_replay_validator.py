@@ -541,3 +541,77 @@ class TestRunningBookState:
 
         results = run(date=date, data_dir=tmp_path, stale_sec=60.0)
         assert results[0].verdict == "no_book", f"Expected no_book (stale), got {results[0].verdict}"
+
+
+# ---------------------------------------------------------------------------
+# Fix #52 — --debug-outside-spread flag
+# ---------------------------------------------------------------------------
+
+class TestDebugOutsideSpread:
+    """Tests for print_report(debug_outside_spread=N) — Proposal #52."""
+
+    def _make_outside_result(self, ts: float, market_id: str, side: str,
+                              fill_price: float, best_ask: float) -> ValidationResult:
+        """Build a ValidationResult with verdict='price_outside_spread' and real book context."""
+        fill = FillRecord(
+            ts=ts, market_id=market_id, side=side,
+            price=fill_price, size=10.0, order_id="o1",
+        )
+        book = BookQuote(
+            ts=ts - 0.5, token_id="tok_up",
+            best_bid=best_ask - 0.01, best_ask=best_ask,
+            bids=None, asks=None,
+        )
+        return ValidationResult(fill=fill, token_id="tok_up", book=book,
+                                verdict="price_outside_spread")
+
+    def test_debug_flag_outputs_outside_spread_fills(self, capsys):
+        """With debug_outside_spread=5, print_report emits the table header."""
+        from replay_validator import print_report
+        results = [
+            self._make_outside_result(1775858581.12, "btc-updown-15m-1775858400", "UP", 0.40, 0.31),
+            self._make_outside_result(1775858578.00, "btc-updown-15m-1775858400", "UP", 0.41, 0.36),
+        ]
+        print_report(results, debug_outside_spread=5)
+        captured = capsys.readouterr()
+        assert "outside-spread fills" in captured.out
+        assert "fill_price" in captured.out
+        assert "real_best_ask" in captured.out
+        # Verify the largest-gap fill (delta +0.09) appears before the smaller one (+0.05)
+        idx_large = captured.out.index("0.400")
+        idx_small = captured.out.index("0.410")
+        assert idx_large < idx_small, "Largest gap fill should appear first (sorted descending)"
+
+    def test_debug_flag_zero_does_not_print_table(self, capsys):
+        """With debug_outside_spread=0 (default), the table is NOT printed."""
+        from replay_validator import print_report
+        results = [
+            self._make_outside_result(1775858581.12, "btc-updown-15m-1775858400", "UP", 0.40, 0.31),
+        ]
+        print_report(results, debug_outside_spread=0)
+        captured = capsys.readouterr()
+        assert "outside-spread fills" not in captured.out
+
+    def test_debug_flag_respects_n_limit(self, capsys):
+        """With debug_outside_spread=2, only top 2 fills are shown even if more exist."""
+        from replay_validator import print_report
+        # 5 outside-spread fills with varying gaps
+        results = [
+            self._make_outside_result(1000.0 + i, "mkt-test", "UP", 0.40 + i * 0.01, 0.31)
+            for i in range(5)
+        ]
+        print_report(results, debug_outside_spread=2)
+        captured = capsys.readouterr()
+        # Count the separator lines in the debug table — header + 2 fill rows, not 5
+        lines_with_mkt = [ln for ln in captured.out.splitlines() if "mkt-test" in ln]
+        assert len(lines_with_mkt) == 2, f"Expected 2 fill rows, got {len(lines_with_mkt)}"
+
+    def test_argparse_accepts_debug_outside_spread_flag(self):
+        """The --debug-outside-spread argparse flag is wired correctly in __main__."""
+        import subprocess, sys
+        result = subprocess.run(
+            [sys.executable, "-m", "replay_validator", "--help"],
+            capture_output=True, text=True,
+            cwd=str(pathlib.Path(__file__).parent.parent / "tools"),
+        )
+        assert "--debug-outside-spread" in result.stdout

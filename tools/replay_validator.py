@@ -388,7 +388,7 @@ def validate(
 # Report
 # ---------------------------------------------------------------------------
 
-def print_report(results: list[ValidationResult]) -> None:
+def print_report(results: list[ValidationResult], debug_outside_spread: int = 0) -> None:
     total = len(results)
     if total == 0:
         print("No fills found.")
@@ -429,6 +429,31 @@ def print_report(results: list[ValidationResult]) -> None:
     print(f"Estimated phantom capital deployed: ${phantom_cost:.2f}")
     print(f"Estimated realistic capital deployed: ${real_cost:.2f}")
 
+    # Debug: dump top N outside-spread fills with book context
+    if debug_outside_spread > 0:
+        outside_results = [
+            r for r in results
+            if r.verdict == "price_outside_spread" and r.book is not None
+        ]
+        # Sort by descending gap (fill_price - best_ask)
+        outside_results.sort(
+            key=lambda r: r.fill.price - r.book.best_ask,
+            reverse=True,
+        )
+        top_n = outside_results[:debug_outside_spread]
+        print()
+        print(f"Top {debug_outside_spread} outside-spread fills:")
+        header = f"{'ts':<18} {'market_id':<32} {'side':<5} {'fill_price':<11} {'real_best_ask':<14} {'delta'}"
+        print(header)
+        print("-" * len(header))
+        for r in top_n:
+            delta = r.fill.price - r.book.best_ask
+            sign = "+" if delta >= 0 else ""
+            print(
+                f"{r.fill.ts:<18.2f} {r.fill.market_id:<32} {r.fill.side:<5} "
+                f"{r.fill.price:<11.3f} {r.book.best_ask:<14.3f} {sign}{delta:.3f}"
+            )
+
 
 # ---------------------------------------------------------------------------
 # Main entry point
@@ -439,6 +464,7 @@ def run(
     data_dir: pathlib.Path,
     max_delta_sec: float = 2.0,
     stale_sec: float = 60.0,
+    debug_outside_spread: int = 0,
 ) -> list[ValidationResult]:
     """Run the replay validator for a given date.
 
@@ -447,6 +473,7 @@ def run(
         data_dir: path to the data/ directory
         max_delta_sec: kept for API compatibility; actual staleness threshold is stale_sec
         stale_sec: reject quotes older than this many seconds before the fill
+        debug_outside_spread: if > 0, print the top N outside-spread fills with book context
 
     Returns:
         List of ValidationResult objects (for programmatic use).
@@ -501,7 +528,7 @@ def run(
     results = validate(fills, market_token_map, book_index, max_delta_sec, stale_sec=stale_sec)
 
     print()
-    print_report(results)
+    print_report(results, debug_outside_spread=debug_outside_spread)
     return results
 
 
@@ -523,10 +550,15 @@ if __name__ == "__main__":
         "--stale-sec", type=float, default=60.0,
         help="Reject book quotes older than this many seconds before the fill (default: 60)"
     )
+    parser.add_argument(
+        "--debug-outside-spread", type=int, default=0, metavar="N",
+        help="Print the top N outside-spread fills with (ts, market_id, side, fill_price, real_best_ask, delta)"
+    )
     args = parser.parse_args()
     run(
         date=args.date,
         data_dir=pathlib.Path(args.data_dir),
         max_delta_sec=args.max_delta_sec,
         stale_sec=args.stale_sec,
+        debug_outside_spread=args.debug_outside_spread,
     )
