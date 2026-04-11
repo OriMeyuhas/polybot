@@ -1,0 +1,169 @@
+{
+  "config_name": "baseline_current",
+  "config": {
+    "fv_gate_enabled": false,
+    "fv_gate_certainty_threshold": 0.8,
+    "directional_budget_cap": 20.0,
+    "fv_cancel_enabled": true,
+    "fv_cancel_certainty_threshold": 0.75,
+    "one_sided_abort_enabled": true,
+    "one_sided_abort_cost_pct": 0.01,
+    "one_sided_abort_ratio": 3.0,
+    "rungs": 10,
+    "spacing": 0.01,
+    "width": 0.1,
+    "position_size_fraction": 0.05,
+    "max_pair_cost": 0.98,
+    "size_skew": 2.0,
+    "trend_filter_enabled": false,
+    "trend_filter_window_sec": 300,
+    "trend_filter_threshold_pct": 0.004,
+    "bankroll": 500.0,
+    "maker_fee_rate": 0.0,
+    "vol_window_sec": 300,
+    "vol_fallback_annual": 0.5,
+    "vol_min_samples": 30,
+    "name": "baseline_current"
+  },
+  "markets_simulated": 122,
+  "markets_with_outcome": 122,
+  "book_coverage_rate": 1.0,
+  "total_pnl": 65.962,
+  "mean_pnl_per_market": 0.5407,
+  "win_rate": 0.3852,
+  "paired_rate": 0.5738,
+  "one_sided_rate": 0.418,
+  "no_fill_rate": 0.0082,
+  "fv_blocked_rate": 0.0,
+  "fv_accuracy": 0.5574,
+  "max_loss": -12.552,
+  "max_gain": 130.066,
+  "max_drawdown_pct": 0.852,
+  "sharpe_like": 0.0358,
+  "calibration_table": {
+    "0.50-0.60": {
+      "n": 122,
+      "win_rate": 0.5574
+    },
+    "0.60-0.70": {
+      "n": 0,
+      "win_rate": null
+    },
+    "0.70-0.80": {
+      "n": 0,
+      "win_rate": null
+    },
+    "0.80-0.90": {
+      "n": 0,
+      "win_rate": null
+    },
+    "0.90-1.00": {
+      "n": 0,
+      "win_rate": null
+    }
+  },
+  "per_hour_pnl": {
+    "0": 6.759,
+    "1": 29.655,
+    "2": -22.597,
+    "3": -27.881,
+    "4": -10.617,
+    "5": 8.262,
+    "6": -6.275,
+    "7": -3.635,
+    "8": -13.358,
+    "9": -24.955,
+    "10": -15.603,
+    "11": -13.203,
+    "12": 3.034,
+    "13": -8.679,
+    "14": -18.287,
+    "15": 121.767,
+    "16": 28.609,
+    "17": 13.242,
+    "18": 11.295,
+    "19": 13.659,
+    "20": -25.101,
+    "21": 10.297,
+    "22": 10.084,
+    "23": -0.51
+  },
+  "per_hour_count": {
+    "0": 4,
+    "1": 4,
+    "2": 4,
+    "3": 4,
+    "4": 4,
+    "5": 4,
+    "6": 4,
+    "7": 4,
+    "8": 4,
+    "9": 4,
+    "10": 4,
+    "11": 4,
+    "12": 4,
+    "13": 4,
+    "14": 4,
+    "15": 5,
+    "16": 8,
+    "17": 8,
+    "18": 8,
+    "19": 8,
+    "20": 8,
+    "21": 8,
+    "22": 5,
+    "23": 4
+  },
+  "worst_markets": [
+    {
+      "market_id": "btc-updown-15m-1775916000",
+      "pnl": -12.552,
+      "outcome": "UP",
+      "paired": false,
+      "up_qty": 0,
+      "dn_qty": 20.7,
+      "has_book_data": true,
+      "reason": "aborted"
+    },
+    {
+      "market_id": "btc-updown-15m-1775929500",
+      "pnl": -12.525,
+      "outcome": "DOWN",
+      "paired": false,
+      "up_qty": 35.1,
+      "dn_qty": 0,
+      "has_book_data": true,
+      "reason": "aborted"
+    },
+    {
+      "market_id": "btc-updown-15m-1775881800",
+      "pnl": -12.518,
+      "outcome": "UP",
+      "paired": false,
+      "up_qty": 0,
+      "dn_qty": 32.1,
+      "has_book_data": true,
+      "reason": "aborted"
+    },
+    {
+      "market_id": "btc-updown-15m-1775898900",
+      "pnl": -12.518,
+      "outcome": "UP",
+      "paired": false,
+      "up_qty": 0,
+      "dn_qty": 32.1,
+      "has_book_data": true,
+      "reason": "aborted"
+    },
+    {
+      "market_id": "btc-updown-15m-1775873700",
+      "pnl": -12.517,
+      "outcome": "UP",
+      "paired": false,
+      "up_qty": 0,
+      "dn_qty": 27.7,
+      "has_book_data": true,
+      "reason": "aborted"
+    }
+  ]
+}

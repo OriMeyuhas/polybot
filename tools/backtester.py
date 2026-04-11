@@ -427,11 +427,11 @@ def load_market_windows(
     """Load market windows for the given date range.
 
     Combines:
-    - market_event_log for open/close epochs
+    - market_event_log for open/close epochs AND token IDs (preferred)
     - settlement_log for outcomes
     """
     # Step 1: Build market window registry from market_event_log
-    market_meta: dict[str, dict] = {}  # market_id -> {open, close}
+    market_meta: dict[str, dict] = {}  # market_id -> {open, close, up_token, dn_token}
     for date in dates:
         event_log = data_dir / f"market_event_log_{date}.jsonl"
         if not event_log.exists():
@@ -452,8 +452,19 @@ def load_market_windows(
                 meta = obj.get("metadata", {})
                 open_ep = meta.get("open_epoch", 0)
                 close_ep = meta.get("close_epoch", 0)
+                up_tok_full = meta.get("up_token_id", "")
+                dn_tok_full = meta.get("dn_token_id", "")
                 if mid not in market_meta:
-                    market_meta[mid] = {"open": open_ep, "close": close_ep}
+                    market_meta[mid] = {
+                        "open": open_ep,
+                        "close": close_ep,
+                        "up_token": str(up_tok_full)[:20] if up_tok_full else None,
+                        "dn_token": str(dn_tok_full)[:20] if dn_tok_full else None,
+                    }
+                elif up_tok_full and not market_meta[mid].get("up_token"):
+                    # Update token IDs if discovered event had them
+                    market_meta[mid]["up_token"] = str(up_tok_full)[:20]
+                    market_meta[mid]["dn_token"] = str(dn_tok_full)[:20]
 
     # Step 2: Load outcomes from settlement_log
     outcomes: dict[str, str] = {}
@@ -484,13 +495,16 @@ def load_market_windows(
         # Only include markets that settled in our date range
         if mid not in outcomes:
             continue
+        # Use token IDs from market_event_log metadata if available (ground truth)
+        up_tok = meta.get("up_token")
+        dn_tok = meta.get("dn_token")
         w = MarketWindow(
             market_id=mid,
             open_epoch=open_ep,
             close_epoch=close_ep,
             outcome=outcomes.get(mid),
-            up_token_id=None,  # filled by map_tokens_to_markets
-            dn_token_id=None,
+            up_token_id=up_tok,  # may be None; map_tokens_to_markets fills rest
+            dn_token_id=dn_tok,
             pnl_actual=actual_pnls.get(mid, 0.0),
         )
         windows.append(w)
@@ -540,6 +554,17 @@ def map_tokens_to_markets(
                 return
         except Exception as e:
             logger.warning("Token map cache load failed: %s", e)
+
+    # Count markets that already have tokens from metadata (ground truth)
+    already_mapped = sum(1 for w in windows if w.up_token_id and w.dn_token_id)
+    needs_mapping = [w for w in windows if not w.up_token_id or not w.dn_token_id]
+    logger.info(
+        "Token mapping: %d already have tokens from metadata, %d need heuristic mapping",
+        already_mapped, len(needs_mapping),
+    )
+    if not needs_mapping:
+        logger.info("All markets have token IDs from metadata — skipping book_log scan")
+        return
 
     logger.info("Building token->market mapping by scanning book_log condition_ids...")
 
@@ -784,7 +809,8 @@ def _apply_token_map_with_window_map(
         w = mid_to_window.get(window.market_id)
         if w is None:
             continue
-        if up_dn is not None:
+        if up_dn is not None and not w.up_token_id:
+            # Don't overwrite ground-truth tokens from metadata
             up_token, dn_token = up_dn
             w.up_token_id = up_token
             w.dn_token_id = dn_token

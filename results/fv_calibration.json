@@ -1,0 +1,528 @@
+{
+  "metadata": {
+    "start_date": "2026-04-02",
+    "end_date": "2026-04-11",
+    "total_settlements": 749,
+    "valid_results": 122,
+    "no_data_count": 627,
+    "dome_fetch_count": 0,
+    "local_data_count": 122,
+    "outcome_distribution": {
+      "UP": 393,
+      "DOWN": 356
+    }
+  },
+  "overall_accuracy_at_open": 0.5574,
+  "overall_accuracy_at_close": 0.9754,
+  "high_cert_accuracy_at_open": null,
+  "high_cert_accuracy_at_close": 0.9826,
+  "overall_accuracy": 0.5574,
+  "high_cert_accuracy": null,
+  "calibration_table": {
+    "by_cert_at_open": {
+      "fine_grained": {
+        "0.50-0.55": {
+          "n": 122,
+          "wins": 68,
+          "win_rate": 0.5574,
+          "ci_lo_95": 0.4688,
+          "ci_hi_95": 0.6424,
+          "significant": false
+        },
+        "0.55-0.60": {
+          "n": 0,
+          "wins": 0,
+          "win_rate": null,
+          "ci_lo_95": null,
+          "ci_hi_95": null,
+          "significant": false
+        },
+        "0.60-0.65": {
+          "n": 0,
+          "wins": 0,
+          "win_rate": null,
+          "ci_lo_95": null,
+          "ci_hi_95": null,
+          "significant": false
+        },
+        "0.65-0.70": {
+          "n": 0,
+          "wins": 0,
+          "win_rate": null,
+          "ci_lo_95": null,
+          "ci_hi_95": null,
+          "significant": false
+        },
+        "0.70-0.75": {
+          "n": 0,
+          "wins": 0,
+          "win_rate": null,
+          "ci_lo_95": null,
+          "ci_hi_95": null,
+          "significant": false
+        },
+        "0.75-0.80": {
+          "n": 0,
+          "wins": 0,
+          "win_rate": null,
+          "ci_lo_95": null,
+          "ci_hi_95": null,
+          "significant": false
+        },
+        "0.80-0.85": {
+          "n": 0,
+          "wins": 0,
+          "win_rate": null,
+          "ci_lo_95": null,
+          "ci_hi_95": null,
+          "significant": false
+        },
+        "0.85-0.90": {
+          "n": 0,
+          "wins": 0,
+          "win_rate": null,
+          "ci_lo_95": null,
+          "ci_hi_95": null,
+          "significant": false
+        },
+        "0.90-0.95": {
+          "n": 0,
+          "wins": 0,
+          "win_rate": null,
+          "ci_lo_95": null,
+          "ci_hi_95": null,
+          "significant": false
+        },
+        "0.95-1.00": {
+          "n": 0,
+          "wins": 0,
+          "win_rate": null,
+          "ci_lo_95": null,
+          "ci_hi_95": null,
+          "significant": false
+        }
+      },
+      "coarse": {
+        "0.50-0.60": {
+          "n": 122,
+          "wins": 68,
+          "win_rate": 0.5574,
+          "ci_lo_95": 0.4688,
+          "ci_hi_95": 0.6424,
+          "significant": false
+        },
+        "0.60-0.70": {
+          "n": 0,
+          "wins": 0,
+          "win_rate": null,
+          "ci_lo_95": null,
+          "ci_hi_95": null,
+          "significant": false
+        },
+        "0.70-0.80": {
+          "n": 0,
+          "wins": 0,
+          "win_rate": null,
+          "ci_lo_95": null,
+          "ci_hi_95": null,
+          "significant": false
+        },
+        "0.80-0.90": {
+          "n": 0,
+          "wins": 0,
+          "win_rate": null,
+          "ci_lo_95": null,
+          "ci_hi_95": null,
+          "significant": false
+        },
+        "0.90-1.00": {
+          "n": 0,
+          "wins": 0,
+          "win_rate": null,
+          "ci_lo_95": null,
+          "ci_hi_95": null,
+          "significant": false
+        }
+      },
+      "description": "FV signal at window open (entry signal for ladder posting)"
+    },
+    "by_cert_at_close": {
+      "fine_grained": {
+        "0.50-0.55": {
+          "n": 7,
+          "wins": 6,
+          "win_rate": 0.8571,
+          "ci_lo_95": 0.4869,
+          "ci_hi_95": 0.9743,
+          "significant": false
+        },
+        "0.55-0.60": {
+          "n": 0,
+          "wins": 0,
+          "win_rate": null,
+          "ci_lo_95": null,
+          "ci_hi_95": null,
+          "significant": false
+        },
+        "0.60-0.65": {
+          "n": 0,
+          "wins": 0,
+          "win_rate": null,
+          "ci_lo_95": null,
+          "ci_hi_95": null,
+          "significant": false
+        },
+        "0.65-0.70": {
+          "n": 0,
+          "wins": 0,
+          "win_rate": null,
+          "ci_lo_95": null,
+          "ci_hi_95": null,
+          "significant": false
+        },
+        "0.70-0.75": {
+          "n": 0,
+          "wins": 0,
+          "win_rate": null,
+          "ci_lo_95": null,
+          "ci_hi_95": null,
+          "significant": false
+        },
+        "0.75-0.80": {
+          "n": 0,
+          "wins": 0,
+          "win_rate": null,
+          "ci_lo_95": null,
+          "ci_hi_95": null,
+          "significant": false
+        },
+        "0.80-0.85": {
+          "n": 0,
+          "wins": 0,
+          "win_rate": null,
+          "ci_lo_95": null,
+          "ci_hi_95": null,
+          "significant": false
+        },
+        "0.85-0.90": {
+          "n": 0,
+          "wins": 0,
+          "win_rate": null,
+          "ci_lo_95": null,
+          "ci_hi_95": null,
+          "significant": false
+        },
+        "0.90-0.95": {
+          "n": 0,
+          "wins": 0,
+          "win_rate": null,
+          "ci_lo_95": null,
+          "ci_hi_95": null,
+          "significant": false
+        },
+        "0.95-1.00": {
+          "n": 115,
+          "wins": 113,
+          "win_rate": 0.9826,
+          "ci_lo_95": 0.9388,
+          "ci_hi_95": 0.9952,
+          "significant": true
+        }
+      },
+      "coarse": {
+        "0.50-0.60": {
+          "n": 7,
+          "wins": 6,
+          "win_rate": 0.8571,
+          "ci_lo_95": 0.4869,
+          "ci_hi_95": 0.9743,
+          "significant": false
+        },
+        "0.60-0.70": {
+          "n": 0,
+          "wins": 0,
+          "win_rate": null,
+          "ci_lo_95": null,
+          "ci_hi_95": null,
+          "significant": false
+        },
+        "0.70-0.80": {
+          "n": 0,
+          "wins": 0,
+          "win_rate": null,
+          "ci_lo_95": null,
+          "ci_hi_95": null,
+          "significant": false
+        },
+        "0.80-0.90": {
+          "n": 0,
+          "wins": 0,
+          "win_rate": null,
+          "ci_lo_95": null,
+          "ci_hi_95": null,
+          "significant": false
+        },
+        "0.90-1.00": {
+          "n": 115,
+          "wins": 113,
+          "win_rate": 0.9826,
+          "ci_lo_95": 0.9388,
+          "ci_hi_95": 0.9952,
+          "significant": true
+        }
+      },
+      "description": "FV signal at window close (retrospective maximum signal)"
+    },
+    "by_max_cert": {
+      "fine_grained": {
+        "0.50-0.55": {
+          "n": 6,
+          "wins": 6,
+          "win_rate": 1.0,
+          "ci_lo_95": 0.6097,
+          "ci_hi_95": 1.0,
+          "significant": true
+        },
+        "0.55-0.60": {
+          "n": 1,
+          "wins": 1,
+          "win_rate": 1.0,
+          "ci_lo_95": 0.2065,
+          "ci_hi_95": 1.0,
+          "significant": false
+        },
+        "0.60-0.65": {
+          "n": 0,
+          "wins": 0,
+          "win_rate": null,
+          "ci_lo_95": null,
+          "ci_hi_95": null,
+          "significant": false
+        },
+        "0.65-0.70": {
+          "n": 0,
+          "wins": 0,
+          "win_rate": null,
+          "ci_lo_95": null,
+          "ci_hi_95": null,
+          "significant": false
+        },
+        "0.70-0.75": {
+          "n": 0,
+          "wins": 0,
+          "win_rate": null,
+          "ci_lo_95": null,
+          "ci_hi_95": null,
+          "significant": false
+        },
+        "0.75-0.80": {
+          "n": 0,
+          "wins": 0,
+          "win_rate": null,
+          "ci_lo_95": null,
+          "ci_hi_95": null,
+          "significant": false
+        },
+        "0.80-0.85": {
+          "n": 0,
+          "wins": 0,
+          "win_rate": null,
+          "ci_lo_95": null,
+          "ci_hi_95": null,
+          "significant": false
+        },
+        "0.85-0.90": {
+          "n": 0,
+          "wins": 0,
+          "win_rate": null,
+          "ci_lo_95": null,
+          "ci_hi_95": null,
+          "significant": false
+        },
+        "0.90-0.95": {
+          "n": 0,
+          "wins": 0,
+          "win_rate": null,
+          "ci_lo_95": null,
+          "ci_hi_95": null,
+          "significant": false
+        },
+        "0.95-1.00": {
+          "n": 115,
+          "wins": 113,
+          "win_rate": 0.9826,
+          "ci_lo_95": 0.9388,
+          "ci_hi_95": 0.9952,
+          "significant": true
+        }
+      },
+      "coarse": {
+        "0.50-0.60": {
+          "n": 7,
+          "wins": 7,
+          "win_rate": 1.0,
+          "ci_lo_95": 0.6457,
+          "ci_hi_95": 1.0,
+          "significant": true
+        },
+        "0.60-0.70": {
+          "n": 0,
+          "wins": 0,
+          "win_rate": null,
+          "ci_lo_95": null,
+          "ci_hi_95": null,
+          "significant": false
+        },
+        "0.70-0.80": {
+          "n": 0,
+          "wins": 0,
+          "win_rate": null,
+          "ci_lo_95": null,
+          "ci_hi_95": null,
+          "significant": false
+        },
+        "0.80-0.90": {
+          "n": 0,
+          "wins": 0,
+          "win_rate": null,
+          "ci_lo_95": null,
+          "ci_hi_95": null,
+          "significant": false
+        },
+        "0.90-1.00": {
+          "n": 115,
+          "wins": 113,
+          "win_rate": 0.9826,
+          "ci_lo_95": 0.9388,
+          "ci_hi_95": 0.9952,
+          "significant": true
+        }
+      },
+      "description": "Peak FV certainty seen during the window"
+    },
+    "fine_grained": {
+      "0.50-0.55": {
+        "n": 122,
+        "wins": 68,
+        "win_rate": 0.5574,
+        "ci_lo_95": 0.4688,
+        "ci_hi_95": 0.6424,
+        "significant": false
+      },
+      "0.55-0.60": {
+        "n": 0,
+        "wins": 0,
+        "win_rate": null,
+        "ci_lo_95": null,
+        "ci_hi_95": null,
+        "significant": false
+      },
+      "0.60-0.65": {
+        "n": 0,
+        "wins": 0,
+        "win_rate": null,
+        "ci_lo_95": null,
+        "ci_hi_95": null,
+        "significant": false
+      },
+      "0.65-0.70": {
+        "n": 0,
+        "wins": 0,
+        "win_rate": null,
+        "ci_lo_95": null,
+        "ci_hi_95": null,
+        "significant": false
+      },
+      "0.70-0.75": {
+        "n": 0,
+        "wins": 0,
+        "win_rate": null,
+        "ci_lo_95": null,
+        "ci_hi_95": null,
+        "significant": false
+      },
+      "0.75-0.80": {
+        "n": 0,
+        "wins": 0,
+        "win_rate": null,
+        "ci_lo_95": null,
+        "ci_hi_95": null,
+        "significant": false
+      },
+      "0.80-0.85": {
+        "n": 0,
+        "wins": 0,
+        "win_rate": null,
+        "ci_lo_95": null,
+        "ci_hi_95": null,
+        "significant": false
+      },
+      "0.85-0.90": {
+        "n": 0,
+        "wins": 0,
+        "win_rate": null,
+        "ci_lo_95": null,
+        "ci_hi_95": null,
+        "significant": false
+      },
+      "0.90-0.95": {
+        "n": 0,
+        "wins": 0,
+        "win_rate": null,
+        "ci_lo_95": null,
+        "ci_hi_95": null,
+        "significant": false
+      },
+      "0.95-1.00": {
+        "n": 0,
+        "wins": 0,
+        "win_rate": null,
+        "ci_lo_95": null,
+        "ci_hi_95": null,
+        "significant": false
+      }
+    },
+    "coarse": {
+      "0.50-0.60": {
+        "n": 122,
+        "wins": 68,
+        "win_rate": 0.5574,
+        "ci_lo_95": 0.4688,
+        "ci_hi_95": 0.6424,
+        "significant": false
+      },
+      "0.60-0.70": {
+        "n": 0,
+        "wins": 0,
+        "win_rate": null,
+        "ci_lo_95": null,
+        "ci_hi_95": null,
+        "significant": false
+      },
+      "0.70-0.80": {
+        "n": 0,
+        "wins": 0,
+        "win_rate": null,
+        "ci_lo_95": null,
+        "ci_hi_95": null,
+        "significant": false
+      },
+      "0.80-0.90": {
+        "n": 0,
+        "wins": 0,
+        "win_rate": null,
+        "ci_lo_95": null,
+        "ci_hi_95": null,
+        "significant": false
+      },
+      "0.90-1.00": {
+        "n": 0,
+        "wins": 0,
+        "win_rate": null,
+        "ci_lo_95": null,
+        "ci_hi_95": null,
+        "significant": false
+      }
+    }
+  }
+}
