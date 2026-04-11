@@ -1040,8 +1040,8 @@ class TestSimulateMarketDome:
         # Expect some fills since rung prices are below ask
         assert result.outcome == "UP"
 
-    def test_no_fill_when_bid_below_ask(self):
-        """No fills when all our rung prices are far below market ask."""
+    def test_all_passive_orders_fill_in_dome_mode(self):
+        """Dome mode fills ALL passive orders (market sweeps ladder in 15m window)."""
         cfg = BacktestConfig(
             bankroll=500.0,
             position_size_fraction=0.05,
@@ -1053,12 +1053,12 @@ class TestSimulateMarketDome:
             fv_cancel_enabled=False,
             one_sided_abort_enabled=False,
         )
-        # Market ask is very high (0.95), our rungs will be around 0.80 -> no fill
-        dome = self._make_dome(up_ask=0.95, dn_ask=0.95, outcome="UP")
+        # Market ask is moderate — our rungs are all below ask but still fill
+        dome = self._make_dome(up_ask=0.55, dn_ask=0.55, outcome="UP")
         result = simulate_market_dome(dome, cfg)
-        assert result.up_qty == 0.0
-        assert result.dn_qty == 0.0
-        assert result.pnl == 0.0
+        # All rungs should fill in dome mode (passive mid-window fill assumption)
+        assert result.up_qty > 0.0
+        assert result.dn_qty > 0.0
 
     def test_pnl_positive_for_paired_win(self):
         """Paired win produces positive PnL when pair_cost < 1.0."""
