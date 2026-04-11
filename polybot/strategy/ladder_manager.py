@@ -986,19 +986,29 @@ class LadderManager:
             # rate on 452 zero-fill one-sided windows). Only block posting when very confident.
             # FV cancel (0.60) still cleans up AFTER posting. Late-window guard (0.60) unchanged.
             cert = fv_certainty(fair_up) if self.cfg.fair_value_enabled else 0.0
+            # Hard cap on directional budget (Proposal #53): when FV gate or spot skip forces
+            # 100% of budget onto one side, clamp to directional_budget_cap. This limits
+            # worst-case adverse selection loss per window to ≤$20 (from -$27/-$30 outliers).
+            # Orthogonal to is_directional flag — cap operates unconditionally on one-sided posts.
+            dir_cap = self.cfg.directional_budget_cap
             if cert >= 0.80:
+                capped_budget = min(budget, dir_cap)
                 if fair_up > 0.5:
                     # UP is winning — don't post DN
-                    budget_up = budget
+                    budget_up = capped_budget
                     budget_dn = 0.0
-                    logger.info("FV GATE: %s certainty %.0f%% UP — skipping DN side",
-                                market.market_id, cert * 100)
+                    logger.info(
+                        "FV GATE: %s certainty %.0f%% UP — DN skipped, UP budget=$%.2f (cap=$%.2f)",
+                        market.market_id, cert * 100, capped_budget, dir_cap,
+                    )
                 else:
                     # DN is winning — don't post UP
                     budget_up = 0.0
-                    budget_dn = budget
-                    logger.info("FV GATE: %s certainty %.0f%% DN — skipping UP side",
-                                market.market_id, cert * 100)
+                    budget_dn = capped_budget
+                    logger.info(
+                        "FV GATE: %s certainty %.0f%% DN — UP skipped, DN budget=$%.2f (cap=$%.2f)",
+                        market.market_id, cert * 100, capped_budget, dir_cap,
+                    )
             else:
                 # Spot-delta based skew (mild, defensive only)
                 reduce_thresh = self.cfg.spot_delta_reduce_threshold
@@ -1006,14 +1016,17 @@ class LadderManager:
                 abs_delta = abs(spot_delta)
 
                 if abs_delta >= skip_thresh:
+                    capped_budget = min(budget, dir_cap)
                     if spot_delta > 0:
-                        budget_up = budget
+                        budget_up = capped_budget
                         budget_dn = 0.0
                     else:
                         budget_up = 0.0
-                        budget_dn = budget
-                    logger.info("SPOT SKIP: %s delta=%.3f%% — skipping %s side",
-                                market.market_id, spot_delta * 100, "DN" if spot_delta > 0 else "UP")
+                        budget_dn = capped_budget
+                    logger.info(
+                        "SPOT SKIP: %s delta=%.3f%% — one-side budget=$%.2f (cap=$%.2f)",
+                        market.market_id, spot_delta * 100, capped_budget, dir_cap,
+                    )
                 elif abs_delta >= reduce_thresh:
                     losing_frac = 0.5 * (1.0 - (abs_delta - reduce_thresh) / (skip_thresh - reduce_thresh))
                     winning_frac = 1.0 - losing_frac

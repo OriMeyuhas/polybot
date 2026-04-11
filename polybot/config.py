@@ -200,6 +200,13 @@ class BotConfig:
     spot_gate_force_buy_threshold: float = 0.003 # 0.30% — block force-buy when spot against
     spot_loss_cap_multiplier: float = 0.50       # tighten loss cap when spot confirms loss
 
+    # Directional post hard cap — prevents runaway adverse selection on FV-gated
+    # one-sided ladders. When FV gate or spot skip forces 100% of budget onto one
+    # side, cap that budget at this absolute dollar amount regardless of bankroll.
+    # Sized from 2026-04-11 outlier analysis: $20 optimum on 49-stl session.
+    # Proposal #53.
+    directional_budget_cap: float = 20.0
+
     def get_ladder_params(self, timeframe_sec: int, current_bankroll: float | None = None) -> LadderParams:
         """Return ladder parameters tuned for the given timeframe.
 
@@ -461,6 +468,7 @@ def load_bot_config() -> BotConfig:
         spot_delta_skip_threshold=float(os.getenv("SPOT_DELTA_SKIP_THRESHOLD", "0.005")),
         spot_gate_force_buy_threshold=float(os.getenv("SPOT_GATE_FORCE_BUY_THRESHOLD", "0.003")),
         spot_loss_cap_multiplier=float(os.getenv("SPOT_LOSS_CAP_MULTIPLIER", "0.50")),
+        directional_budget_cap=float(os.getenv("DIRECTIONAL_BUDGET_CAP", "20.0")),
     )
 
 

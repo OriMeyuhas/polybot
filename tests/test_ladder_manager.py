@@ -772,3 +772,242 @@ class TestOneSidedAbort:
             mgr.process_paper_fills(paper_fills)
             # check_one_sided_abort must have been called with the market_id of the fill
             mock_abort.assert_called_once_with(mid)
+
+
+# ── Proposal #53: Directional budget cap tests ───────────────────────────────
+
+import time as _time_mod
+import os
+
+
+def _make_dir_cap_manager(directional_budget_cap=20.0, bankroll=540.0, fair_value_enabled=True):
+    """Build a LadderManager configured with specified directional_budget_cap and bankroll."""
+    from polybot.strategy.ladder_manager import LadderManager
+    from polybot.strategy.position_manager import PositionManager
+    from polybot.risk_manager import RiskManager
+
+    cfg = BotConfig(
+        dry_run=True,
+        bankroll=bankroll,
+        ladder_rungs=10,
+        ladder_spacing=0.01,
+        ladder_width=0.20,
+        ladder_size_skew=1.0,
+        max_pair_cost=0.93,
+        position_size_fraction=0.10,
+        reprice_threshold=0.03,
+        maker_fee_rate=0.0,
+        batch_order_size=15,
+        no_trade_final_sec=60,
+        imbalance_min_heavy_fills=1,
+        boost_elapsed_pct=0.20,
+        force_buy_elapsed_pct=0.70,
+        force_buy_max_pair_cost=0.83,
+        spot_delta_reduce_threshold=0.0015,
+        spot_delta_skip_threshold=0.005,
+        spot_gate_force_buy_threshold=0.003,
+        spot_loss_cap_multiplier=0.50,
+        fair_value_enabled=fair_value_enabled,
+        vol_window_sec=300,
+        vol_fallback_annual=0.50,
+        vol_min_samples=30,
+        skew_phase_pct=0.30,
+        directional_phase_pct=0.70,
+        certainty_exit_threshold=0.30,
+        certainty_hold_threshold=0.95,
+        certainty_directional_threshold=0.92,
+        directional_max_ask=0.75,
+        max_budget_skew=0.80,
+        exit_enabled=True,
+        exit_elapsed_pct=0.55,
+        exit_min_loss_ratio=3.0,
+        exit_target_price=0.35,
+        exit_min_price=0.15,
+        reactive_pairing_enabled=True,
+        reactive_chase_width=0.10,
+        reactive_chase_budget_pct=0.50,
+        inventory_skew_enabled=True,
+        inventory_skew_max=0.60,
+        directional_budget_cap=directional_budget_cap,
+    )
+
+    executor = MagicMock()
+    executor.get_best_ask.return_value = 0.45
+    executor.get_midpoint.return_value = 0.44
+    executor.get_open_orders.return_value = []
+    # Return a fixed list of mock order records — budget is what we passed to build_ladder_rungs
+    executor.place_batch_limit_buys.side_effect = lambda orders: [
+        MagicMock(order_id=f"ord-{i}", status="open", price=od["price"], size=od["size"])
+        for i, od in enumerate(orders)
+    ]
+    executor.cancel_batch.return_value = []
+
+    tracker = MagicMock()
+    tracker.orders = {}
+    tracker.filled_count.return_value = 0
+    tracker.filled_qty.return_value = 0.0
+    tracker.filled_cost.return_value = 0.0
+    tracker.get_resting.return_value = []
+    tracker.get_resting_side.return_value = []
+    tracker.cancel_side.return_value = []
+    tracker.cancel_market.return_value = []
+    tracker.has_orders.return_value = False
+    tracker.flush_uncredited.return_value = []
+    tracker.total_count.return_value = 0
+
+    pm = PositionManager(cfg, bankroll)
+    risk = MagicMock()
+    risk.is_halted.return_value = False
+    risk.can_open_position.return_value = True
+    risk.exposure_factor.return_value = 1.0
+
+    tick_cache = MagicMock()
+    tick_cache.get_tick_size.return_value = 0.01
+
+    return LadderManager(cfg, executor, tracker, pm, risk, tick_cache)
+
+
+def _dir_cap_market(market_id="btc-15m-dircap"):
+    now = int(_time_mod.time())
+    return MarketWindow(
+        market_id=market_id,
+        condition_id="0xdircap",
+        asset="BTC",
+        timeframe_sec=900,
+        up_token_id="tok_up",
+        dn_token_id="tok_dn",
+        open_epoch=now - 60,
+        close_epoch=now + 840,
+    )
+
+
+def _total_budget_posted(lm):
+    """Sum price * size for all orders passed to place_batch_limit_buys."""
+    total = 0.0
+    for call in lm.executor.place_batch_limit_buys.call_args_list:
+        order_dicts = call.args[0] if call.args else call.kwargs.get('orders', [])
+        for od in order_dicts:
+            if isinstance(od, dict):
+                total += od["price"] * od["size"]
+    return total
+
+
+def _budget_by_token(lm, token_id):
+    """Sum price * size for orders targeting a specific token_id."""
+    total = 0.0
+    for call in lm.executor.place_batch_limit_buys.call_args_list:
+        order_dicts = call.args[0] if call.args else call.kwargs.get('orders', [])
+        for od in order_dicts:
+            if isinstance(od, dict) and od.get("token_id") == token_id:
+                total += od["price"] * od["size"]
+    return total
+
+
+class TestDirectionalBudgetCap:
+    """Proposal #53: directional_budget_cap clips one-sided FV gate / spot skip posts."""
+
+    def test_directional_budget_capped_at_20_fv_gate_dn(self):
+        """FV gate fires cert=88% DN (fair_up=0.12) with large bankroll budget.
+        DN budget should be clamped to directional_budget_cap=20, not full budget."""
+        # At bankroll=540, position_size_fraction=0.10, budget=54. Cap at 20.
+        lm = _make_dir_cap_manager(directional_budget_cap=20.0, bankroll=540.0)
+        market = _dir_cap_market()
+        # fair_up=0.12 -> cert=0.88 >= 0.80 -> FV gate fires, DN side only
+        lm.post_ladder(market, spot_delta=0.0, fair_up=0.12)
+        dn_budget = _budget_by_token(lm, "tok_dn")
+        up_budget = _budget_by_token(lm, "tok_up")
+        # UP side must not be posted (FV gate skips UP when DN is winning)
+        assert up_budget == pytest.approx(0.0, abs=0.01), (
+            f"FV gate DN should post 0 UP budget, got UP={up_budget:.2f}"
+        )
+        # DN budget must not exceed cap
+        assert dn_budget <= 20.0 + 0.05, (  # 0.05 tolerance for rounding
+            f"DN budget {dn_budget:.2f} should be capped at 20.0"
+        )
+        # And it should be close to the cap (not much lower — all budget should be used up to cap)
+        assert dn_budget >= 15.0, (
+            f"DN budget {dn_budget:.2f} should be near the $20 cap (was $54 without cap)"
+        )
+
+    def test_directional_budget_capped_at_20_fv_gate_up(self):
+        """FV gate fires cert=88% UP (fair_up=0.88). UP budget capped at 20."""
+        lm = _make_dir_cap_manager(directional_budget_cap=20.0, bankroll=540.0)
+        market = _dir_cap_market()
+        # fair_up=0.88 -> cert=0.88 >= 0.80 -> FV gate fires, UP side only
+        lm.post_ladder(market, spot_delta=0.0, fair_up=0.88)
+        up_budget = _budget_by_token(lm, "tok_up")
+        dn_budget = _budget_by_token(lm, "tok_dn")
+        assert dn_budget == pytest.approx(0.0, abs=0.01), (
+            f"FV gate UP should post 0 DN budget, got DN={dn_budget:.2f}"
+        )
+        assert up_budget <= 20.0 + 0.05, (
+            f"UP budget {up_budget:.2f} should be capped at 20.0"
+        )
+        assert up_budget >= 15.0, (
+            f"UP budget {up_budget:.2f} should be near the $20 cap"
+        )
+
+    def test_directional_budget_capped_at_20_spot_skip(self):
+        """Spot skip fires (delta > 0.5%) with large bankroll budget.
+        The active side budget should be clamped to directional_budget_cap=20."""
+        lm = _make_dir_cap_manager(directional_budget_cap=20.0, bankroll=540.0,
+                                   fair_value_enabled=False)
+        market = _dir_cap_market()
+        # spot_delta=0.01 (1%) exceeds skip_threshold=0.005 -> UP side only
+        lm.post_ladder(market, spot_delta=0.01, fair_up=0.5)
+        up_budget = _budget_by_token(lm, "tok_up")
+        dn_budget = _budget_by_token(lm, "tok_dn")
+        assert dn_budget == pytest.approx(0.0, abs=0.01), (
+            f"Spot skip UP should post 0 DN budget, got DN={dn_budget:.2f}"
+        )
+        assert up_budget <= 20.0 + 0.05, (
+            f"UP budget {up_budget:.2f} should be capped at 20.0 after spot skip"
+        )
+        assert up_budget >= 15.0, (
+            f"UP budget {up_budget:.2f} should be near the $20 cap"
+        )
+
+    def test_directional_budget_below_cap_unchanged(self):
+        """When natural budget is below cap, it is posted in full (cap is a no-op)."""
+        # bankroll=150 -> position_size_fraction=0.10 -> budget=15, cap=20 -> no clip
+        lm = _make_dir_cap_manager(directional_budget_cap=20.0, bankroll=150.0)
+        market = _dir_cap_market()
+        # FV gate fires with cert=88% DN
+        lm.post_ladder(market, spot_delta=0.0, fair_up=0.12)
+        dn_budget = _budget_by_token(lm, "tok_dn")
+        up_budget = _budget_by_token(lm, "tok_up")
+        assert up_budget == pytest.approx(0.0, abs=0.01)
+        # Budget should be ~15 (uncapped), not clipped to 20 (it's already below)
+        assert dn_budget <= 20.0 + 0.05, "Budget below cap must not be inflated"
+        # At bankroll=150 with fraction=0.15 (micro tier), budget ≥ min_required
+        assert dn_budget >= 1.0, "Budget should still be meaningful"
+
+    def test_balanced_budget_not_capped(self):
+        """Two-sided (balanced) posts are NOT affected by directional_budget_cap.
+        Both UP and DN should get full budget allocation when cert < 0.80."""
+        # At bankroll=540, budget≈54. Cap=20. With cert=50% (neutral), both sides get budget/2=27.
+        lm = _make_dir_cap_manager(directional_budget_cap=20.0, bankroll=540.0)
+        market = _dir_cap_market()
+        # fair_up=0.50 -> cert=50% < 80% -> balanced posting, no cap applies
+        lm.post_ladder(market, spot_delta=0.0, fair_up=0.50)
+        up_budget = _budget_by_token(lm, "tok_up")
+        dn_budget = _budget_by_token(lm, "tok_dn")
+        # Both sides should have budget > 20 (well above the directional cap)
+        assert up_budget > 20.0, (
+            f"Balanced UP budget {up_budget:.2f} should not be capped at 20"
+        )
+        assert dn_budget > 20.0, (
+            f"Balanced DN budget {dn_budget:.2f} should not be capped at 20"
+        )
+
+    def test_config_loads_directional_budget_cap_from_env(self):
+        """BotConfig.directional_budget_cap reads from DIRECTIONAL_BUDGET_CAP env var."""
+        from polybot.config import load_bot_config
+        os.environ["DIRECTIONAL_BUDGET_CAP"] = "25.0"
+        try:
+            cfg = load_bot_config()
+            assert cfg.directional_budget_cap == pytest.approx(25.0), (
+                f"Expected 25.0 from env, got {cfg.directional_budget_cap}"
+            )
+        finally:
+            del os.environ["DIRECTIONAL_BUDGET_CAP"]
