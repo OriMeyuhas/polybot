@@ -786,7 +786,31 @@ class Bot:
         # See: polybot/tasks/lessons.md, researcher imbalance_lock_analysis.md
 
         # Loss cap: cancel remaining orders on one-sided positions exceeding 3% bankroll
-        await asyncio.to_thread(self.ladder_manager.check_loss_cap, self.spot_prices, self.window_open_prices)
+        loss_cap_fires = await asyncio.to_thread(
+            self.ladder_manager.check_loss_cap, self.spot_prices, self.window_open_prices
+        )
+        # Proposal #54: surface LOSS_CAP fires to activity log (previously discarded)
+        for mid in loss_cap_fires:
+            mkt = market_map.get(mid)
+            asset = mkt.asset if mkt is not None else "UNKNOWN"
+            self._record_activity("LOSS_CAP", asset, f"loss cap fired on {mid}")
+
+        # Proposal #54: drain ONE-SIDED ABORT fires queued by check_one_sided_abort
+        for abort in self.ladder_manager._recent_aborts:
+            self._record_activity(
+                "ONE_SIDED_ABORT", abort["asset"],
+                f"one-sided abort: up={abort['up_qty']:.1f} dn={abort['dn_qty']:.1f} "
+                f"cost=${abort['cost']:.2f} on {abort['market_id']}",
+            )
+        self.ladder_manager._recent_aborts.clear()
+
+        # Proposal #54: drain FV CANCEL CIRCUIT BREAKER fires queued by cancel_losing_side_orders
+        for cb in self.ladder_manager._recent_circuit_breaker_fires:
+            self._record_activity(
+                "FV_CIRCUIT_BREAKER", cb["asset"],
+                f"FV cancel circuit breaker: {cb['cancel_count']} cancels in 60s on {cb['market_id']}",
+            )
+        self.ladder_manager._recent_circuit_breaker_fires.clear()
 
         # Boost DISABLED — floods light side with 16-22 rungs after lock, causing 3:1 inversion
         # chase_pair DISABLED — same problem, adds 6+ rungs on top of boost

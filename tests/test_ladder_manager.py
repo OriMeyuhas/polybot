@@ -1011,3 +1011,192 @@ class TestDirectionalBudgetCap:
             )
         finally:
             del os.environ["DIRECTIONAL_BUDGET_CAP"]
+
+
+# ── Proposal #54: Guard telemetry — drain list tests ─────────────────────────
+
+class TestGuardTelemetryDrainLists:
+    """Unit tests for _recent_aborts and _recent_circuit_breaker_fires drain lists
+    on LadderManager (Proposal #54). These verify the plumbing that bot.py drains."""
+
+    def _make_lm_with_state(self, bankroll=500.0):
+        """Make a LadderManager with a real PositionManager and mock everything else."""
+        from polybot.strategy.ladder_manager import LadderManager, LadderState
+        from polybot.strategy.position_manager import PositionManager
+
+        cfg = BotConfig(
+            dry_run=True,
+            bankroll=bankroll,
+            ladder_rungs=6,
+            ladder_spacing=0.01,
+            ladder_width=0.10,
+            ladder_size_skew=1.0,
+            max_pair_cost=0.93,
+            position_size_fraction=0.10,
+            reprice_threshold=0.03,
+            maker_fee_rate=0.0,
+            batch_order_size=15,
+            no_trade_final_sec=60,
+            imbalance_min_heavy_fills=1,
+            boost_elapsed_pct=0.20,
+            force_buy_elapsed_pct=0.70,
+            force_buy_max_pair_cost=0.83,
+            spot_delta_reduce_threshold=0.0015,
+            spot_delta_skip_threshold=0.005,
+            spot_gate_force_buy_threshold=0.003,
+            spot_loss_cap_multiplier=0.50,
+        )
+        executor = MagicMock()
+        executor.cancel_batch.return_value = []
+
+        from polybot.order_tracker import OrderTracker
+        tracker = OrderTracker()
+
+        pm = PositionManager(cfg, bankroll)
+        risk = MagicMock()
+        risk.is_halted.return_value = False
+        risk.can_open_position.return_value = True
+        risk.exposure_factor.return_value = 1.0
+
+        return LadderManager(cfg, executor, tracker, pm, risk)
+
+    def test_recent_aborts_initially_empty(self):
+        """_recent_aborts starts empty on a fresh LadderManager."""
+        lm = self._make_lm_with_state()
+        assert lm._recent_aborts == []
+
+    def test_recent_circuit_breaker_fires_initially_empty(self):
+        """_recent_circuit_breaker_fires starts empty on a fresh LadderManager."""
+        lm = self._make_lm_with_state()
+        assert lm._recent_circuit_breaker_fires == []
+
+    def test_one_sided_abort_populates_recent_aborts(self):
+        """check_one_sided_abort appends an entry to _recent_aborts when it kills a ladder."""
+        from polybot.strategy.ladder_manager import LadderManager, LadderState
+        from polybot.order_tracker import OrderTracker, TrackedOrder
+
+        lm = self._make_lm_with_state(bankroll=500.0)
+        mid = "btc-15m-abort-telemetry"
+        # Set up a ladder state
+        lm.ladders[mid] = LadderState(
+            market_id=mid, asset="BTC",
+            anchor_up=0.45, anchor_dn=0.45, posted_at=1000.0,
+        )
+        # Add a filled UP order (100% one-sided, above 1% of bankroll threshold)
+        order = TrackedOrder(
+            order_id="o-abort-1", market_id=mid,
+            token_id="tok_up", side=Side.UP,
+            price=0.45, size=20.0, placed_at=1000.0,
+        )
+        lm.tracker.add(order)
+        lm.tracker.update_fill("o-abort-1", 20.0)  # 100% filled UP, dn=0
+
+        result = lm.check_one_sided_abort(mid)
+
+        assert result is True, "check_one_sided_abort should return True (ladder killed)"
+        assert len(lm._recent_aborts) == 1, (
+            f"Expected 1 entry in _recent_aborts, got {len(lm._recent_aborts)}"
+        )
+        abort_entry = lm._recent_aborts[0]
+        assert abort_entry["market_id"] == mid
+        assert abort_entry["asset"] == "BTC"
+        assert abort_entry["up_qty"] > 0
+        assert abort_entry["dn_qty"] == pytest.approx(0.0)
+        assert abort_entry["cost"] > 0
+
+    def test_one_sided_abort_no_entry_when_not_triggered(self):
+        """check_one_sided_abort does NOT append when guard does not fire."""
+        from polybot.strategy.ladder_manager import LadderState
+        from polybot.order_tracker import TrackedOrder
+
+        lm = self._make_lm_with_state(bankroll=500.0)
+        mid = "btc-15m-no-abort"
+        lm.ladders[mid] = LadderState(
+            market_id=mid, asset="BTC",
+            anchor_up=0.45, anchor_dn=0.45, posted_at=1000.0,
+        )
+        # Both sides filled equally — guard should not fire
+        for oid, side, tok in [("o-up", Side.UP, "tok_up"), ("o-dn", Side.DOWN, "tok_dn")]:
+            order = TrackedOrder(
+                order_id=oid, market_id=mid,
+                token_id=tok, side=side,
+                price=0.45, size=10.0, placed_at=1000.0,
+            )
+            lm.tracker.add(order)
+            lm.tracker.update_fill(oid, 10.0)
+
+        result = lm.check_one_sided_abort(mid)
+        assert result is False
+        assert lm._recent_aborts == []
+
+    def test_circuit_breaker_populates_recent_fires(self):
+        """cancel_losing_side_orders appends to _recent_circuit_breaker_fires when breaker fires."""
+        from polybot.strategy.ladder_manager import LadderState
+        from polybot.order_tracker import TrackedOrder
+        import time as _t
+
+        lm = self._make_lm_with_state(bankroll=500.0)
+        lm.cfg = BotConfig(
+            dry_run=True, bankroll=500.0,
+            ladder_rungs=6, ladder_spacing=0.01, ladder_width=0.10,
+            ladder_size_skew=1.0, max_pair_cost=0.93,
+            position_size_fraction=0.10, reprice_threshold=0.03,
+            maker_fee_rate=0.0, batch_order_size=15, no_trade_final_sec=60,
+            imbalance_min_heavy_fills=1, boost_elapsed_pct=0.20,
+            force_buy_elapsed_pct=0.70, force_buy_max_pair_cost=0.83,
+            spot_delta_reduce_threshold=0.0015, spot_delta_skip_threshold=0.005,
+            spot_gate_force_buy_threshold=0.003, spot_loss_cap_multiplier=0.50,
+            fair_value_enabled=True,
+        )
+
+        now = int(_time_mod.time())
+        mw = MarketWindow(
+            market_id="btc-15m-cb",
+            condition_id="0xcb",
+            asset="BTC",
+            timeframe_sec=900,
+            up_token_id="tok_up_cb",
+            dn_token_id="tok_dn_cb",
+            open_epoch=now - 60,
+            close_epoch=now + 840,
+        )
+        mid = mw.market_id
+        lm.ladders[mid] = LadderState(
+            market_id=mid, asset="BTC",
+            anchor_up=0.45, anchor_dn=0.45, posted_at=1000.0,
+            # Seed 3 recent FV cancel timestamps — triggers circuit breaker on next call
+            fv_cancel_history=[_t.time() - 10, _t.time() - 20, _t.time() - 30],
+        )
+        # fair_up=0.12 -> cert=88% > 0.75 threshold -> will try to cancel, but breaker fires first
+        result = lm.cancel_losing_side_orders(mw, fair_up=0.12)
+
+        assert result == 0, "Circuit breaker should return 0 (killed, no cancels counted)"
+        assert mid in lm._killed_ladders
+        assert len(lm._recent_circuit_breaker_fires) == 1, (
+            f"Expected 1 circuit breaker entry, got {len(lm._recent_circuit_breaker_fires)}"
+        )
+        cb_entry = lm._recent_circuit_breaker_fires[0]
+        assert cb_entry["market_id"] == mid
+        assert cb_entry["asset"] == "BTC"
+        assert cb_entry["cancel_count"] >= 3
+
+    def test_drain_clears_recent_aborts(self):
+        """Draining _recent_aborts (as bot loop does) clears the list."""
+        lm = self._make_lm_with_state()
+        lm._recent_aborts.append({"market_id": "x", "asset": "BTC",
+                                   "up_qty": 10.0, "dn_qty": 0.0, "cost": 5.0})
+        # Simulate drain
+        drained = list(lm._recent_aborts)
+        lm._recent_aborts.clear()
+        assert len(drained) == 1
+        assert lm._recent_aborts == []
+
+    def test_drain_clears_recent_circuit_breaker_fires(self):
+        """Draining _recent_circuit_breaker_fires (as bot loop does) clears the list."""
+        lm = self._make_lm_with_state()
+        lm._recent_circuit_breaker_fires.append({"market_id": "y", "asset": "ETH",
+                                                   "cancel_count": 3})
+        drained = list(lm._recent_circuit_breaker_fires)
+        lm._recent_circuit_breaker_fires.clear()
+        assert len(drained) == 1
+        assert lm._recent_circuit_breaker_fires == []

@@ -155,6 +155,9 @@ class LadderManager:
         self._killed_ladders: set[str] = set()
         self.tick_cache = tick_size_cache
         self.fee_rate: float = getattr(cfg, "maker_fee_rate", 0.0)
+        # Proposal #54: pending guard-fire events for bot loop to drain and record to activity log
+        self._recent_aborts: list[dict] = []           # ONE-SIDED ABORT fires
+        self._recent_circuit_breaker_fires: list[dict] = []  # FV CANCEL CIRCUIT BREAKER fires
 
     def _fill_cost(self, price: float, qty: float) -> float:
         """Fee-inclusive cost for qty shares at price."""
@@ -1485,6 +1488,11 @@ class LadderManager:
                 "FV CANCEL CIRCUIT BREAKER: market=%s fired %d times in 60s, killing ladder",
                 mid, len(state.fv_cancel_history),
             )
+            self._recent_circuit_breaker_fires.append({
+                "market_id": mid,
+                "asset": state.asset,
+                "cancel_count": len(state.fv_cancel_history),
+            })
             all_cancelled = self.tracker.cancel_market(mid)
             self.executor.cancel_batch(all_cancelled)
             self._killed_ladders.add(mid)
@@ -1692,6 +1700,14 @@ class LadderManager:
                 "ONE-SIDED ABORT: market=%s up=%.1f dn=%.1f cost=$%.2f — killing ladder",
                 market_id, up_qty, dn_qty, total_cost,
             )
+            asset = state.asset if state is not None else "UNKNOWN"
+            self._recent_aborts.append({
+                "market_id": market_id,
+                "asset": asset,
+                "up_qty": up_qty,
+                "dn_qty": dn_qty,
+                "cost": total_cost,
+            })
             self.cancel_ladder(market_id)
             if market_id in self.ladders:
                 del self.ladders[market_id]
