@@ -30,6 +30,13 @@ from tools.fv_calibration import (
     compute_market_fv_trajectory,
     load_local_prices,
     BUCKET_LABELS,
+    # New 2D calibration symbols
+    ELAPSED_BINS,
+    CONF_BUCKET_EDGES,
+    CONF_BUCKET_LABELS,
+    compute_fv_2d_table,
+    wilson_ci,
+    find_actionable_threshold,
 )
 
 
@@ -398,3 +405,275 @@ class TestLoadLocalPrices:
 
         prices = load_local_prices(tmp_path, ts1 - 100, ts2 + 100)
         assert prices[0][0] < prices[1][0]
+
+
+# ---------------------------------------------------------------------------
+# Test: ELAPSED_BINS / CONF_BUCKET constants
+# ---------------------------------------------------------------------------
+
+class TestConstants:
+    def test_elapsed_bins_count(self):
+        """Must have exactly 7 elapsed bins."""
+        assert len(ELAPSED_BINS) == 7
+
+    def test_elapsed_bin_fractions(self):
+        """Bins must be the required elapsed fractions."""
+        expected = [0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.99]
+        assert ELAPSED_BINS == expected
+
+    def test_conf_buckets_count(self):
+        """Must have exactly 5 confidence bucket labels."""
+        assert len(CONF_BUCKET_LABELS) == 5
+
+    def test_conf_bucket_labels_values(self):
+        """Bucket labels must cover 0.50-1.00 in 0.10 bands."""
+        assert CONF_BUCKET_LABELS == [
+            "0.50-0.60",
+            "0.60-0.70",
+            "0.70-0.80",
+            "0.80-0.90",
+            "0.90-1.00",
+        ]
+
+
+# ---------------------------------------------------------------------------
+# Test: wilson_ci
+# ---------------------------------------------------------------------------
+
+class TestWilsonCI:
+    def test_known_value(self):
+        """Wilson CI for p=0.7, n=100 at 95% confidence.
+
+        Reference: scipy.stats.proportion_confint(70, 100, method='wilson')
+        Expected: (0.6026..., 0.7834...)
+        """
+        lo, hi = wilson_ci(0.7, 100)
+        assert abs(lo - 0.6026) < 0.01, f"lo={lo}"
+        assert abs(hi - 0.7834) < 0.01, f"hi={hi}"
+
+    def test_perfect_win_rate(self):
+        """p=1.0, n=10: CI lower bound should be > 0."""
+        lo, hi = wilson_ci(1.0, 10)
+        assert lo > 0
+        assert hi == pytest.approx(1.0, abs=0.01)
+
+    def test_50pct_win_rate_large_n(self):
+        """p=0.5, n=10000: CI must be very tight around 0.5."""
+        lo, hi = wilson_ci(0.5, 10000)
+        assert abs(lo - 0.5) < 0.015
+        assert abs(hi - 0.5) < 0.015
+
+    def test_zero_n_returns_none(self):
+        """n=0 returns (None, None)."""
+        lo, hi = wilson_ci(0.5, 0)
+        assert lo is None
+        assert hi is None
+
+
+# ---------------------------------------------------------------------------
+# Test: compute_fv_2d_table
+# ---------------------------------------------------------------------------
+
+class TestComputeFV2DTable:
+    """2D calibration table: elapsed × confidence bucket."""
+
+    def _make_record(self, elapsed_pct: float, cert: float, correct: bool,
+                     outcome: str = "UP") -> dict:
+        """Synthetic per-market record as returned by compute_market_fv_trajectory."""
+        return {
+            "market_id": "btc-test-1",
+            "outcome": outcome,
+            "sample_points": [
+                {
+                    "ts_pct": elapsed_pct,
+                    "fv": cert if correct else (1.0 - cert),
+                    "cert": cert,
+                }
+            ],
+            "elapsed_predictions": {
+                f"{int(elapsed_pct * 100)}pct": {
+                    "p_up": cert if outcome == "UP" else (1.0 - cert),
+                    "cert": cert,
+                    "correct": correct,
+                }
+            },
+        }
+
+    def test_shape_7x5(self):
+        """Table has exactly 7 elapsed bins × 5 confidence buckets."""
+        table = compute_fv_2d_table([])
+        assert len(table) == 7
+        elapsed_keys = list(table.keys())
+        assert elapsed_keys[0] == "5pct_elapsed"
+        assert elapsed_keys[-1] == "99pct_elapsed"
+        for key, bins in table.items():
+            assert len(bins) == 5, f"{key} has {len(bins)} bins, expected 5"
+            for label in CONF_BUCKET_LABELS:
+                assert label in bins, f"Missing {label} in {key}"
+
+    def test_perfect_predictions_at_50pct(self):
+        """Synthetic: FV is perfectly correct at 50% elapsed in high-cert bucket.
+
+        When we pass 100 records all with cert=0.85 and correct=True at 50%,
+        the 50pct_elapsed bucket 0.80-0.90 should have win_rate=1.0.
+        """
+        records = []
+        for _ in range(100):
+            records.append({
+                "outcome": "UP",
+                "elapsed_predictions": {
+                    "50pct": {"p_up": 0.85, "cert": 0.85, "correct": True},
+                },
+            })
+        table = compute_fv_2d_table(records)
+        bucket = table["50pct_elapsed"]["0.80-0.90"]
+        assert bucket["n"] == 100
+        assert bucket["win_rate"] == pytest.approx(1.0)
+
+    def test_zero_records_all_buckets_empty(self):
+        """Empty input: all buckets have n=0, win_rate=None."""
+        table = compute_fv_2d_table([])
+        for elapsed_key, bins in table.items():
+            for label, bucket in bins.items():
+                assert bucket["n"] == 0
+                assert bucket["win_rate"] is None
+
+    def test_significance_threshold(self):
+        """Significant flag = True when CI lower bound > 0.55, n>=30."""
+        # 40 correct out of 40 in 0.80-0.90 at 25pct -> CI_lo >> 0.55
+        records = []
+        for _ in range(40):
+            records.append({
+                "outcome": "UP",
+                "elapsed_predictions": {
+                    "25pct": {"p_up": 0.85, "cert": 0.85, "correct": True},
+                },
+            })
+        table = compute_fv_2d_table(records)
+        bucket = table["25pct_elapsed"]["0.80-0.90"]
+        assert bucket["n"] == 40
+        assert bucket["significant"] is True
+
+    def test_not_significant_low_n(self):
+        """n<30 never marked significant regardless of win rate."""
+        records = []
+        for _ in range(29):
+            records.append({
+                "outcome": "UP",
+                "elapsed_predictions": {
+                    "10pct": {"p_up": 0.85, "cert": 0.85, "correct": True},
+                },
+            })
+        table = compute_fv_2d_table(records)
+        bucket = table["10pct_elapsed"]["0.80-0.90"]
+        assert bucket["n"] == 29
+        assert bucket["significant"] is False
+
+    def test_errors_excluded(self):
+        """Records with 'error' key are excluded."""
+        records = [
+            {"error": "no_prices", "outcome": "UP"},
+            {
+                "outcome": "UP",
+                "elapsed_predictions": {
+                    "50pct": {"p_up": 0.85, "cert": 0.85, "correct": True},
+                },
+            },
+        ]
+        table = compute_fv_2d_table(records)
+        bucket = table["50pct_elapsed"]["0.80-0.90"]
+        assert bucket["n"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Test: find_actionable_threshold
+# ---------------------------------------------------------------------------
+
+class TestFindActionableThreshold:
+    def _make_bucket(self, n: int, win_rate: float, ci_lo: float,
+                     significant: bool) -> dict:
+        return {
+            "n": n,
+            "win_rate": win_rate,
+            "ci_lo": ci_lo,
+            "significant": significant,
+        }
+
+    def _make_table(self, elapsed_key: str, conf_key: str, n: int,
+                    win_rate: float, ci_lo: float,
+                    significant: bool) -> dict:
+        """Build minimal 2D table with one populated bucket."""
+        table = {}
+        for bin_label in [f"{int(f*100)}pct_elapsed" for f in ELAPSED_BINS]:
+            table[bin_label] = {
+                label: {"n": 0, "win_rate": None, "ci_lo": None,
+                        "significant": False}
+                for label in CONF_BUCKET_LABELS
+            }
+        table[elapsed_key][conf_key] = self._make_bucket(
+            n, win_rate, ci_lo, significant
+        )
+        return table
+
+    def test_finds_earliest_actionable(self):
+        """Returns earliest elapsed bin where cert>=0.80 has win_rate>0.65 and n>=30."""
+        table = self._make_table(
+            "25pct_elapsed", "0.80-0.90",
+            n=40, win_rate=0.72, ci_lo=0.57, significant=True
+        )
+        result = find_actionable_threshold(table)
+        assert result is not None
+        assert result["elapsed_pct"] == 25
+        assert result["certainty_threshold"] == 0.80
+        assert result["realized_win_rate"] == pytest.approx(0.72)
+
+    def test_returns_none_when_no_bucket_qualifies(self):
+        """Returns None when no bucket meets criteria."""
+        table = {}
+        for f in ELAPSED_BINS:
+            key = f"{int(f*100)}pct_elapsed"
+            table[key] = {
+                label: {"n": 5, "win_rate": 0.60, "ci_lo": 0.40,
+                        "significant": False}
+                for label in CONF_BUCKET_LABELS
+            }
+        result = find_actionable_threshold(table)
+        assert result is None
+
+    def test_requires_n_ge_30(self):
+        """n=29 does not qualify even with perfect win rate."""
+        table = self._make_table(
+            "5pct_elapsed", "0.80-0.90",
+            n=29, win_rate=1.0, ci_lo=0.90, significant=False
+        )
+        result = find_actionable_threshold(table)
+        assert result is None
+
+    def test_requires_win_rate_gt_065(self):
+        """win_rate=0.65 (not > 0.65) does not qualify."""
+        table = self._make_table(
+            "5pct_elapsed", "0.80-0.90",
+            n=50, win_rate=0.65, ci_lo=0.52, significant=True
+        )
+        result = find_actionable_threshold(table)
+        assert result is None
+
+    def test_earliest_elapsed_bin_wins(self):
+        """When multiple elapsed bins qualify, pick the earliest."""
+        # Both 25pct and 50pct qualify; 25pct should be picked
+        table: dict = {}
+        for f in ELAPSED_BINS:
+            key = f"{int(f*100)}pct_elapsed"
+            table[key] = {
+                label: {"n": 0, "win_rate": None, "ci_lo": None,
+                        "significant": False}
+                for label in CONF_BUCKET_LABELS
+            }
+        # Qualify at both 25pct and 50pct
+        for elapsed_key in ("25pct_elapsed", "50pct_elapsed"):
+            table[elapsed_key]["0.80-0.90"] = {
+                "n": 50, "win_rate": 0.70, "ci_lo": 0.57, "significant": True
+            }
+        result = find_actionable_threshold(table)
+        assert result is not None
+        assert result["elapsed_pct"] == 25

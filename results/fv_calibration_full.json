@@ -1,0 +1,980 @@
+{
+  "sample_size": 749,
+  "settlements_with_data": 749,
+  "overall_accuracy_at_50pct": 0.6061,
+  "calibration_by_time_and_confidence": {
+    "5pct_elapsed": {
+      "0.50-0.60": {
+        "n": 713,
+        "wins": 370,
+        "win_rate": 0.5189,
+        "ci_lo": 0.4823,
+        "ci_hi": 0.5554,
+        "significant": false
+      },
+      "0.60-0.70": {
+        "n": 29,
+        "wins": 24,
+        "win_rate": 0.8276,
+        "ci_lo": 0.6545,
+        "ci_hi": 0.924,
+        "significant": false
+      },
+      "0.70-0.80": {
+        "n": 0,
+        "wins": 0,
+        "win_rate": null,
+        "ci_lo": null,
+        "ci_hi": null,
+        "significant": false
+      },
+      "0.80-0.90": {
+        "n": 6,
+        "wins": 5,
+        "win_rate": 0.8333,
+        "ci_lo": 0.4365,
+        "ci_hi": 0.9699,
+        "significant": false
+      },
+      "0.90-1.00": {
+        "n": 1,
+        "wins": 0,
+        "win_rate": 0.0,
+        "ci_lo": 0.0,
+        "ci_hi": 0.7935,
+        "significant": false
+      }
+    },
+    "10pct_elapsed": {
+      "0.50-0.60": {
+        "n": 704,
+        "wins": 373,
+        "win_rate": 0.5298,
+        "ci_lo": 0.4929,
+        "ci_hi": 0.5664,
+        "significant": false
+      },
+      "0.60-0.70": {
+        "n": 29,
+        "wins": 15,
+        "win_rate": 0.5172,
+        "ci_lo": 0.3443,
+        "ci_hi": 0.6861,
+        "significant": false
+      },
+      "0.70-0.80": {
+        "n": 9,
+        "wins": 7,
+        "win_rate": 0.7778,
+        "ci_lo": 0.4526,
+        "ci_hi": 0.9368,
+        "significant": false
+      },
+      "0.80-0.90": {
+        "n": 5,
+        "wins": 4,
+        "win_rate": 0.8,
+        "ci_lo": 0.3755,
+        "ci_hi": 0.9638,
+        "significant": false
+      },
+      "0.90-1.00": {
+        "n": 2,
+        "wins": 2,
+        "win_rate": 1.0,
+        "ci_lo": 0.3424,
+        "ci_hi": 1.0,
+        "significant": false
+      }
+    },
+    "25pct_elapsed": {
+      "0.50-0.60": {
+        "n": 564,
+        "wins": 298,
+        "win_rate": 0.5284,
+        "ci_lo": 0.4871,
+        "ci_hi": 0.5692,
+        "significant": false
+      },
+      "0.60-0.70": {
+        "n": 59,
+        "wins": 40,
+        "win_rate": 0.678,
+        "ci_lo": 0.551,
+        "ci_hi": 0.7831,
+        "significant": true
+      },
+      "0.70-0.80": {
+        "n": 47,
+        "wins": 35,
+        "win_rate": 0.7447,
+        "ci_lo": 0.6049,
+        "ci_hi": 0.8475,
+        "significant": true
+      },
+      "0.80-0.90": {
+        "n": 27,
+        "wins": 18,
+        "win_rate": 0.6667,
+        "ci_lo": 0.4782,
+        "ci_hi": 0.8136,
+        "significant": false
+      },
+      "0.90-1.00": {
+        "n": 52,
+        "wins": 42,
+        "win_rate": 0.8077,
+        "ci_lo": 0.681,
+        "ci_hi": 0.892,
+        "significant": true
+      }
+    },
+    "50pct_elapsed": {
+      "0.50-0.60": {
+        "n": 529,
+        "wins": 273,
+        "win_rate": 0.5161,
+        "ci_lo": 0.4735,
+        "ci_hi": 0.5584,
+        "significant": false
+      },
+      "0.60-0.70": {
+        "n": 44,
+        "wins": 36,
+        "win_rate": 0.8182,
+        "ci_lo": 0.6804,
+        "ci_hi": 0.9049,
+        "significant": true
+      },
+      "0.70-0.80": {
+        "n": 43,
+        "wins": 34,
+        "win_rate": 0.7907,
+        "ci_lo": 0.6479,
+        "ci_hi": 0.8858,
+        "significant": true
+      },
+      "0.80-0.90": {
+        "n": 44,
+        "wins": 37,
+        "win_rate": 0.8409,
+        "ci_lo": 0.7063,
+        "ci_hi": 0.9207,
+        "significant": true
+      },
+      "0.90-1.00": {
+        "n": 89,
+        "wins": 74,
+        "win_rate": 0.8315,
+        "ci_lo": 0.7404,
+        "ci_hi": 0.8951,
+        "significant": true
+      }
+    },
+    "75pct_elapsed": {
+      "0.50-0.60": {
+        "n": 507,
+        "wins": 261,
+        "win_rate": 0.5148,
+        "ci_lo": 0.4713,
+        "ci_hi": 0.558,
+        "significant": false
+      },
+      "0.60-0.70": {
+        "n": 29,
+        "wins": 25,
+        "win_rate": 0.8621,
+        "ci_lo": 0.6944,
+        "ci_hi": 0.945,
+        "significant": false
+      },
+      "0.70-0.80": {
+        "n": 27,
+        "wins": 22,
+        "win_rate": 0.8148,
+        "ci_lo": 0.633,
+        "ci_hi": 0.9182,
+        "significant": false
+      },
+      "0.80-0.90": {
+        "n": 35,
+        "wins": 30,
+        "win_rate": 0.8571,
+        "ci_lo": 0.7062,
+        "ci_hi": 0.9374,
+        "significant": true
+      },
+      "0.90-1.00": {
+        "n": 151,
+        "wins": 146,
+        "win_rate": 0.9669,
+        "ci_lo": 0.9248,
+        "ci_hi": 0.9858,
+        "significant": true
+      }
+    },
+    "90pct_elapsed": {
+      "0.50-0.60": {
+        "n": 35,
+        "wins": 24,
+        "win_rate": 0.6857,
+        "ci_lo": 0.5202,
+        "ci_hi": 0.8145,
+        "significant": false
+      },
+      "0.60-0.70": {
+        "n": 32,
+        "wins": 21,
+        "win_rate": 0.6562,
+        "ci_lo": 0.4831,
+        "ci_hi": 0.7959,
+        "significant": false
+      },
+      "0.70-0.80": {
+        "n": 60,
+        "wins": 47,
+        "win_rate": 0.7833,
+        "ci_lo": 0.6638,
+        "ci_hi": 0.8688,
+        "significant": true
+      },
+      "0.80-0.90": {
+        "n": 65,
+        "wins": 50,
+        "win_rate": 0.7692,
+        "ci_lo": 0.6536,
+        "ci_hi": 0.8549,
+        "significant": true
+      },
+      "0.90-1.00": {
+        "n": 557,
+        "wins": 533,
+        "win_rate": 0.9569,
+        "ci_lo": 0.9367,
+        "ci_hi": 0.9709,
+        "significant": true
+      }
+    },
+    "99pct_elapsed": {
+      "0.50-0.60": {
+        "n": 15,
+        "wins": 12,
+        "win_rate": 0.8,
+        "ci_lo": 0.5481,
+        "ci_hi": 0.9295,
+        "significant": false
+      },
+      "0.60-0.70": {
+        "n": 6,
+        "wins": 5,
+        "win_rate": 0.8333,
+        "ci_lo": 0.4365,
+        "ci_hi": 0.9699,
+        "significant": false
+      },
+      "0.70-0.80": {
+        "n": 12,
+        "wins": 10,
+        "win_rate": 0.8333,
+        "ci_lo": 0.552,
+        "ci_hi": 0.953,
+        "significant": false
+      },
+      "0.80-0.90": {
+        "n": 19,
+        "wins": 14,
+        "win_rate": 0.7368,
+        "ci_lo": 0.5121,
+        "ci_hi": 0.8819,
+        "significant": false
+      },
+      "0.90-1.00": {
+        "n": 697,
+        "wins": 674,
+        "win_rate": 0.967,
+        "ci_lo": 0.951,
+        "ci_hi": 0.9779,
+        "significant": true
+      }
+    }
+  },
+  "per_bucket_significance": {
+    "5pct_elapsed_0.50-0.60": {
+      "n": 713,
+      "win_rate": 0.5189,
+      "ci_lower": 0.4823,
+      "ci_upper": 0.5554,
+      "significant": false
+    },
+    "10pct_elapsed_0.50-0.60": {
+      "n": 704,
+      "win_rate": 0.5298,
+      "ci_lower": 0.4929,
+      "ci_upper": 0.5664,
+      "significant": false
+    },
+    "25pct_elapsed_0.50-0.60": {
+      "n": 564,
+      "win_rate": 0.5284,
+      "ci_lower": 0.4871,
+      "ci_upper": 0.5692,
+      "significant": false
+    },
+    "25pct_elapsed_0.60-0.70": {
+      "n": 59,
+      "win_rate": 0.678,
+      "ci_lower": 0.551,
+      "ci_upper": 0.7831,
+      "significant": true
+    },
+    "25pct_elapsed_0.70-0.80": {
+      "n": 47,
+      "win_rate": 0.7447,
+      "ci_lower": 0.6049,
+      "ci_upper": 0.8475,
+      "significant": true
+    },
+    "25pct_elapsed_0.90-1.00": {
+      "n": 52,
+      "win_rate": 0.8077,
+      "ci_lower": 0.681,
+      "ci_upper": 0.892,
+      "significant": true
+    },
+    "50pct_elapsed_0.50-0.60": {
+      "n": 529,
+      "win_rate": 0.5161,
+      "ci_lower": 0.4735,
+      "ci_upper": 0.5584,
+      "significant": false
+    },
+    "50pct_elapsed_0.60-0.70": {
+      "n": 44,
+      "win_rate": 0.8182,
+      "ci_lower": 0.6804,
+      "ci_upper": 0.9049,
+      "significant": true
+    },
+    "50pct_elapsed_0.70-0.80": {
+      "n": 43,
+      "win_rate": 0.7907,
+      "ci_lower": 0.6479,
+      "ci_upper": 0.8858,
+      "significant": true
+    },
+    "50pct_elapsed_0.80-0.90": {
+      "n": 44,
+      "win_rate": 0.8409,
+      "ci_lower": 0.7063,
+      "ci_upper": 0.9207,
+      "significant": true
+    },
+    "50pct_elapsed_0.90-1.00": {
+      "n": 89,
+      "win_rate": 0.8315,
+      "ci_lower": 0.7404,
+      "ci_upper": 0.8951,
+      "significant": true
+    },
+    "75pct_elapsed_0.50-0.60": {
+      "n": 507,
+      "win_rate": 0.5148,
+      "ci_lower": 0.4713,
+      "ci_upper": 0.558,
+      "significant": false
+    },
+    "75pct_elapsed_0.80-0.90": {
+      "n": 35,
+      "win_rate": 0.8571,
+      "ci_lower": 0.7062,
+      "ci_upper": 0.9374,
+      "significant": true
+    },
+    "75pct_elapsed_0.90-1.00": {
+      "n": 151,
+      "win_rate": 0.9669,
+      "ci_lower": 0.9248,
+      "ci_upper": 0.9858,
+      "significant": true
+    },
+    "90pct_elapsed_0.50-0.60": {
+      "n": 35,
+      "win_rate": 0.6857,
+      "ci_lower": 0.5202,
+      "ci_upper": 0.8145,
+      "significant": false
+    },
+    "90pct_elapsed_0.60-0.70": {
+      "n": 32,
+      "win_rate": 0.6562,
+      "ci_lower": 0.4831,
+      "ci_upper": 0.7959,
+      "significant": false
+    },
+    "90pct_elapsed_0.70-0.80": {
+      "n": 60,
+      "win_rate": 0.7833,
+      "ci_lower": 0.6638,
+      "ci_upper": 0.8688,
+      "significant": true
+    },
+    "90pct_elapsed_0.80-0.90": {
+      "n": 65,
+      "win_rate": 0.7692,
+      "ci_lower": 0.6536,
+      "ci_upper": 0.8549,
+      "significant": true
+    },
+    "90pct_elapsed_0.90-1.00": {
+      "n": 557,
+      "win_rate": 0.9569,
+      "ci_lower": 0.9367,
+      "ci_upper": 0.9709,
+      "significant": true
+    },
+    "99pct_elapsed_0.90-1.00": {
+      "n": 697,
+      "win_rate": 0.967,
+      "ci_lower": 0.951,
+      "ci_upper": 0.9779,
+      "significant": true
+    }
+  },
+  "actionable_threshold": {
+    "elapsed_pct": 25,
+    "certainty_threshold": 0.9,
+    "certainty_bucket": "0.90-1.00",
+    "realized_win_rate": 0.8077,
+    "n": 52,
+    "ci_lo": 0.681,
+    "ci_hi": 0.892,
+    "significant": true,
+    "description": "At 25% elapsed with cert>=0.90, realized win rate = 80.8% (n=52)"
+  },
+  "metadata": {
+    "start_date": "2026-04-02",
+    "end_date": "2026-04-11",
+    "total_settlements": 749,
+    "valid_results": 749,
+    "no_data_count": 0,
+    "dome_fetch_count": 0,
+    "local_data_count": 749,
+    "outcome_distribution": {
+      "UP": 393,
+      "DOWN": 356
+    }
+  },
+  "overall_accuracy_at_open": 0.5247,
+  "overall_accuracy_at_close": 0.9813,
+  "high_cert_accuracy_at_open": null,
+  "high_cert_accuracy_at_close": 0.9825,
+  "overall_accuracy": 0.5247,
+  "high_cert_accuracy": null,
+  "calibration_table": {
+    "by_cert_at_open": {
+      "fine_grained": {
+        "0.50-0.55": {
+          "n": 749,
+          "wins": 393,
+          "win_rate": 0.5247,
+          "ci_lo_95": 0.4889,
+          "ci_hi_95": 0.5602,
+          "significant": false
+        },
+        "0.55-0.60": {
+          "n": 0,
+          "wins": 0,
+          "win_rate": null,
+          "ci_lo_95": null,
+          "ci_hi_95": null,
+          "significant": false
+        },
+        "0.60-0.65": {
+          "n": 0,
+          "wins": 0,
+          "win_rate": null,
+          "ci_lo_95": null,
+          "ci_hi_95": null,
+          "significant": false
+        },
+        "0.65-0.70": {
+          "n": 0,
+          "wins": 0,
+          "win_rate": null,
+          "ci_lo_95": null,
+          "ci_hi_95": null,
+          "significant": false
+        },
+        "0.70-0.75": {
+          "n": 0,
+          "wins": 0,
+          "win_rate": null,
+          "ci_lo_95": null,
+          "ci_hi_95": null,
+          "significant": false
+        },
+        "0.75-0.80": {
+          "n": 0,
+          "wins": 0,
+          "win_rate": null,
+          "ci_lo_95": null,
+          "ci_hi_95": null,
+          "significant": false
+        },
+        "0.80-0.85": {
+          "n": 0,
+          "wins": 0,
+          "win_rate": null,
+          "ci_lo_95": null,
+          "ci_hi_95": null,
+          "significant": false
+        },
+        "0.85-0.90": {
+          "n": 0,
+          "wins": 0,
+          "win_rate": null,
+          "ci_lo_95": null,
+          "ci_hi_95": null,
+          "significant": false
+        },
+        "0.90-0.95": {
+          "n": 0,
+          "wins": 0,
+          "win_rate": null,
+          "ci_lo_95": null,
+          "ci_hi_95": null,
+          "significant": false
+        },
+        "0.95-1.00": {
+          "n": 0,
+          "wins": 0,
+          "win_rate": null,
+          "ci_lo_95": null,
+          "ci_hi_95": null,
+          "significant": false
+        }
+      },
+      "coarse": {
+        "0.50-0.60": {
+          "n": 749,
+          "wins": 393,
+          "win_rate": 0.5247,
+          "ci_lo_95": 0.4889,
+          "ci_hi_95": 0.5602,
+          "significant": false
+        },
+        "0.60-0.70": {
+          "n": 0,
+          "wins": 0,
+          "win_rate": null,
+          "ci_lo_95": null,
+          "ci_hi_95": null,
+          "significant": false
+        },
+        "0.70-0.80": {
+          "n": 0,
+          "wins": 0,
+          "win_rate": null,
+          "ci_lo_95": null,
+          "ci_hi_95": null,
+          "significant": false
+        },
+        "0.80-0.90": {
+          "n": 0,
+          "wins": 0,
+          "win_rate": null,
+          "ci_lo_95": null,
+          "ci_hi_95": null,
+          "significant": false
+        },
+        "0.90-1.00": {
+          "n": 0,
+          "wins": 0,
+          "win_rate": null,
+          "ci_lo_95": null,
+          "ci_hi_95": null,
+          "significant": false
+        }
+      },
+      "description": "FV signal at window open (entry signal for ladder posting)"
+    },
+    "by_cert_at_close": {
+      "fine_grained": {
+        "0.50-0.55": {
+          "n": 6,
+          "wins": 5,
+          "win_rate": 0.8333,
+          "ci_lo_95": 0.4365,
+          "ci_hi_95": 0.9699,
+          "significant": false
+        },
+        "0.55-0.60": {
+          "n": 1,
+          "wins": 1,
+          "win_rate": 1.0,
+          "ci_lo_95": 0.2065,
+          "ci_hi_95": 1.0,
+          "significant": false
+        },
+        "0.60-0.65": {
+          "n": 0,
+          "wins": 0,
+          "win_rate": null,
+          "ci_lo_95": null,
+          "ci_hi_95": null,
+          "significant": false
+        },
+        "0.65-0.70": {
+          "n": 0,
+          "wins": 0,
+          "win_rate": null,
+          "ci_lo_95": null,
+          "ci_hi_95": null,
+          "significant": false
+        },
+        "0.70-0.75": {
+          "n": 0,
+          "wins": 0,
+          "win_rate": null,
+          "ci_lo_95": null,
+          "ci_hi_95": null,
+          "significant": false
+        },
+        "0.75-0.80": {
+          "n": 1,
+          "wins": 1,
+          "win_rate": 1.0,
+          "ci_lo_95": 0.2065,
+          "ci_hi_95": 1.0,
+          "significant": false
+        },
+        "0.80-0.85": {
+          "n": 0,
+          "wins": 0,
+          "win_rate": null,
+          "ci_lo_95": null,
+          "ci_hi_95": null,
+          "significant": false
+        },
+        "0.85-0.90": {
+          "n": 1,
+          "wins": 1,
+          "win_rate": 1.0,
+          "ci_lo_95": 0.2065,
+          "ci_hi_95": 1.0,
+          "significant": false
+        },
+        "0.90-0.95": {
+          "n": 1,
+          "wins": 0,
+          "win_rate": 0.0,
+          "ci_lo_95": 0.0,
+          "ci_hi_95": 0.7935,
+          "significant": false
+        },
+        "0.95-1.00": {
+          "n": 739,
+          "wins": 727,
+          "win_rate": 0.9838,
+          "ci_lo_95": 0.9718,
+          "ci_hi_95": 0.9907,
+          "significant": true
+        }
+      },
+      "coarse": {
+        "0.50-0.60": {
+          "n": 7,
+          "wins": 6,
+          "win_rate": 0.8571,
+          "ci_lo_95": 0.4869,
+          "ci_hi_95": 0.9743,
+          "significant": false
+        },
+        "0.60-0.70": {
+          "n": 0,
+          "wins": 0,
+          "win_rate": null,
+          "ci_lo_95": null,
+          "ci_hi_95": null,
+          "significant": false
+        },
+        "0.70-0.80": {
+          "n": 1,
+          "wins": 1,
+          "win_rate": 1.0,
+          "ci_lo_95": 0.2065,
+          "ci_hi_95": 1.0,
+          "significant": false
+        },
+        "0.80-0.90": {
+          "n": 1,
+          "wins": 1,
+          "win_rate": 1.0,
+          "ci_lo_95": 0.2065,
+          "ci_hi_95": 1.0,
+          "significant": false
+        },
+        "0.90-1.00": {
+          "n": 740,
+          "wins": 727,
+          "win_rate": 0.9824,
+          "ci_lo_95": 0.9702,
+          "ci_hi_95": 0.9897,
+          "significant": true
+        }
+      },
+      "description": "FV signal at window close (retrospective maximum signal)"
+    },
+    "by_max_cert": {
+      "fine_grained": {
+        "0.50-0.55": {
+          "n": 5,
+          "wins": 4,
+          "win_rate": 0.8,
+          "ci_lo_95": 0.3755,
+          "ci_hi_95": 0.9638,
+          "significant": false
+        },
+        "0.55-0.60": {
+          "n": 1,
+          "wins": 1,
+          "win_rate": 1.0,
+          "ci_lo_95": 0.2065,
+          "ci_hi_95": 1.0,
+          "significant": false
+        },
+        "0.60-0.65": {
+          "n": 0,
+          "wins": 0,
+          "win_rate": null,
+          "ci_lo_95": null,
+          "ci_hi_95": null,
+          "significant": false
+        },
+        "0.65-0.70": {
+          "n": 1,
+          "wins": 1,
+          "win_rate": 1.0,
+          "ci_lo_95": 0.2065,
+          "ci_hi_95": 1.0,
+          "significant": false
+        },
+        "0.70-0.75": {
+          "n": 0,
+          "wins": 0,
+          "win_rate": null,
+          "ci_lo_95": null,
+          "ci_hi_95": null,
+          "significant": false
+        },
+        "0.75-0.80": {
+          "n": 1,
+          "wins": 1,
+          "win_rate": 1.0,
+          "ci_lo_95": 0.2065,
+          "ci_hi_95": 1.0,
+          "significant": false
+        },
+        "0.80-0.85": {
+          "n": 0,
+          "wins": 0,
+          "win_rate": null,
+          "ci_lo_95": null,
+          "ci_hi_95": null,
+          "significant": false
+        },
+        "0.85-0.90": {
+          "n": 1,
+          "wins": 1,
+          "win_rate": 1.0,
+          "ci_lo_95": 0.2065,
+          "ci_hi_95": 1.0,
+          "significant": false
+        },
+        "0.90-0.95": {
+          "n": 1,
+          "wins": 0,
+          "win_rate": 0.0,
+          "ci_lo_95": 0.0,
+          "ci_hi_95": 0.7935,
+          "significant": false
+        },
+        "0.95-1.00": {
+          "n": 739,
+          "wins": 720,
+          "win_rate": 0.9743,
+          "ci_lo_95": 0.9602,
+          "ci_hi_95": 0.9835,
+          "significant": true
+        }
+      },
+      "coarse": {
+        "0.50-0.60": {
+          "n": 6,
+          "wins": 5,
+          "win_rate": 0.8333,
+          "ci_lo_95": 0.4365,
+          "ci_hi_95": 0.9699,
+          "significant": false
+        },
+        "0.60-0.70": {
+          "n": 1,
+          "wins": 1,
+          "win_rate": 1.0,
+          "ci_lo_95": 0.2065,
+          "ci_hi_95": 1.0,
+          "significant": false
+        },
+        "0.70-0.80": {
+          "n": 1,
+          "wins": 1,
+          "win_rate": 1.0,
+          "ci_lo_95": 0.2065,
+          "ci_hi_95": 1.0,
+          "significant": false
+        },
+        "0.80-0.90": {
+          "n": 1,
+          "wins": 1,
+          "win_rate": 1.0,
+          "ci_lo_95": 0.2065,
+          "ci_hi_95": 1.0,
+          "significant": false
+        },
+        "0.90-1.00": {
+          "n": 740,
+          "wins": 720,
+          "win_rate": 0.973,
+          "ci_lo_95": 0.9586,
+          "ci_hi_95": 0.9824,
+          "significant": true
+        }
+      },
+      "description": "Peak FV certainty seen during the window"
+    },
+    "fine_grained": {
+      "0.50-0.55": {
+        "n": 749,
+        "wins": 393,
+        "win_rate": 0.5247,
+        "ci_lo_95": 0.4889,
+        "ci_hi_95": 0.5602,
+        "significant": false
+      },
+      "0.55-0.60": {
+        "n": 0,
+        "wins": 0,
+        "win_rate": null,
+        "ci_lo_95": null,
+        "ci_hi_95": null,
+        "significant": false
+      },
+      "0.60-0.65": {
+        "n": 0,
+        "wins": 0,
+        "win_rate": null,
+        "ci_lo_95": null,
+        "ci_hi_95": null,
+        "significant": false
+      },
+      "0.65-0.70": {
+        "n": 0,
+        "wins": 0,
+        "win_rate": null,
+        "ci_lo_95": null,
+        "ci_hi_95": null,
+        "significant": false
+      },
+      "0.70-0.75": {
+        "n": 0,
+        "wins": 0,
+        "win_rate": null,
+        "ci_lo_95": null,
+        "ci_hi_95": null,
+        "significant": false
+      },
+      "0.75-0.80": {
+        "n": 0,
+        "wins": 0,
+        "win_rate": null,
+        "ci_lo_95": null,
+        "ci_hi_95": null,
+        "significant": false
+      },
+      "0.80-0.85": {
+        "n": 0,
+        "wins": 0,
+        "win_rate": null,
+        "ci_lo_95": null,
+        "ci_hi_95": null,
+        "significant": false
+      },
+      "0.85-0.90": {
+        "n": 0,
+        "wins": 0,
+        "win_rate": null,
+        "ci_lo_95": null,
+        "ci_hi_95": null,
+        "significant": false
+      },
+      "0.90-0.95": {
+        "n": 0,
+        "wins": 0,
+        "win_rate": null,
+        "ci_lo_95": null,
+        "ci_hi_95": null,
+        "significant": false
+      },
+      "0.95-1.00": {
+        "n": 0,
+        "wins": 0,
+        "win_rate": null,
+        "ci_lo_95": null,
+        "ci_hi_95": null,
+        "significant": false
+      }
+    },
+    "coarse": {
+      "0.50-0.60": {
+        "n": 749,
+        "wins": 393,
+        "win_rate": 0.5247,
+        "ci_lo_95": 0.4889,
+        "ci_hi_95": 0.5602,
+        "significant": false
+      },
+      "0.60-0.70": {
+        "n": 0,
+        "wins": 0,
+        "win_rate": null,
+        "ci_lo_95": null,
+        "ci_hi_95": null,
+        "significant": false
+      },
+      "0.70-0.80": {
+        "n": 0,
+        "wins": 0,
+        "win_rate": null,
+        "ci_lo_95": null,
+        "ci_hi_95": null,
+        "significant": false
+      },
+      "0.80-0.90": {
+        "n": 0,
+        "wins": 0,
+        "win_rate": null,
+        "ci_lo_95": null,
+        "ci_hi_95": null,
+        "significant": false
+      },
+      "0.90-1.00": {
+        "n": 0,
+        "wins": 0,
+        "win_rate": null,
+        "ci_lo_95": null,
+        "ci_hi_95": null,
+        "significant": false
+      }
+    }
+  }
+}
