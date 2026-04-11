@@ -127,8 +127,9 @@ class TestFvGateThreshold:
 
     def test_gate_fires_at_85pct_certainty(self):
         """At 85% certainty (fair_up=0.85), FV gate MUST fire and skip DN.
-        Verified by checking executor was only called for UP token."""
-        lm = _make_manager()
+        Verified by checking executor was only called for UP token.
+        Requires fv_gate_enabled=True — default is False since 2026-04-11."""
+        lm = _make_manager(_cfg(fv_gate_enabled=True))
         market = _market()
         lm.post_ladder(market, spot_delta=0.0, fair_up=0.85)
         tokens_posted = self._get_posted_token_ids(lm)
@@ -139,8 +140,9 @@ class TestFvGateThreshold:
         )
 
     def test_gate_boundary_at_exactly_80pct(self):
-        """fair_up=0.80 -> certainty=80% -> gate fires (>= 0.80 threshold)."""
-        lm = _make_manager()
+        """fair_up=0.80 -> certainty=80% -> gate fires (>= 0.80 threshold).
+        Requires fv_gate_enabled=True — default is False since 2026-04-11."""
+        lm = _make_manager(_cfg(fv_gate_enabled=True))
         market = _market()
         lm.post_ladder(market, spot_delta=0.0, fair_up=0.80)
         tokens_posted = self._get_posted_token_ids(lm)
@@ -167,6 +169,70 @@ class TestFvGateThreshold:
         # fair_up=0.95 — if gate used it, it would fire; since FV is off, it must not
         count = lm.post_ladder(market, spot_delta=0.0, fair_up=0.95)
         assert count >= 0  # no crash
+
+
+# ── FV gate feature-flag tests (2026-04-11 kill) ────────────────────────────
+
+class TestFvGateFeatureFlag:
+    """Tests for the fv_gate_enabled flag introduced 2026-04-11.
+
+    Default is False (gate off). Gate logic preserved behind the flag.
+    """
+
+    def _get_posted_token_ids(self, lm):
+        tokens_posted = set()
+        for call in lm.executor.place_batch_limit_buys.call_args_list:
+            order_dicts = call.args[0] if call.args else call.kwargs.get('orders', [])
+            for od in order_dicts:
+                if isinstance(od, dict) and 'token_id' in od:
+                    tokens_posted.add(od['token_id'])
+        return tokens_posted
+
+    def test_fv_gate_disabled_posts_bilateral(self):
+        """With fv_gate_enabled=False (default), high certainty still posts both sides.
+
+        Research finding: 33% win rate at 80-89% cert — worse than coin flip.
+        Disabling the gate restores bilateral posting at all certainty levels.
+        """
+        lm = _make_manager(_cfg(fv_gate_enabled=False))
+        market = _market()
+        # cert=85% — would have fired the gate if enabled
+        lm.post_ladder(market, spot_delta=0.0, fair_up=0.85)
+        tokens_posted = self._get_posted_token_ids(lm)
+        assert "tok_up" in tokens_posted and "tok_dn" in tokens_posted, (
+            f"With fv_gate_enabled=False, both sides must be posted at 85% certainty. "
+            f"Got: {tokens_posted}"
+        )
+
+    def test_fv_gate_enabled_posts_directional(self):
+        """With fv_gate_enabled=True, high certainty skips the losing side.
+
+        Preserves the old gate behavior for experiments / re-calibration.
+        """
+        lm = _make_manager(_cfg(fv_gate_enabled=True))
+        market = _market()
+        # fair_up=0.85 -> cert=85% -> gate fires, DN skipped
+        lm.post_ladder(market, spot_delta=0.0, fair_up=0.85)
+        tokens_posted = self._get_posted_token_ids(lm)
+        assert "tok_dn" not in tokens_posted, (
+            f"With fv_gate_enabled=True, DN must be skipped at 85% certainty. "
+            f"Got: {tokens_posted}"
+        )
+
+    def test_fv_gate_disabled_low_certainty_unchanged(self):
+        """With fv_gate_enabled=False and low certainty, bilateral posting unchanged.
+
+        Low certainty (50%) never triggered the gate anyway — sanity check that
+        the flag doesn't break the normal bilateral path.
+        """
+        lm = _make_manager(_cfg(fv_gate_enabled=False))
+        market = _market()
+        # cert=50% — well below any gate threshold
+        lm.post_ladder(market, spot_delta=0.0, fair_up=0.50)
+        tokens_posted = self._get_posted_token_ids(lm)
+        assert "tok_up" in tokens_posted and "tok_dn" in tokens_posted, (
+            f"Low certainty (50%) must always post bilateral. Got: {tokens_posted}"
+        )
 
 
 # ── Task 2: 1h pair cost guard tests ────────────────────────────────────────

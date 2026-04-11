@@ -994,7 +994,7 @@ class LadderManager:
             # worst-case adverse selection loss per window to ≤$20 (from -$27/-$30 outliers).
             # Orthogonal to is_directional flag — cap operates unconditionally on one-sided posts.
             dir_cap = self.cfg.directional_budget_cap
-            if cert >= 0.80:
+            if self.cfg.fv_gate_enabled and cert >= 0.80:
                 capped_budget = min(budget, dir_cap)
                 if fair_up > 0.5:
                     # UP is winning — don't post DN
@@ -1013,6 +1013,13 @@ class LadderManager:
                         market.market_id, cert * 100, capped_budget, dir_cap,
                     )
             else:
+                if not self.cfg.fv_gate_enabled and cert >= 0.80:
+                    # Gate disabled — log what would have fired for observability / later analysis
+                    p_up = fair_up
+                    logger.info(
+                        "FV GATE DISABLED: would have fired cert=%.2f p_up=%.2f on %s — posting bilateral",
+                        cert, p_up, market.market_id,
+                    )
                 # Spot-delta based skew (mild, defensive only)
                 reduce_thresh = self.cfg.spot_delta_reduce_threshold
                 skip_thresh = self.cfg.spot_delta_skip_threshold

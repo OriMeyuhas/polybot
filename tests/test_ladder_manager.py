@@ -780,8 +780,13 @@ import time as _time_mod
 import os
 
 
-def _make_dir_cap_manager(directional_budget_cap=20.0, bankroll=540.0, fair_value_enabled=True):
-    """Build a LadderManager configured with specified directional_budget_cap and bankroll."""
+def _make_dir_cap_manager(directional_budget_cap=20.0, bankroll=540.0, fair_value_enabled=True,
+                          fv_gate_enabled=True):
+    """Build a LadderManager configured with specified directional_budget_cap and bankroll.
+
+    fv_gate_enabled defaults to True here because these tests specifically exercise
+    the FV gate firing path. The bot default is False (disabled 2026-04-11).
+    """
     from polybot.strategy.ladder_manager import LadderManager
     from polybot.strategy.position_manager import PositionManager
     from polybot.risk_manager import RiskManager
@@ -808,6 +813,7 @@ def _make_dir_cap_manager(directional_budget_cap=20.0, bankroll=540.0, fair_valu
         spot_gate_force_buy_threshold=0.003,
         spot_loss_cap_multiplier=0.50,
         fair_value_enabled=fair_value_enabled,
+        fv_gate_enabled=fv_gate_enabled,
         vol_window_sec=300,
         vol_fallback_annual=0.50,
         vol_min_samples=30,

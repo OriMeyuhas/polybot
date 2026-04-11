@@ -207,6 +207,15 @@ class BotConfig:
     # Proposal #53.
     directional_budget_cap: float = 20.0
 
+    # FV directional gate — when enabled, skips the losing side at cert >= 80%.
+    # Disabled 2026-04-11: 500ms-delay removal killed info-arb edge, FV calibration
+    # broken at 80-89% (33% win rate, worse than coin flip). Re-enable only after
+    # proper model calibration against historical data. See:
+    # researcher_2026-04-11_fv-gate-kill-decision.md
+    # NOTE: fv_gate_certainty_threshold (hardcoded 0.80 in ladder_manager.py) is
+    # inert when fv_gate_enabled=False — the threshold check is never reached.
+    fv_gate_enabled: bool = False
+
     def get_ladder_params(self, timeframe_sec: int, current_bankroll: float | None = None) -> LadderParams:
         """Return ladder parameters tuned for the given timeframe.
 
@@ -469,6 +478,7 @@ def load_bot_config() -> BotConfig:
         spot_gate_force_buy_threshold=float(os.getenv("SPOT_GATE_FORCE_BUY_THRESHOLD", "0.003")),
         spot_loss_cap_multiplier=float(os.getenv("SPOT_LOSS_CAP_MULTIPLIER", "0.50")),
         directional_budget_cap=float(os.getenv("DIRECTIONAL_BUDGET_CAP", "20.0")),
+        fv_gate_enabled=os.getenv("FV_GATE_ENABLED", "false").lower() in ("true", "1", "yes"),
     )
 
 
