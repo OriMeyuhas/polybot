@@ -1,19 +1,20 @@
-"""Tests for tools/backtester.py
+"""Tests for tools/backtester.py (local book_log version).
 
 Covers:
- - simulate_market() with hand-crafted snapshots
+ - BookState / lookup_book_state: correct best_bid/best_ask from price_change events
  - BacktestConfig loading from YAML
- - FV gate toggle changes output
- - Calibration table binning
- - No-fills case (PnL = 0)
+ - simulate_market: paired fills when both sides have resting orders matching book state
+ - fv_gate_enabled flag changes behavior
+ - MarketWindow with/without token mapping
+ - aggregate_results metrics
 """
 from __future__ import annotations
 
+import json
 import math
 import pathlib
 import sys
 import tempfile
-import json
 
 import pytest
 import yaml
@@ -22,93 +23,125 @@ import yaml
 _PROJECT_ROOT = pathlib.Path(__file__).parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
-# Also add tools/ so backtester imports correctly
-_TOOLS_DIR = _PROJECT_ROOT / "tools"
-if str(_TOOLS_DIR) not in sys.path:
-    sys.path.insert(0, str(_TOOLS_DIR))
 
 from tools.backtester import (
     BacktestConfig,
-    MarketSnapshot,
-    simulate_market,
-    aggregate_results,
+    BookState,
+    MarketResult,
+    MarketWindow,
     _cert_bucket,
-    load_snapshot,
-    run_backtest,
+    aggregate_results,
+    build_book_index,
+    lookup_book_state,
+    simulate_market,
+    _p_fair_up,
+    _fv_certainty,
 )
 
 
 # ---------------------------------------------------------------------------
-# Helpers to build synthetic snapshots
+# Helpers for building synthetic test data
 # ---------------------------------------------------------------------------
 
-def _make_snapshot(
+def _make_window(
+    market_id: str = "btc-updown-15m-1000000",
+    open_epoch: int = 1_000_000,
+    close_epoch: int = 1_000_900,
     outcome: str | None = "DOWN",
-    price_to_beat: float = 72000.0,
-    final_price: float | None = 71800.0,
-    n_binance: int = 100,
-    up_best_ask: float = 0.55,
-    dn_best_ask: float = 0.48,  # implied via bid = 1 - dn_ask = 0.52
-    window_start: int = 1_000_000,
-    window_dur: int = 900,
-) -> MarketSnapshot:
-    """Create a minimal synthetic MarketSnapshot for testing."""
-    window_end = window_start + window_dur
-
-    # Binance prices: flat at some spot
-    spot = price_to_beat * 0.998 if outcome == "DOWN" else price_to_beat * 1.002
-    binance = [
-        {
-            "timestamp_ms": (window_start + i * (window_dur // n_binance)) * 1000,
-            "value": spot,
-        }
-        for i in range(n_binance)
-    ]
-
-    # Orderbook: best ask for UP token = up_best_ask
-    # Bids for UP token: best bid = 1 - dn_best_ask (so DN ask can be derived)
-    up_bid = 1.0 - dn_best_ask  # e.g. 0.52
-    asks = [{"price": str(round(up_best_ask + 0.01 * i, 2)), "size": "1000"} for i in range(5)]
-    bids = [{"price": str(round(up_bid - 0.01 * i, 2)), "size": "1000"} for i in range(5)]
-
-    # Spread orderbooks across the window
-    orderbooks = [
-        {
-            "timestamp_ms": (window_start + i * (window_dur // 10)) * 1000,
-            "asks": asks,
-            "bids": bids,
-            "tick_size": 0.01,
-            "asset_id": "up_token_123",
-        }
-        for i in range(10)
-    ]
-
-    chainlink = [
-        {
-            "timestamp_ms": (window_start + i * 30) * 1000,
-            "value": spot,
-        }
-        for i in range(30)
-    ]
-
-    return MarketSnapshot(
-        slug="test-btc-15m",
-        condition_id="0xtest",
-        up_token_id="up_token_123",
-        window_start=window_start,
-        window_end=window_end,
-        price_to_beat=price_to_beat,
-        final_price=final_price,
+    up_token_id: str | None = "up_token_short_123",
+    dn_token_id: str | None = "dn_token_short_456",
+    pnl_actual: float = 0.0,
+) -> MarketWindow:
+    return MarketWindow(
+        market_id=market_id,
+        open_epoch=open_epoch,
+        close_epoch=close_epoch,
         outcome=outcome,
-        binance=binance,
-        chainlink=chainlink,
-        orderbooks=orderbooks,
-        candles=[],
+        up_token_id=up_token_id,
+        dn_token_id=dn_token_id,
+        pnl_actual=pnl_actual,
+    )
+
+
+def _make_book_index(
+    up_token: str,
+    dn_token: str,
+    up_ask: float = 0.50,
+    dn_ask: float = 0.50,
+    open_epoch: int = 1_000_000,
+    close_epoch: int = 1_000_900,
+    step: int = 30,
+) -> dict[str, list[tuple[float, float, float]]]:
+    """Build a synthetic book index with constant best_bid/best_ask throughout the window."""
+    index: dict[str, list] = {}
+    for tok, ask in [(up_token, up_ask), (dn_token, dn_ask)]:
+        bid = max(0.01, ask - 0.01)
+        entries = []
+        ts = float(open_epoch - 10)
+        while ts <= close_epoch + 10:
+            entries.append((ts, bid, ask))
+            ts += step
+        index[tok] = entries
+    return index
+
+
+def _make_price_series(
+    open_epoch: int = 1_000_000,
+    close_epoch: int = 1_000_900,
+    start_price: float = 72000.0,
+    end_price: float | None = None,
+    step: int = 30,
+) -> list[tuple[float, float]]:
+    """Build a synthetic Binance price series."""
+    if end_price is None:
+        end_price = start_price
+    prices = []
+    n = max(1, (close_epoch - open_epoch) // step)
+    for i in range(n + 1):
+        ts = open_epoch - 600 + i * step
+        # Linear interpolation from start to end
+        frac = min(1.0, (ts - (open_epoch - 600)) / max(close_epoch - (open_epoch - 600), 1))
+        price = start_price + frac * (end_price - start_price)
+        prices.append((float(ts), price))
+    return prices
+
+
+def _make_result(
+    market_id: str = "test",
+    outcome: str | None = "UP",
+    pnl: float = 1.0,
+    paired: bool = True,
+    up_qty: float = 10.0,
+    dn_qty: float = 10.0,
+    cert: float = 0.65,
+    outcome_correct: bool | None = True,
+    has_book_data: bool = True,
+) -> MarketResult:
+    return MarketResult(
+        market_id=market_id,
+        outcome=outcome,
+        outcome_correct=outcome_correct,
+        fills=[],
+        events=[],
+        pnl=pnl,
+        paired=paired,
+        up_cost=up_qty * 0.45,
+        dn_cost=dn_qty * 0.45,
+        pair_cost=0.90,
+        up_qty=up_qty,
+        dn_qty=dn_qty,
+        fv_at_entry=cert if outcome == "UP" else 1.0 - cert,
+        certainty_at_entry=cert,
+        aborted=False,
+        fv_blocked=False,
+        cert_bucket=_cert_bucket(cert),
+        market_hour=12,
+        has_book_data=has_book_data,
     )
 
 
 # ---------------------------------------------------------------------------
-# Test: BacktestConfig loading from YAML
+# Test: BacktestConfig
 # ---------------------------------------------------------------------------
 
 class TestBacktestConfig:
@@ -123,7 +156,7 @@ class TestBacktestConfig:
         cfg = BacktestConfig.from_dict({"fv_gate_enabled": True, "rungs": 5})
         assert cfg.fv_gate_enabled is True
         assert cfg.rungs == 5
-        assert cfg.spacing == 0.01  # default unchanged
+        assert cfg.spacing == 0.01
 
     def test_from_dict_ignores_unknown_keys(self):
         cfg = BacktestConfig.from_dict({"unknown_key": 99, "rungs": 7})
@@ -143,7 +176,7 @@ class TestBacktestConfig:
         p = tmp_path / "empty.yaml"
         p.write_text("")
         cfg = BacktestConfig.from_yaml(p)
-        assert cfg.rungs == 10  # defaults
+        assert cfg.rungs == 10
 
     def test_to_dict_round_trip(self):
         cfg = BacktestConfig(rungs=7, fv_gate_enabled=True)
@@ -154,102 +187,283 @@ class TestBacktestConfig:
 
 
 # ---------------------------------------------------------------------------
-# Test: simulate_market — basic cases
+# Test: Book state reconstruction
 # ---------------------------------------------------------------------------
 
-class TestSimulateMarket:
-    def test_no_fills_when_no_orderbooks(self):
-        """If there are no orderbooks, no fills can occur -> PnL = 0."""
-        snap = _make_snapshot(outcome="DOWN")
-        snap.orderbooks.clear()
-        cfg = BacktestConfig()
-        result = simulate_market(snap, cfg)
-        assert result.pnl == 0.0
+class TestBookStateReconstruction:
+    def test_initial_state(self):
+        """Fresh BookState has default best_bid=0, best_ask=1."""
+        bs = BookState("mytoken")
+        assert bs.best_bid == 0.0
+        assert bs.best_ask == 1.0
+        assert bs.last_update_ts == 0.0
+
+    def test_apply_book_event_updates_bid_ask(self):
+        """Applying a book event with bids/asks updates best_bid/best_ask."""
+        bs = BookState("tok1")
+        event = {
+            "ts": 1000.5,
+            "token_id": "tok1",
+            "event_type": "book",
+            "data": {
+                "bids": [{"price": "0.44", "size": "100"}, {"price": "0.43", "size": "200"}],
+                "asks": [{"price": "0.46", "size": "100"}, {"price": "0.47", "size": "200"}],
+            },
+        }
+        bs.apply_book_event(event)
+        assert bs.best_bid == pytest.approx(0.44, abs=1e-9)
+        assert bs.best_ask == pytest.approx(0.46, abs=1e-9)
+        assert bs.last_update_ts == pytest.approx(1000.5)
+
+    def test_apply_price_change_updates_bid_ask(self):
+        """Applying a price_change entry updates best_bid/best_ask."""
+        bs = BookState("tok1")
+        pc = {"asset_id": "tok1full", "best_bid": "0.52", "best_ask": "0.54", "price": "0.01", "size": "10", "side": "BUY"}
+        bs.apply_price_change(pc, ts=1001.0)
+        assert bs.best_bid == pytest.approx(0.52)
+        assert bs.best_ask == pytest.approx(0.54)
+
+    def test_apply_price_change_partial_update(self):
+        """If only best_ask is present, best_bid stays unchanged."""
+        bs = BookState("tok1")
+        bs.best_bid = 0.45
+        bs.best_ask = 0.50
+        pc = {"asset_id": "tok1full", "best_ask": "0.48"}
+        bs.apply_price_change(pc, ts=1002.0)
+        assert bs.best_bid == pytest.approx(0.45)
+        assert bs.best_ask == pytest.approx(0.48)
+
+
+# ---------------------------------------------------------------------------
+# Test: build_book_index and lookup_book_state
+# ---------------------------------------------------------------------------
+
+class TestBookIndex:
+    def test_build_index_from_book_events(self, tmp_path):
+        """Index correctly extracts best_bid/best_ask from book events."""
+        book_log = tmp_path / "book_log_2000-01-01.jsonl"
+        events = [
+            {"ts": 1000.0, "token_id": "tok1", "event_type": "book",
+             "data": {"bids": [{"price": "0.44", "size": "100"}],
+                      "asks": [{"price": "0.46", "size": "100"}]}},
+            {"ts": 1030.0, "token_id": "tok1", "event_type": "book",
+             "data": {"bids": [{"price": "0.42", "size": "100"}],
+                      "asks": [{"price": "0.44", "size": "100"}]}},
+        ]
+        book_log.write_text("\n".join(json.dumps(e) for e in events))
+
+        index = build_book_index(tmp_path, ["2000-01-01"], cache_dir=None)
+        assert "tok1" in index
+        assert len(index["tok1"]) == 2
+        assert index["tok1"][0] == pytest.approx((1000.0, 0.44, 0.46), abs=1e-6)
+        assert index["tok1"][1] == pytest.approx((1030.0, 0.42, 0.44), abs=1e-6)
+
+    def test_build_index_from_price_change_events(self, tmp_path):
+        """Index correctly extracts best_bid/best_ask from price_change events."""
+        book_log = tmp_path / "book_log_2000-01-01.jsonl"
+        events = [
+            {"ts": 1000.0, "token_id": "", "event_type": "price_change",
+             "data": {"price_changes": [
+                 {"asset_id": "tok2full", "best_bid": "0.51", "best_ask": "0.53",
+                  "price": "0.01", "size": "10", "side": "BUY"},
+             ]}},
+            {"ts": 1060.0, "token_id": "", "event_type": "price_change",
+             "data": {"price_changes": [
+                 {"asset_id": "tok2full", "best_bid": "0.52", "best_ask": "0.54",
+                  "price": "0.01", "size": "10", "side": "BUY"},
+             ]}},
+        ]
+        book_log.write_text("\n".join(json.dumps(e) for e in events))
+
+        index = build_book_index(tmp_path, ["2000-01-01"], cache_dir=None)
+        tok2_short = "tok2full"[:20]
+        assert tok2_short in index
+        assert len(index[tok2_short]) == 2
+
+    def test_lookup_book_state_binary_search(self):
+        """lookup_book_state returns the most recent entry before ts."""
+        entries = [
+            (1000.0, 0.44, 0.46),
+            (1030.0, 0.42, 0.44),
+            (1060.0, 0.40, 0.42),
+        ]
+        index = {"tok1": entries}
+
+        result = lookup_book_state(index, "tok1", 1029.9)
+        assert result == pytest.approx((0.44, 0.46), abs=1e-9)
+
+        result = lookup_book_state(index, "tok1", 1060.0)
+        assert result == pytest.approx((0.40, 0.42), abs=1e-9)
+
+        result = lookup_book_state(index, "tok1", 999.0)
+        assert result == pytest.approx((0.44, 0.46), abs=1e-9)  # first entry
+
+    def test_lookup_missing_token(self):
+        """lookup_book_state returns None for unknown token."""
+        index: dict = {}
+        result = lookup_book_state(index, "unknown", 1000.0)
+        assert result is None
+
+    def test_lookup_empty_list(self):
+        """lookup_book_state returns None for token with empty list."""
+        index = {"tok1": []}
+        result = lookup_book_state(index, "tok1", 1000.0)
+        assert result is None
+
+    def test_index_from_multiple_dates(self, tmp_path):
+        """Index merges data from multiple date files."""
+        log1 = tmp_path / "book_log_2000-01-01.jsonl"
+        log2 = tmp_path / "book_log_2000-01-02.jsonl"
+        log1.write_text(json.dumps({
+            "ts": 1000.0, "token_id": "tok1", "event_type": "book",
+            "data": {"bids": [{"price": "0.44", "size": "1"}], "asks": [{"price": "0.46", "size": "1"}]}
+        }))
+        log2.write_text(json.dumps({
+            "ts": 86401.0, "token_id": "tok1", "event_type": "book",
+            "data": {"bids": [{"price": "0.48", "size": "1"}], "asks": [{"price": "0.50", "size": "1"}]}
+        }))
+        index = build_book_index(tmp_path, ["2000-01-01", "2000-01-02"], cache_dir=None)
+        assert len(index["tok1"]) == 2
+
+    def test_paired_fills_detected_when_ask_low(self):
+        """simulate_market detects paired fills when book ask falls to rung level."""
+        # Set up a scenario where UP and DN asks are at 0.01 (very cheap)
+        # Our ladder at ~0.45 would fill immediately since 0.45 >= 0.01
+        up_tok = "up_token_abc123456789"
+        dn_tok = "dn_token_xyz987654321"
+        open_epoch = 1_000_000
+        close_epoch = 1_000_900
+
+        book_index = _make_book_index(up_tok, dn_tok, up_ask=0.01, dn_ask=0.01,
+            open_epoch=open_epoch, close_epoch=close_epoch)
+        prices = _make_price_series(open_epoch, close_epoch, 72000.0)
+        window = _make_window(up_token_id=up_tok, dn_token_id=dn_tok,
+            open_epoch=open_epoch, close_epoch=close_epoch, outcome="DOWN")
+
+        cfg = BacktestConfig(
+            fv_cancel_enabled=False,
+            one_sided_abort_enabled=False,
+            fv_gate_enabled=False,
+        )
+        result = simulate_market(window, book_index, prices, cfg)
+
+        # With ask=0.01 on both sides, all our resting bids (0.35-0.45) should fill
+        assert result.up_qty > 0
+        assert result.dn_qty > 0
+        assert result.paired
+
+    def test_no_fills_when_ask_too_high(self):
+        """No fills occur when book ask is 0.99 (above all our resting bids)."""
+        up_tok = "up_token_abc123456789"
+        dn_tok = "dn_token_xyz987654321"
+        open_epoch = 1_000_000
+        close_epoch = 1_000_900
+
+        book_index = _make_book_index(up_tok, dn_tok, up_ask=0.99, dn_ask=0.99,
+            open_epoch=open_epoch, close_epoch=close_epoch)
+        prices = _make_price_series(open_epoch, close_epoch, 72000.0)
+        window = _make_window(up_token_id=up_tok, dn_token_id=dn_tok,
+            open_epoch=open_epoch, close_epoch=close_epoch, outcome="DOWN")
+
+        cfg = BacktestConfig(
+            fv_cancel_enabled=False,
+            one_sided_abort_enabled=False,
+            fv_gate_enabled=False,
+        )
+        result = simulate_market(window, book_index, prices, cfg)
         assert result.up_qty == 0.0
         assert result.dn_qty == 0.0
         assert not result.paired
+        assert result.pnl == 0.0
 
-    def test_fills_occur_when_price_below_our_bids(self):
-        """When the book's ask is at 0.01, our limit orders at 0.55 should fill."""
-        snap = _make_snapshot(
-            outcome="DOWN",
-            up_best_ask=0.01,  # very cheap — all our UP bids at 0.55+ fill immediately
-            dn_best_ask=0.01,
-        )
+    def test_paired_pnl_positive_when_pair_cost_below_max(self):
+        """Paired position with pair_cost < max_pair_cost produces positive PnL."""
+        up_tok = "up_token_abc123456789"
+        dn_tok = "dn_token_xyz987654321"
+        open_epoch = 1_000_000
+        close_epoch = 1_000_900
+
+        # Asks at 0.01 -> our bids at ~0.40-0.45 fill; pair cost well below 0.98
+        book_index = _make_book_index(up_tok, dn_tok, up_ask=0.01, dn_ask=0.01,
+            open_epoch=open_epoch, close_epoch=close_epoch)
+        prices = _make_price_series(open_epoch, close_epoch, 72000.0)
+
+        for outcome in ("UP", "DOWN"):
+            window = _make_window(up_token_id=up_tok, dn_token_id=dn_tok,
+                open_epoch=open_epoch, close_epoch=close_epoch, outcome=outcome)
+            cfg = BacktestConfig(
+                fv_cancel_enabled=False,
+                one_sided_abort_enabled=False,
+                fv_gate_enabled=False,
+                max_pair_cost=0.98,
+            )
+            result = simulate_market(window, book_index, prices, cfg)
+            if result.paired:
+                assert result.pnl > 0, f"Expected positive PnL for paired fill (outcome={outcome})"
+
+    def test_no_book_data_returns_no_fills(self):
+        """If no token IDs assigned, simulate_market produces no fills."""
+        window = _make_window(up_token_id=None, dn_token_id=None, outcome="UP")
+        book_index: dict = {}
+        prices = _make_price_series(1_000_000, 1_000_900, 72000.0)
         cfg = BacktestConfig(fv_cancel_enabled=False, one_sided_abort_enabled=False)
-        result = simulate_market(snap, cfg)
-        # With ask=0.01, our rung prices (>= 0.01) should fill
-        assert result.up_qty > 0 or result.dn_qty > 0
-
-    def test_dn_wins_gives_dn_profit(self):
-        """When outcome=DOWN and we hold DN shares, PnL > 0."""
-        # Place order at very low DN ask so DN fills
-        snap = _make_snapshot(
-            outcome="DOWN",
-            up_best_ask=0.99,  # UP never fills (too expensive)
-            dn_best_ask=0.01,  # DN fills at 0.01 ask (derived from up bid ~0.99)
-        )
-        cfg = BacktestConfig(
-            fv_cancel_enabled=False,
-            one_sided_abort_enabled=False,
-            fv_gate_enabled=False,
-        )
-        result = simulate_market(snap, cfg)
-        # DN should have filled (best DN ask implied from UP bid = 1 - 0.99 bids side)
-        # UP orders at our price of ~0.44-0.54 vs ask=0.99 → no fill (ask too high)
-        if result.dn_qty > 0 and result.up_qty == 0:
-            # DN-only, outcome is DOWN -> profit
-            assert result.pnl > 0
+        result = simulate_market(window, book_index, prices, cfg)
+        assert result.up_qty == 0.0
+        assert result.dn_qty == 0.0
+        assert result.has_book_data is False
 
     def test_unresolved_market_pnl_zero(self):
-        """Markets with outcome=None produce pnl=0 (can't resolve)."""
-        snap = _make_snapshot(outcome=None, final_price=None)
-        cfg = BacktestConfig()
-        result = simulate_market(snap, cfg)
+        """Markets with outcome=None produce PnL=0."""
+        up_tok = "up_token_abc123456789"
+        dn_tok = "dn_token_xyz987654321"
+        book_index = _make_book_index(up_tok, dn_tok, up_ask=0.01, dn_ask=0.01)
+        prices = _make_price_series()
+        window = _make_window(up_token_id=up_tok, dn_token_id=dn_tok, outcome=None)
+        cfg = BacktestConfig(fv_cancel_enabled=False, one_sided_abort_enabled=False)
+        result = simulate_market(window, book_index, prices, cfg)
         assert result.pnl == 0.0
-        assert result.outcome is None
 
-    def test_paired_position_is_profitable_when_spread_positive(self):
-        """A paired position at pair_cost < 1.0 should be profitable."""
-        # Set asks so both UP and DN fill at ~0.45 each (pair_cost ~ 0.90)
-        snap = _make_snapshot(
-            outcome="UP",
-            up_best_ask=0.01,  # UP fills immediately
-            dn_best_ask=0.01,  # DN fills immediately (bid-derived)
-        )
-        cfg = BacktestConfig(
+    def test_fv_gate_enabled_blocks_both_sides(self):
+        """FV gate enabled with threshold 0.50 fires on all markets (cert >= 0.50 always)."""
+        up_tok = "up_token_abc123456789"
+        dn_tok = "dn_token_xyz987654321"
+        book_index = _make_book_index(up_tok, dn_tok, up_ask=0.01, dn_ask=0.01)
+        prices = _make_price_series()
+        window = _make_window(up_token_id=up_tok, dn_token_id=dn_tok, outcome="UP")
+
+        cfg_off = BacktestConfig(fv_gate_enabled=False, fv_cancel_enabled=False)
+        cfg_on = BacktestConfig(
+            fv_gate_enabled=True, fv_gate_certainty_threshold=0.50,
             fv_cancel_enabled=False,
-            one_sided_abort_enabled=False,
-            fv_gate_enabled=False,
         )
-        result = simulate_market(snap, cfg)
-        if result.paired:
-            # Paired should be profitable (spread > 0)
-            assert result.pnl > -50.0  # won't be a disaster
+        r_off = simulate_market(window, book_index, prices, cfg_off)
+        r_on = simulate_market(window, book_index, prices, cfg_on)
 
-    def test_fv_entry_is_computed(self):
-        """FV at entry should be between 0 and 1."""
-        snap = _make_snapshot()
+        assert not r_off.fv_blocked
+        assert r_on.fv_blocked
+
+    def test_fv_gate_off_never_blocks(self):
+        """FV gate disabled -> fv_blocked always False."""
+        up_tok = "up_token_abc123456789"
+        dn_tok = "dn_token_xyz987654321"
+        book_index = _make_book_index(up_tok, dn_tok)
+        prices = _make_price_series()
+        window = _make_window(up_token_id=up_tok, dn_token_id=dn_tok, outcome="DOWN")
+        cfg = BacktestConfig(fv_gate_enabled=False)
+        result = simulate_market(window, book_index, prices, cfg)
+        assert result.fv_blocked is False
+
+    def test_fv_entry_in_range(self):
+        """FV at entry is always in [0, 1]."""
+        up_tok = "up_token_abc123456789"
+        dn_tok = "dn_token_xyz987654321"
+        book_index = _make_book_index(up_tok, dn_tok)
+        prices = _make_price_series()
+        window = _make_window(up_token_id=up_tok, dn_token_id=dn_tok, outcome="UP")
         cfg = BacktestConfig()
-        result = simulate_market(snap, cfg)
+        result = simulate_market(window, book_index, prices, cfg)
         assert 0.0 <= result.fv_at_entry <= 1.0
         assert 0.5 <= result.certainty_at_entry <= 1.0
-
-    def test_market_hour_extracted(self):
-        """Market hour should be extracted from window_start epoch."""
-        import datetime
-        snap = _make_snapshot(window_start=1_700_000_000)  # some known epoch
-        cfg = BacktestConfig()
-        result = simulate_market(snap, cfg)
-        expected_hour = datetime.datetime.utcfromtimestamp(1_700_000_000).hour
-        assert result.market_hour == expected_hour
-
-    def test_result_slug_matches_snapshot(self):
-        snap = _make_snapshot()
-        snap.slug = "my-test-slug"
-        cfg = BacktestConfig()
-        result = simulate_market(snap, cfg)
-        assert result.slug == "my-test-slug"
 
 
 # ---------------------------------------------------------------------------
@@ -257,61 +471,31 @@ class TestSimulateMarket:
 # ---------------------------------------------------------------------------
 
 class TestFVGateToggle:
-    def test_fv_gate_changes_fv_blocked(self):
-        """With FV gate enabled at high certainty, fv_blocked should differ."""
-        snap = _make_snapshot(
-            outcome="DOWN",
-            price_to_beat=72000.0,
-            final_price=71000.0,  # large move DOWN -> high FV certainty for DOWN
-            up_best_ask=0.01,
-            dn_best_ask=0.01,
-        )
-        # Use very short window to maximize certainty signal
-        snap.window_start = 1_000_000
-        snap.window_end = 1_000_900
-
-        cfg_off = BacktestConfig(fv_gate_enabled=False)
-        cfg_on = BacktestConfig(
-            fv_gate_enabled=True,
-            fv_gate_certainty_threshold=0.51,  # very low threshold — almost always fires
-        )
-        result_off = simulate_market(snap, cfg_off)
-        result_on = simulate_market(snap, cfg_on)
-
-        # With gate OFF: fv_blocked=False
-        assert not result_off.fv_blocked
-        # With gate ON (very low threshold): fv_blocked=True (unless cert happens to be 0.5)
-        # The results should NOT be identical
-        assert result_off.fv_blocked != result_on.fv_blocked or result_off.pnl != result_on.pnl or True
-        # At minimum: the gate flag should differ
-        assert not result_off.fv_blocked  # gate is off -> never blocked
-
     def test_fv_gate_on_produces_fv_blocked_flag(self):
-        """FV gate on + low threshold -> fv_blocked=True for markets with any certainty."""
-        snap = _make_snapshot()
+        """FV gate on + low threshold -> fv_blocked=True."""
+        up_tok = "up_token_abc123456789"
+        dn_tok = "dn_token_xyz987654321"
+        book_index = _make_book_index(up_tok, dn_tok)
+        prices = _make_price_series()
+        window = _make_window(up_token_id=up_tok, dn_token_id=dn_tok)
         cfg = BacktestConfig(fv_gate_enabled=True, fv_gate_certainty_threshold=0.50)
-        result = simulate_market(snap, cfg)
-        # certainty is always >= 0.5 (it's max(p, 1-p)), so gate always fires
+        result = simulate_market(window, book_index, prices, cfg)
         assert result.fv_blocked is True
 
-    def test_fv_gate_off_never_blocks(self):
-        """FV gate disabled -> fv_blocked always False."""
-        snap = _make_snapshot()
-        cfg = BacktestConfig(fv_gate_enabled=False)
-        result = simulate_market(snap, cfg)
-        assert result.fv_blocked is False
-
     def test_fv_gate_results_differ_from_baseline(self):
-        """FV gate on vs off should produce different outcomes (regression test)."""
-        snap = _make_snapshot(outcome="UP", up_best_ask=0.01, dn_best_ask=0.01)
-        cfg_off = BacktestConfig(fv_gate_enabled=False, fv_cancel_enabled=False, one_sided_abort_enabled=False)
+        """FV gate on vs off produces different fv_blocked flag."""
+        up_tok = "up_token_abc123456789"
+        dn_tok = "dn_token_xyz987654321"
+        book_index = _make_book_index(up_tok, dn_tok, up_ask=0.01, dn_ask=0.01)
+        prices = _make_price_series()
+        window = _make_window(up_token_id=up_tok, dn_token_id=dn_tok, outcome="UP")
+        cfg_off = BacktestConfig(fv_gate_enabled=False, fv_cancel_enabled=False)
         cfg_on = BacktestConfig(
             fv_gate_enabled=True, fv_gate_certainty_threshold=0.50,
-            fv_cancel_enabled=False, one_sided_abort_enabled=False,
+            fv_cancel_enabled=False,
         )
-        r_off = simulate_market(snap, cfg_off)
-        r_on = simulate_market(snap, cfg_on)
-        # They should differ in fv_blocked flag
+        r_off = simulate_market(window, book_index, prices, cfg_off)
+        r_on = simulate_market(window, book_index, prices, cfg_on)
         assert r_off.fv_blocked != r_on.fv_blocked
 
 
@@ -320,550 +504,148 @@ class TestFVGateToggle:
 # ---------------------------------------------------------------------------
 
 class TestCalibrationTable:
-    def _make_result(self, cert: float, outcome_correct: bool | None, pnl: float = 0.1):
-        from tools.backtester import MarketResult, Fill
-        return MarketResult(
-            slug="test",
-            outcome="UP" if outcome_correct else "DOWN",
-            outcome_correct=outcome_correct,
-            fills=[],
-            events=[],
-            pnl=pnl,
-            paired=False,
-            up_cost=0.0,
-            dn_cost=0.0,
-            pair_cost=0.0,
-            up_qty=0.0,
-            dn_qty=0.0,
-            fv_at_entry=cert,
-            certainty_at_entry=cert,
-            aborted=False,
-            fv_blocked=False,
-            cert_bucket=_cert_bucket(cert),
-            market_hour=12,
-        )
-
     def test_cert_bucket_boundaries(self):
         assert _cert_bucket(0.50) == "0.50-0.60"
         assert _cert_bucket(0.59) == "0.50-0.60"
         assert _cert_bucket(0.60) == "0.60-0.70"
-        assert _cert_bucket(0.69) == "0.60-0.70"
+        assert _cert_bucket(0.699) == "0.60-0.70"
         assert _cert_bucket(0.70) == "0.70-0.80"
         assert _cert_bucket(0.80) == "0.80-0.90"
         assert _cert_bucket(0.90) == "0.90-1.00"
-        assert _cert_bucket(0.99) == "0.90-1.00"
+        assert _cert_bucket(1.0) == "0.90-1.00"
 
-    def test_calibration_table_has_all_buckets(self):
-        """aggregate_results should always emit all 5 buckets."""
-        results = [
-            self._make_result(0.55, True),
-            self._make_result(0.65, False),
-            self._make_result(0.75, True),
-            self._make_result(0.85, True),
-            self._make_result(0.95, False),
-        ]
+    def test_aggregate_results_empty(self):
         cfg = BacktestConfig()
-        agg = aggregate_results(results, cfg)
-        table = agg["calibration_table"]
-        assert set(table.keys()) == {"0.50-0.60", "0.60-0.70", "0.70-0.80", "0.80-0.90", "0.90-1.00"}
+        result = aggregate_results([], cfg)
+        assert "error" in result
 
-    def test_calibration_win_rate_correct(self):
-        """Win rate in each bucket should be computed correctly."""
-        results = [
-            self._make_result(0.55, True),
-            self._make_result(0.55, True),
-            self._make_result(0.55, False),  # 2/3 = 0.6667
-        ]
+    def test_aggregate_single_market_win(self):
         cfg = BacktestConfig()
-        agg = aggregate_results(results, cfg)
-        wr = agg["calibration_table"]["0.50-0.60"]["win_rate"]
-        assert abs(wr - 2 / 3) < 0.001
-
-    def test_empty_bucket_has_none_win_rate(self):
-        """Buckets with no data have win_rate=None."""
-        results = [self._make_result(0.55, True)]
-        cfg = BacktestConfig()
-        agg = aggregate_results(results, cfg)
-        assert agg["calibration_table"]["0.90-1.00"]["win_rate"] is None
-        assert agg["calibration_table"]["0.90-1.00"]["n"] == 0
-
-
-# ---------------------------------------------------------------------------
-# Test: No-fills case
-# ---------------------------------------------------------------------------
-
-class TestNoFills:
-    def test_no_fills_pnl_zero(self):
-        """When market is resolved but no orders fill, PnL must be 0."""
-        # Set ask price very high so our limit bids never fill
-        snap = _make_snapshot(
-            outcome="UP",
-            up_best_ask=0.99,  # very high — our bids won't reach this
-            dn_best_ask=0.99,
-        )
-        cfg = BacktestConfig(fv_cancel_enabled=False, one_sided_abort_enabled=False)
-        result = simulate_market(snap, cfg)
-        assert result.up_qty == 0.0
-        assert result.dn_qty == 0.0
-        assert result.pnl == 0.0
-        assert not result.paired
-
-    def test_no_fills_with_fv_gate(self):
-        """FV gate + no fills should still produce PnL = 0."""
-        snap = _make_snapshot(outcome="DOWN", up_best_ask=0.99, dn_best_ask=0.99)
-        cfg = BacktestConfig(fv_gate_enabled=True, fv_gate_certainty_threshold=0.50)
-        result = simulate_market(snap, cfg)
-        assert result.pnl == 0.0
-
-    def test_aggregate_no_fills(self):
-        """aggregate_results with all-zero PnL markets works cleanly."""
-        snap = _make_snapshot(outcome="UP", up_best_ask=0.99, dn_best_ask=0.99)
-        cfg = BacktestConfig()
-        results = [simulate_market(snap, cfg) for _ in range(3)]
-        agg = aggregate_results(results, cfg)
-        assert agg["total_pnl"] == 0.0
-        assert agg["markets_simulated"] == 3
-        assert agg["win_rate"] == 0.0
-
-
-# ---------------------------------------------------------------------------
-# Test: load_snapshot
-# ---------------------------------------------------------------------------
-
-class TestLoadSnapshot:
-    def _make_jsonl(self, tmp_path: pathlib.Path, extra_lines: list[dict] | None = None) -> pathlib.Path:
-        """Write a minimal valid JSONL snapshot file."""
-        header = {
-            "type": "header",
-            "market_slug": "test-market",
-            "condition_id": "0xtest",
-            "token_ids": ["up_id", "dn_id"],
-            "up_token_id": "up_id",
-            "window_start": 1_000_000,
-            "window_end": 1_000_900,
-            "fetched_at": 1_000_950,
-            "raw_market": {
-                "winning_side": "down",
-                "status": "resolved",
-                "extra_fields": {"price_to_beat": 72000.0, "final_price": 71800.0},
-            },
-        }
-        lines = [json.dumps(header)]
-        if extra_lines:
-            lines.extend(json.dumps(l) for l in extra_lines)
-        p = tmp_path / "test-market.jsonl"
-        p.write_text("\n".join(lines))
-        return p
-
-    def test_loads_header_correctly(self, tmp_path):
-        p = self._make_jsonl(tmp_path)
-        snap = load_snapshot(p)
-        assert snap is not None
-        assert snap.slug == "test-market"
-        assert snap.condition_id == "0xtest"
-        assert snap.up_token_id == "up_id"
-        assert snap.window_start == 1_000_000
-        assert snap.window_end == 1_000_900
-
-    def test_outcome_computed_from_prices(self, tmp_path):
-        p = self._make_jsonl(tmp_path)
-        snap = load_snapshot(p)
-        # final_price=71800 < price_to_beat=72000 -> DOWN
-        assert snap.outcome == "DOWN"
-
-    def test_missing_header_returns_none(self, tmp_path):
-        p = tmp_path / "no-header.jsonl"
-        p.write_text(json.dumps({"type": "candle", "data": {}}) + "\n")
-        snap = load_snapshot(p)
-        assert snap is None
-
-    def test_binance_records_loaded(self, tmp_path):
-        binance_rec = {"type": "binance", "data": {"symbol": "btcusdt", "value": 72000, "timestamp": 1_000_000_000}}
-        p = self._make_jsonl(tmp_path, extra_lines=[binance_rec])
-        snap = load_snapshot(p)
-        assert len(snap.binance) == 1
-        assert snap.binance[0]["value"] == 72000.0
-
-    def test_orderbook_records_loaded(self, tmp_path):
-        ob_rec = {
-            "type": "orderbook",
-            "data": {
-                "asks": [{"price": "0.55", "size": "100"}],
-                "bids": [{"price": "0.45", "size": "100"}],
-                "tickSize": "0.01",
-                "assetId": "up_id",
-                "timestamp": 1_000_000_100,
-                "indexedAt": "...",
-                "hash": "...",
-                "market": "...",
-                "minOrderSize": "5",
-                "negRisk": False,
-            }
-        }
-        p = self._make_jsonl(tmp_path, extra_lines=[ob_rec])
-        snap = load_snapshot(p)
-        assert len(snap.orderbooks) == 1
-        assert snap.orderbooks[0]["tick_size"] == 0.01
-        assert snap.orderbooks[0]["asks"][0]["price"] == "0.55"
-
-    def test_nonexistent_file_returns_none(self, tmp_path):
-        snap = load_snapshot(tmp_path / "does_not_exist.jsonl")
-        assert snap is None
-
-
-# ---------------------------------------------------------------------------
-# Test: aggregate_results — edge cases
-# ---------------------------------------------------------------------------
-
-class TestAggregateResults:
-    def _simple_result(self, pnl: float, paired: bool = False, outcome_correct: bool | None = True):
-        from tools.backtester import MarketResult
-        return MarketResult(
-            slug="test",
-            outcome="UP",
-            outcome_correct=outcome_correct,
-            fills=[],
-            events=[],
-            pnl=pnl,
-            paired=paired,
-            up_cost=0.0,
-            dn_cost=0.0,
-            pair_cost=0.0,
-            up_qty=5.0 if pnl > 0 else 0.0,
-            dn_qty=5.0 if pnl > 0 else 0.0,
-            fv_at_entry=0.55,
-            certainty_at_entry=0.55,
-            aborted=False,
-            fv_blocked=False,
-            cert_bucket="0.50-0.60",
-            market_hour=12,
-        )
-
-    def test_empty_results_returns_error(self):
-        cfg = BacktestConfig()
-        agg = aggregate_results([], cfg)
-        assert "error" in agg
-
-    def test_win_rate_calculation(self):
-        results = [
-            self._simple_result(1.0),
-            self._simple_result(1.0),
-            self._simple_result(-1.0),
-        ]
-        cfg = BacktestConfig()
-        agg = aggregate_results(results, cfg)
-        assert abs(agg["win_rate"] - 2 / 3) < 0.001
-
-    def test_total_pnl_summed(self):
-        results = [
-            self._simple_result(2.5),
-            self._simple_result(-1.0),
-            self._simple_result(0.5),
-        ]
-        cfg = BacktestConfig()
-        agg = aggregate_results(results, cfg)
-        assert abs(agg["total_pnl"] - 2.0) < 0.001
-
-    def test_sharpe_positive_for_consistent_gains(self):
-        results = [self._simple_result(1.0) for _ in range(10)]
-        cfg = BacktestConfig()
-        agg = aggregate_results(results, cfg)
-        # Std=0 → sharpe=0 (no variance)
-        assert agg["sharpe_like"] == 0.0
-
-    def test_worst_markets_capped_at_five(self):
-        results = [self._simple_result(-float(i)) for i in range(10)]
-        cfg = BacktestConfig()
-        agg = aggregate_results(results, cfg)
-        assert len(agg["worst_markets"]) == 5
-
-    def test_per_hour_pnl_grouped(self):
-        import datetime
-        # window_start at different hours
-        r1 = self._simple_result(1.0)
-        r1.market_hour = 8
-        r2 = self._simple_result(2.0)
-        r2.market_hour = 8
-        r3 = self._simple_result(3.0)
-        r3.market_hour = 12
-        cfg = BacktestConfig()
-        agg = aggregate_results([r1, r2, r3], cfg)
-        assert abs(agg["per_hour_pnl"]["8"] - 3.0) < 0.001
-        assert abs(agg["per_hour_pnl"]["12"] - 3.0) < 0.001
-
-
-# ---------------------------------------------------------------------------
-# Test: run_backtest integration (with real JSONL files if available)
-# ---------------------------------------------------------------------------
-
-class TestRunBacktest:
-    def test_run_on_empty_dir(self, tmp_path):
-        """Running on an empty directory returns an error dict."""
-        cfg = BacktestConfig()
-        agg = run_backtest(tmp_path, cfg)
-        assert "error" in agg
-
-    def test_run_on_synthetic_file(self, tmp_path):
-        """Writing a synthetic JSONL and running backtest produces valid output."""
-        # Build a minimal valid JSONL
-        header = {
-            "type": "header",
-            "market_slug": "btc-test-15m",
-            "condition_id": "0xabc",
-            "token_ids": ["up", "dn"],
-            "up_token_id": "up",
-            "window_start": 1_700_000_000,
-            "window_end": 1_700_000_900,
-            "fetched_at": 1_700_001_000,
-            "raw_market": {
-                "winning_side": None,
-                "status": "resolved",
-                "extra_fields": {"price_to_beat": 70000.0, "final_price": 70500.0},
-            },
-        }
-        binance = {"type": "binance", "data": {"symbol": "btcusdt", "value": 70500, "timestamp": 1_700_000_500_000}}
-        chainlink = {"type": "chainlink", "data": {"symbol": "btc/usd", "value": 70501.0, "timestamp": 1_700_000_500_000}}
-        ob = {
-            "type": "orderbook",
-            "data": {
-                "asks": [{"price": "0.55", "size": "500"}],
-                "bids": [{"price": "0.45", "size": "500"}],
-                "tickSize": "0.01",
-                "assetId": "up",
-                "timestamp": 1_700_000_100_000,
-                "indexedAt": "x",
-                "hash": "x",
-                "market": "x",
-                "minOrderSize": "5",
-                "negRisk": False,
-            },
-        }
-        lines = [json.dumps(header), json.dumps(binance), json.dumps(chainlink), json.dumps(ob)]
-        p = tmp_path / "btc-test-15m.jsonl"
-        p.write_text("\n".join(lines))
-
-        cfg = BacktestConfig()
-        agg = run_backtest(tmp_path, cfg, verbose=False)
+        r = _make_result(pnl=5.0, paired=True, cert=0.65)
+        agg = aggregate_results([r], cfg)
+        assert agg["total_pnl"] == 5.0
+        assert agg["win_rate"] == 1.0
+        assert agg["paired_rate"] == 1.0
         assert agg["markets_simulated"] == 1
-        assert "total_pnl" in agg
-        assert "calibration_table" in agg
 
-    def test_output_json_written(self, tmp_path):
-        """Output JSON file is created at the specified path."""
-        header = {
-            "type": "header",
-            "market_slug": "btc-out-test",
-            "condition_id": "0xout",
-            "token_ids": ["u", "d"],
-            "up_token_id": "u",
-            "window_start": 1_700_000_000,
-            "window_end": 1_700_000_900,
-            "fetched_at": 1_700_001_000,
-            "raw_market": {
-                "winning_side": "up",
-                "status": "resolved",
-                "extra_fields": {"price_to_beat": 70000.0, "final_price": 71000.0},
-            },
-        }
-        p = tmp_path / "btc-out-test.jsonl"
-        p.write_text(json.dumps(header))
-
-        out_path = tmp_path / "output.json"
+    def test_aggregate_multiple_markets(self):
         cfg = BacktestConfig()
-        run_backtest(tmp_path, cfg, output_path=out_path)
-        assert out_path.exists()
-        data = json.loads(out_path.read_text())
-        assert data["markets_simulated"] == 1
+        results = [
+            _make_result(pnl=3.0, paired=True, cert=0.65),
+            _make_result(pnl=-2.0, paired=False, cert=0.55,
+                up_qty=0.0, dn_qty=0.0, outcome_correct=False),
+            _make_result(pnl=1.0, paired=True, cert=0.80),
+        ]
+        agg = aggregate_results(results, cfg)
+        assert agg["total_pnl"] == pytest.approx(2.0, abs=1e-6)
+        assert agg["markets_simulated"] == 3
+        assert agg["win_rate"] == pytest.approx(2/3, abs=1e-3)
+
+    def test_aggregate_calibration_table_populated(self):
+        cfg = BacktestConfig()
+        results = [
+            _make_result(cert=0.55, outcome_correct=True),
+            _make_result(cert=0.55, outcome_correct=False),
+            _make_result(cert=0.75, outcome_correct=True),
+            _make_result(cert=0.85, outcome_correct=True),
+        ]
+        agg = aggregate_results(results, cfg)
+        cal = agg["calibration_table"]
+        assert cal["0.50-0.60"]["n"] == 2
+        assert cal["0.50-0.60"]["win_rate"] == 0.5
+        assert cal["0.70-0.80"]["n"] == 1
+        assert cal["0.80-0.90"]["n"] == 1
+
+    def test_aggregate_max_loss(self):
+        cfg = BacktestConfig()
+        results = [
+            _make_result(pnl=5.0),
+            _make_result(pnl=-15.0),
+            _make_result(pnl=2.0),
+        ]
+        agg = aggregate_results(results, cfg)
+        assert agg["max_loss"] == -15.0
+        assert agg["max_gain"] == 5.0
+
+    def test_aggregate_has_book_coverage(self):
+        cfg = BacktestConfig()
+        results = [
+            _make_result(has_book_data=True),
+            _make_result(has_book_data=False),
+            _make_result(has_book_data=True),
+        ]
+        agg = aggregate_results(results, cfg)
+        assert agg["book_coverage_rate"] == pytest.approx(2/3, abs=1e-3)
 
 
 # ---------------------------------------------------------------------------
-# Test: DN orderbook reading from real snapshots
+# Test: build_book_index caching
 # ---------------------------------------------------------------------------
 
-def _make_snapshot_with_dn_orderbooks(
-    dn_best_ask: float = 0.43,
-    **kwargs,
-) -> "MarketSnapshot":
-    """Build a MarketSnapshot that includes real DN-side orderbooks (new schema)."""
-    snap = _make_snapshot(**kwargs)
-    # Replace orderbooks with entries that have explicit side tags
-    window_start = snap.window_start
-    window_dur = snap.window_end - snap.window_start
-    up_asks = [{"price": str(round(snap.orderbooks[0]["asks"][0]["price"] if snap.orderbooks else "0.55")), "size": "1000"}]
-    dn_asks = [{"price": str(round(dn_best_ask + 0.01 * i, 2)), "size": "1000"} for i in range(5)]
-    dn_bids = [{"price": str(round(1.0 - dn_best_ask - 0.01 * i - 0.01, 2)), "size": "1000"} for i in range(5)]
+class TestBookIndexCaching:
+    def test_cache_round_trip(self, tmp_path):
+        """Index is saved to cache and loaded correctly on second call."""
+        book_log = tmp_path / "book_log_2000-01-01.jsonl"
+        book_log.write_text(json.dumps({
+            "ts": 1000.0, "token_id": "tok1", "event_type": "book",
+            "data": {"bids": [{"price": "0.44", "size": "100"}],
+                     "asks": [{"price": "0.46", "size": "100"}]}
+        }))
 
-    new_orderbooks = []
-    for i in range(10):
-        ts = (window_start + i * (window_dur // 10)) * 1000
-        # UP entry
-        new_orderbooks.append({
-            "timestamp_ms": ts,
-            "asks": [{"price": str(round(0.55 + 0.01 * j, 2)), "size": "1000"} for j in range(5)],
-            "bids": [{"price": str(round(0.45 - 0.01 * j, 2)), "size": "1000"} for j in range(5)],
-            "tick_size": 0.01,
-            "asset_id": "up_token_123",
-            "side": "UP",
-        })
-        # DN entry with real prices
-        new_orderbooks.append({
-            "timestamp_ms": ts,
-            "asks": dn_asks,
-            "bids": dn_bids,
-            "tick_size": 0.01,
-            "asset_id": "dn_token_456",
-            "side": "DN",
-        })
-    snap.orderbooks = new_orderbooks
-    snap.dn_orderbooks = [ob for ob in new_orderbooks if ob.get("side") == "DN"]
-    return snap
+        # First call builds index
+        index1 = build_book_index(tmp_path, ["2000-01-01"], cache_dir=tmp_path)
+        assert "tok1" in index1
+
+        # Second call uses cache
+        index2 = build_book_index(tmp_path, ["2000-01-01"], cache_dir=tmp_path)
+        assert "tok1" in index2
+        assert index2["tok1"] == index1["tok1"]
 
 
-class TestDNOrderbookReading:
-    def test_reads_dn_orderbook_when_present(self):
-        """When DN orderbook entries exist in snapshot, best_dn_ask_at should return their real ask."""
-        from tools.backtester import best_dn_ask_at
+# ---------------------------------------------------------------------------
+# Test: Experiment YAML configs still load correctly
+# ---------------------------------------------------------------------------
 
-        snap = _make_snapshot(outcome="DOWN")
-        window_start = snap.window_start
+class TestExperimentConfigs:
+    """Verify all experiment YAML files parse without error."""
 
-        # Inject DN orderbook entries into orderbooks list
-        dn_ob = {
-            "timestamp_ms": window_start * 1000,
-            "asks": [{"price": "0.43", "size": "500"}],
-            "bids": [{"price": "0.39", "size": "500"}],
-            "tick_size": 0.01,
-            "asset_id": "dn_token_456",
-            "side": "DN",
-        }
-        snap.orderbooks.append(dn_ob)
-        snap.orderbooks.sort(key=lambda x: x["timestamp_ms"])
+    def _config_dir(self) -> pathlib.Path:
+        return _PROJECT_ROOT / "experiments"
 
-        dn_ask = best_dn_ask_at(snap, window_start)
-        # With real DN data at 0.43, should return 0.43 (not derived from UP bid ~0.48)
-        assert dn_ask is not None
-        assert abs(dn_ask - 0.43) < 0.001, f"Expected 0.43, got {dn_ask}"
+    def test_baseline_current_loads(self):
+        p = self._config_dir() / "baseline_current.yaml"
+        if not p.exists():
+            pytest.skip("baseline_current.yaml not found")
+        cfg = BacktestConfig.from_yaml(p)
+        assert cfg.fv_gate_enabled is False
+        assert cfg.rungs == 10
 
-    def test_falls_back_to_approximation_when_dn_missing(self):
-        """When no DN side orderbooks exist, best_dn_ask_at uses the UP bid approximation."""
-        from tools.backtester import best_dn_ask_at
+    def test_paired_only_loads(self):
+        p = self._config_dir() / "paired_only.yaml"
+        if not p.exists():
+            pytest.skip("paired_only.yaml not found")
+        cfg = BacktestConfig.from_yaml(p)
+        assert cfg.fv_cancel_enabled is False
+        assert cfg.one_sided_abort_enabled is False
 
-        # _make_snapshot creates UP-only orderbooks (no 'side' key or side='UP')
-        snap = _make_snapshot(outcome="DOWN", dn_best_ask=0.48)
-        # Ensure no DN entries
-        for ob in snap.orderbooks:
-            ob.pop("side", None)
+    def test_narrow_band_fv_gate_loads(self):
+        p = self._config_dir() / "narrow_band_fv_gate.yaml"
+        if not p.exists():
+            pytest.skip("narrow_band_fv_gate.yaml not found")
+        cfg = BacktestConfig.from_yaml(p)
+        assert cfg.fv_gate_enabled is True
+        assert cfg.fv_gate_certainty_threshold == 0.95
 
-        dn_ask = best_dn_ask_at(snap, snap.window_start)
-        # Approximation: 1 - best_up_bid. UP bid ladder starts at 1-0.48=0.52
-        # so dn_ask ≈ 1 - 0.52 = 0.48
-        assert dn_ask is not None
-        assert 0.40 <= dn_ask <= 0.60, f"Approximation out of range: {dn_ask}"
+    def test_fv_gate_full_loads(self):
+        p = self._config_dir() / "fv_gate_full.yaml"
+        if not p.exists():
+            pytest.skip("fv_gate_full.yaml not found")
+        cfg = BacktestConfig.from_yaml(p)
+        assert isinstance(cfg.fv_gate_enabled, bool)
 
-    def test_simulate_uses_real_dn_asks_for_fill_check(self):
-        """simulate_market with DN orderbooks should use real DN ask price for fill decisions.
-
-        Key: When side-tagged orderbooks are present, UP fills use UP-side entries only,
-        DN fills use DN-side entries only. This prevents cross-contamination.
-        """
-        window_start = 1_000_000
-        window_dur = 900
-
-        snap = _make_snapshot(
-            outcome="DOWN",
-            up_best_ask=0.55,
-            dn_best_ask=0.48,
-            window_start=window_start,
-            window_dur=window_dur,
-        )
-
-        # Override orderbooks: UP ask=0.55 (won't fill ladder at ~0.01-0.10),
-        # DN ask=0.01 (fills immediately for DN ladder)
-        snap.orderbooks = []
-        for i in range(10):
-            ts = (window_start + i * (window_dur // 10)) * 1000
-            snap.orderbooks.append({
-                "timestamp_ms": ts,
-                "asks": [{"price": "0.55", "size": "1000"}],
-                "bids": [{"price": "0.45", "size": "1000"}],
-                "tick_size": 0.01,
-                "asset_id": "up_token_123",
-                "side": "UP",
-            })
-            snap.orderbooks.append({
-                "timestamp_ms": ts,
-                "asks": [{"price": "0.01", "size": "1000"}],
-                "bids": [{"price": "0.99", "size": "1000"}],
-                "tick_size": 0.01,
-                "asset_id": "dn_token_456",
-                "side": "DN",
-            })
-        snap.orderbooks.sort(key=lambda x: x["timestamp_ms"])
-
-        cfg = BacktestConfig(fv_cancel_enabled=False, one_sided_abort_enabled=False, fv_gate_enabled=False)
-        result = simulate_market(snap, cfg)
-        # DN ladder prices (~0.01-0.10) fill against DN ask=0.01 -> fills
-        assert result.dn_qty > 0, "DN should have filled from cheap DN orderbook"
-        # UP ladder prices (~0.01-0.10) vs UP ask=0.55 -> no fill (our bids < 0.55)
-        assert result.up_qty == 0.0, "UP should NOT fill when UP ask=0.55 and our bids are below it"
-
-    def test_load_snapshot_preserves_dn_side_tag(self, tmp_path):
-        """load_snapshot should preserve 'side' tag from orderbook entries."""
-        from tools.backtester import load_snapshot
-
-        header = {
-            "type": "header",
-            "market_slug": "btc-dn-test-15m",
-            "condition_id": "0xtest",
-            "token_ids": ["up_id", "dn_id"],
-            "up_token_id": "up_id",
-            "window_start": 1_000_000,
-            "window_end": 1_000_900,
-            "fetched_at": 1_000_950,
-            "raw_market": {
-                "winning_side": "down",
-                "status": "resolved",
-                "extra_fields": {"price_to_beat": 72000.0, "final_price": 71800.0},
-            },
-        }
-        up_ob = {
-            "type": "orderbook",
-            "side": "UP",
-            "data": {
-                "asks": [{"price": "0.55", "size": "100"}],
-                "bids": [{"price": "0.45", "size": "100"}],
-                "tickSize": "0.01",
-                "assetId": "up_id",
-                "timestamp": 1_000_100_000,
-                "indexedAt": "x",
-                "hash": "x",
-                "market": "x",
-                "minOrderSize": "5",
-                "negRisk": False,
-            },
-        }
-        dn_ob = {
-            "type": "orderbook",
-            "side": "DN",
-            "data": {
-                "asks": [{"price": "0.43", "size": "100"}],
-                "bids": [{"price": "0.39", "size": "100"}],
-                "tickSize": "0.01",
-                "assetId": "dn_id",
-                "timestamp": 1_000_100_000,
-                "indexedAt": "x",
-                "hash": "x",
-                "market": "x",
-                "minOrderSize": "5",
-                "negRisk": False,
-            },
-        }
-        p = tmp_path / "btc-dn-test-15m.jsonl"
-        p.write_text("\n".join(json.dumps(x) for x in [header, up_ob, dn_ob]))
-
-        snap = load_snapshot(p)
-        assert snap is not None
-        assert len(snap.orderbooks) == 2
-        sides = {ob.get("side") for ob in snap.orderbooks}
-        assert "UP" in sides
-        assert "DN" in sides
+    def test_paired_plus_trend_filter_loads(self):
+        p = self._config_dir() / "paired_plus_trend_filter.yaml"
+        if not p.exists():
+            pytest.skip("paired_plus_trend_filter.yaml not found")
+        cfg = BacktestConfig.from_yaml(p)
+        assert isinstance(cfg.trend_filter_enabled, bool)

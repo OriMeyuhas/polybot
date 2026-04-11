@@ -1,31 +1,32 @@
-"""Calibration backtester for PolyBot strategy.
+"""Full-fidelity paired MM backtester for PolyBot.
 
-Reads Dome historical snapshots from data/dome_snapshots/*.jsonl and simulates
-the strategy against them, producing a calibration report.
+Uses local book_log_YYYY-MM-DD.jsonl files for high-fidelity orderbook data
+instead of sparse Dome snapshots. Simulates the paired market-making strategy
+over Apr 10-11 settlements where we have continuous WS data.
 
 Usage:
-    python tools/backtester.py \
-        --data-dir data/dome_snapshots/ \
-        --config experiments/baseline_current.yaml \
-        --output results/baseline_current.json
+    python tools/backtester.py \\
+        --config experiments/paired_only.yaml \\
+        --output results/paired_only.json \\
+        --start 2026-04-10 --end 2026-04-11
 
-Each JSONL file has:
-  Line 1: header (market metadata)
-  Rest:   candle, orderbook, binance, chainlink records
-
-Simulation model (simplified):
-  - Walk through the market window tick-by-tick using Binance price series
-  - At window start, compute FV and decide whether to post ladder
-  - Determine fill prices from the orderbook snapshots (best ask on the UP/DN token)
-  - At close, compute PnL based on whether UP or DOWN won
+Architecture:
+  1. Build a market window index from market_event_log_*.jsonl
+  2. Build a token->market mapping by scanning book_log for condition_ids
+     and matching them to market windows via time proximity
+  3. For each settled market, replay best_bid/best_ask from book_log
+  4. Simulate fills, safety nets, and compute PnL
 """
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import logging
 import math
+import os
 import pathlib
+import pickle
 import sys
 import time
 from dataclasses import dataclass, field, asdict
@@ -178,7 +179,7 @@ class BacktestConfig:
     max_pair_cost: float = 0.98
     size_skew: float = 2.0
 
-    # Entry filter (trend filter — test whether requiring alignment helps)
+    # Entry filter
     trend_filter_enabled: bool = False
     trend_filter_window_sec: int = 300
     trend_filter_threshold_pct: float = 0.004
@@ -212,243 +213,635 @@ class BacktestConfig:
 
 
 # ---------------------------------------------------------------------------
-# Data loading
+# Book state reconstruction
+# ---------------------------------------------------------------------------
+
+class BookState:
+    """Tracks best_bid/best_ask for a single token, updated from book_log events."""
+
+    def __init__(self, token_id: str) -> None:
+        self.token_id = token_id  # 20-char short form
+        self.best_bid: float = 0.0
+        self.best_ask: float = 1.0
+        self.last_update_ts: float = 0.0
+
+    def apply_book_event(self, event: dict) -> None:
+        """Apply a 'book' event (full snapshot): compute best_bid/best_ask from bids/asks arrays."""
+        data = event.get("data", {})
+        bids = data.get("bids", [])
+        asks = data.get("asks", [])
+        ts = event.get("ts", 0.0)
+        if bids:
+            self.best_bid = max(float(b["price"]) for b in bids)
+        if asks:
+            self.best_ask = min(float(a["price"]) for a in asks)
+        self.last_update_ts = ts
+
+    def apply_price_change(self, price_change: dict, ts: float) -> None:
+        """Apply one price_change entry (from inside a price_change event's price_changes array)."""
+        bb = price_change.get("best_bid")
+        ba = price_change.get("best_ask")
+        if bb is not None:
+            self.best_bid = float(bb)
+        if ba is not None:
+            self.best_ask = float(ba)
+        self.last_update_ts = ts
+
+
+# ---------------------------------------------------------------------------
+# Market window data class
 # ---------------------------------------------------------------------------
 
 @dataclass
-class MarketSnapshot:
-    slug: str
-    condition_id: str
-    up_token_id: str
-    window_start: int   # epoch seconds
-    window_end: int     # epoch seconds
-    price_to_beat: float
-    final_price: float | None
-    outcome: str | None  # "UP", "DOWN", or None if unresolved
-
-    # Time series (sorted ascending by timestamp)
-    binance: list[dict]    # [{timestamp_ms, value}]
-    chainlink: list[dict]  # [{timestamp_ms, value}]
-    orderbooks: list[dict] # [{timestamp_ms, asks, bids, tick_size}]
-    candles: list[dict]    # [{end_period_ts, yes_ask, yes_bid, price}]
+class MarketWindow:
+    market_id: str
+    open_epoch: int
+    close_epoch: int
+    outcome: str | None  # "UP" or "DOWN" from settlement_log
+    up_token_id: str | None  # 20-char short form
+    dn_token_id: str | None
+    pnl_actual: float  # real PnL from settlement_log (for comparison)
 
 
-def load_snapshot(path: pathlib.Path) -> MarketSnapshot | None:
-    """Parse a dome snapshot JSONL file into a MarketSnapshot."""
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except Exception as e:
-        logger.warning("Failed to read %s: %s", path, e)
-        return None
+# ---------------------------------------------------------------------------
+# Book log indexer
+# ---------------------------------------------------------------------------
 
-    header = None
-    candles = []
-    orderbooks = []
-    binance = []
-    chainlink = []
+def build_book_index(
+    data_dir: pathlib.Path,
+    dates: list[str],
+    cache_dir: pathlib.Path | None = None,
+) -> dict[str, list[tuple[float, float, float]]]:
+    """Build an index of book states per token.
 
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
+    Returns:
+        dict mapping token_id (20-char) -> sorted list of (ts, best_bid, best_ask)
+
+    The list is sorted ascending by ts so we can binary-search for
+    "best state before time T".
+    """
+    cache_key = "_".join(dates)
+    cache_path = (cache_dir or data_dir) / f"book_index_{cache_key}.pkl"
+
+    if cache_path.exists():
         try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
+            logger.info("Loading book index from cache: %s", cache_path)
+            with open(cache_path, "rb") as f:
+                return pickle.load(f)
+        except Exception as e:
+            logger.warning("Cache load failed (%s), rebuilding...", e)
+
+    logger.info("Building book index for dates: %s", dates)
+    start = time.time()
+
+    # token_id -> [(ts, best_bid, best_ask), ...]
+    # Use lists for accumulation; we'll convert to tuples later
+    index: dict[str, list[tuple[float, float, float]]] = {}
+    current_state: dict[str, tuple[float, float]] = {}  # token -> (bid, ask)
+
+    total_lines = 0
+    total_events = 0
+
+    for date in dates:
+        book_log = data_dir / f"book_log_{date}.jsonl"
+        if not book_log.exists():
+            logger.warning("Book log not found: %s", book_log)
             continue
 
-        t = obj.get("type")
-        if t == "header":
-            header = obj
-        elif t == "candle":
-            candles.append(obj["data"])
-        elif t == "orderbook":
-            d = obj["data"]
-            orderbooks.append({
-                "timestamp_ms": d.get("timestamp", 0),
-                "asks": d.get("asks", []),
-                "bids": d.get("bids", []),
-                "tick_size": float(d.get("tickSize", 0.01)),
-                "asset_id": d.get("assetId", ""),
-                # "side" is present in new-schema files ("UP" or "DN"); absent in old files.
-                "side": obj.get("side"),
-            })
-        elif t == "binance":
-            d = obj["data"]
-            binance.append({
-                "timestamp_ms": d["timestamp"],
-                "value": float(d["value"]),
-            })
-        elif t == "chainlink":
-            d = obj["data"]
-            chainlink.append({
-                "timestamp_ms": d["timestamp"],
-                "value": float(d["value"]),
-            })
+        logger.info("Scanning %s ...", book_log)
+        with open(book_log, encoding="utf-8") as f:
+            for line in f:
+                total_lines += 1
+                if not line.strip():
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
 
-    if header is None:
-        logger.warning("No header in %s", path)
-        return None
+                event_type = obj.get("event_type", "")
+                ts = obj.get("ts", 0.0)
 
-    raw = header.get("raw_market", {})
-    extra = raw.get("extra_fields", {})
-    price_to_beat = extra.get("price_to_beat", 0.0)
-    final_price_raw = extra.get("final_price")
+                if event_type == "book":
+                    token_id = obj.get("token_id", "")
+                    if not token_id:
+                        # Try to extract from data.asset_id
+                        token_id = str(obj.get("data", {}).get("asset_id", ""))[:20]
+                    if not token_id:
+                        continue
+                    data = obj.get("data", {})
+                    bids = data.get("bids", [])
+                    asks = data.get("asks", [])
+                    if not bids and not asks:
+                        continue
+                    best_bid = max((float(b["price"]) for b in bids), default=0.0)
+                    best_ask = min((float(a["price"]) for a in asks), default=1.0)
+                    current_state[token_id] = (best_bid, best_ask)
+                    if token_id not in index:
+                        index[token_id] = []
+                    index[token_id].append((ts, best_bid, best_ask))
+                    total_events += 1
 
-    if final_price_raw is not None:
-        final_price = float(final_price_raw)
-        if final_price > 0 and price_to_beat > 0:
-            outcome = "UP" if final_price >= price_to_beat else "DOWN"
-        else:
-            outcome = None
-    else:
-        winning_side = raw.get("winning_side")
-        if winning_side == "up" or winning_side == "UP":
-            outcome = "UP"
-            final_price = None
-        elif winning_side == "down" or winning_side == "DOWN":
-            outcome = "DOWN"
-            final_price = None
-        else:
-            outcome = None
-            final_price = None
+                elif event_type == "price_change":
+                    data = obj.get("data", {})
+                    for pc in data.get("price_changes", []):
+                        asset_id = str(pc.get("asset_id", ""))[:20]
+                        if not asset_id:
+                            continue
+                        bb = pc.get("best_bid")
+                        ba = pc.get("best_ask")
+                        if bb is None and ba is None:
+                            continue
+                        prev_bid, prev_ask = current_state.get(asset_id, (0.0, 1.0))
+                        best_bid = float(bb) if bb is not None else prev_bid
+                        best_ask = float(ba) if ba is not None else prev_ask
+                        current_state[asset_id] = (best_bid, best_ask)
+                        if asset_id not in index:
+                            index[asset_id] = []
+                        index[asset_id].append((ts, best_bid, best_ask))
+                        total_events += 1
 
-    # Sort time series ascending
-    binance.sort(key=lambda x: x["timestamp_ms"])
-    chainlink.sort(key=lambda x: x["timestamp_ms"])
-    orderbooks.sort(key=lambda x: x["timestamp_ms"])
-    candles.sort(key=lambda x: x["end_period_ts"])
-
-    return MarketSnapshot(
-        slug=header.get("market_slug", path.stem),
-        condition_id=header.get("condition_id", ""),
-        up_token_id=header.get("up_token_id", ""),
-        window_start=header.get("window_start", 0),
-        window_end=header.get("window_end", 0),
-        price_to_beat=float(price_to_beat) if price_to_beat else 0.0,
-        final_price=final_price,
-        outcome=outcome,
-        binance=binance,
-        chainlink=chainlink,
-        orderbooks=orderbooks,
-        candles=candles,
+    elapsed = time.time() - start
+    logger.info(
+        "Indexed %d events from %d lines in %.1fs. Tokens: %d",
+        total_events, total_lines, elapsed, len(index),
     )
 
+    # Save cache
+    try:
+        if cache_dir:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+        with open(cache_path, "wb") as f:
+            pickle.dump(index, f, protocol=4)
+        logger.info("Book index cached to %s", cache_path)
+    except Exception as e:
+        logger.warning("Failed to cache book index: %s", e)
 
-# ---------------------------------------------------------------------------
-# Fill simulation helpers
-# ---------------------------------------------------------------------------
+    return index
 
-def best_ask_at(snapshot: MarketSnapshot, epoch_sec: int) -> float | None:
-    """Return the best ask price (UP token) at or just before epoch_sec.
 
-    Prefers entries tagged with side="UP". Falls back to entries with no side tag
-    (old-schema files). Ignores DN-side entries.
+def lookup_book_state(
+    index: dict[str, list[tuple[float, float, float]]],
+    token_id: str,
+    ts: float,
+) -> tuple[float, float] | None:
+    """Binary search for the most recent (best_bid, best_ask) at or before ts.
+
+    Returns (best_bid, best_ask) or None if no data for this token.
     """
-    target_ms = epoch_sec * 1000
+    entries = index.get(token_id)
+    if not entries:
+        return None
 
-    # Separate UP-side and untagged orderbooks (old-schema compatibility)
-    up_obs = [ob for ob in snapshot.orderbooks if ob.get("side") in ("UP", None)]
-    candidates = up_obs if up_obs else snapshot.orderbooks
-
-    # Find last entry at or before target_ms
-    best = None
-    for ob in candidates:
-        if ob["timestamp_ms"] <= target_ms:
-            best = ob
+    # Binary search: find rightmost entry with ts <= target
+    lo, hi = 0, len(entries) - 1
+    result_idx = -1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if entries[mid][0] <= ts:
+            result_idx = mid
+            lo = mid + 1
         else:
-            break
-    if best is None and candidates:
-        best = candidates[0]
-    if best is None:
+            hi = mid - 1
+
+    if result_idx < 0:
+        # ts before all entries — use first entry
+        if entries:
+            return entries[0][1], entries[0][2]
         return None
-    asks = best["asks"]
-    if not asks:
-        return None
-    # We want the lowest ask = best ask for a buyer
-    min_ask = min(float(a["price"]) for a in asks)
-    return min_ask
+
+    return entries[result_idx][1], entries[result_idx][2]
 
 
-def best_dn_ask_at(snapshot: MarketSnapshot, epoch_sec: int) -> float | None:
-    """Return the best ask price for the DOWN token at or just before epoch_sec.
+# ---------------------------------------------------------------------------
+# Market window loading and token mapping
+# ---------------------------------------------------------------------------
 
-    Priority:
-      1. Real DN-side orderbook entries (side="DN") — present in new-schema files.
-      2. Approximation from UP bid: dn_ask ≈ 1.0 - best_up_bid — fallback for old
-         files that only contain UP orderbook data.
+def load_market_windows(
+    data_dir: pathlib.Path,
+    dates: list[str],
+    settlement_log: pathlib.Path,
+    start_epoch: int,
+    end_epoch: int,
+) -> list[MarketWindow]:
+    """Load market windows for the given date range.
+
+    Combines:
+    - market_event_log for open/close epochs
+    - settlement_log for outcomes
     """
-    target_ms = epoch_sec * 1000
+    # Step 1: Build market window registry from market_event_log
+    market_meta: dict[str, dict] = {}  # market_id -> {open, close}
+    for date in dates:
+        event_log = data_dir / f"market_event_log_{date}.jsonl"
+        if not event_log.exists():
+            continue
+        with open(event_log, encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if obj.get("event") not in ("discovered", "settled"):
+                    continue
+                mid = obj.get("market_id", "")
+                if not mid:
+                    continue
+                meta = obj.get("metadata", {})
+                open_ep = meta.get("open_epoch", 0)
+                close_ep = meta.get("close_epoch", 0)
+                if mid not in market_meta:
+                    market_meta[mid] = {"open": open_ep, "close": close_ep}
 
-    # --- Priority 1: real DN-side orderbooks (new schema) ---
-    dn_obs = [ob for ob in snapshot.orderbooks if ob.get("side") == "DN"]
-    if dn_obs:
-        best_dn = None
-        for ob in dn_obs:
-            if ob["timestamp_ms"] <= target_ms:
-                best_dn = ob
+    # Step 2: Load outcomes from settlement_log
+    outcomes: dict[str, str] = {}
+    actual_pnls: dict[str, float] = {}
+    if settlement_log.exists():
+        with open(settlement_log, encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                ts = obj.get("ts", 0)
+                if start_epoch <= ts < end_epoch:
+                    mid = obj.get("market_id", "")
+                    outcome = obj.get("outcome")
+                    pnl = obj.get("pnl", 0.0)
+                    if mid and outcome:
+                        outcomes[mid] = outcome
+                        actual_pnls[mid] = pnl
+
+    # Step 3: Build MarketWindow objects for markets in date range
+    windows: list[MarketWindow] = []
+    for mid, meta in market_meta.items():
+        open_ep = meta["open"]
+        close_ep = meta["close"]
+        # Only include markets that settled in our date range
+        if mid not in outcomes:
+            continue
+        w = MarketWindow(
+            market_id=mid,
+            open_epoch=open_ep,
+            close_epoch=close_ep,
+            outcome=outcomes.get(mid),
+            up_token_id=None,  # filled by map_tokens_to_markets
+            dn_token_id=None,
+            pnl_actual=actual_pnls.get(mid, 0.0),
+        )
+        windows.append(w)
+
+    logger.info("Loaded %d market windows with outcomes", len(windows))
+    return windows
+
+
+def map_tokens_to_markets(
+    index: dict[str, list[tuple[float, float, float]]],
+    windows: list[MarketWindow],
+    data_dir: pathlib.Path,
+    dates: list[str],
+    cache_dir: pathlib.Path | None = None,
+) -> None:
+    """Assign up_token_id and dn_token_id to each MarketWindow.
+
+    Strategy:
+    1. Scan book_log to build condition_id -> {token_ids} mapping
+    2. For each condition_id, find the median timestamp of its token activity
+    3. Match condition to the market window whose close_epoch is closest to
+       when the WS subscription ended (last book event for those tokens)
+    4. Determine UP vs DN by price: UP token trades near 0.5 at start of window;
+       the token with lower initial price is the UP token (conservative) or
+       we use the fact that UP+DN prices sum to ~1.0 and the one with higher
+       best_ask at window open is the DN token (since DN wins when price falls).
+    """
+    cache_key = "_".join(dates) + "_token_map"
+    cache_path = (cache_dir or data_dir) / f"token_map_{cache_key}.pkl"
+
+    if cache_path.exists():
+        try:
+            with open(cache_path, "rb") as f:
+                cached = pickle.load(f)
+            if isinstance(cached, dict) and "token_map" in cached:
+                token_map = cached["token_map"]
+                ctwk = cached.get("condition_to_window_keys", {})
+                logger.info("Token map loaded from cache: %d condition_ids", len(token_map))
+                # Rebuild condition_to_window from market_id keys
+                mid_to_window = {w.market_id: w for w in windows}
+                condition_to_window: dict[str, MarketWindow] = {}
+                for cond, mid in ctwk.items():
+                    w = mid_to_window.get(mid)
+                    if w is not None:
+                        condition_to_window[cond] = w
+                _apply_token_map_with_window_map(token_map, condition_to_window, windows)
+                return
+        except Exception as e:
+            logger.warning("Token map cache load failed: %s", e)
+
+    logger.info("Building token->market mapping by scanning book_log condition_ids...")
+
+    # Build: condition_id -> set of token_ids (short form)
+    condition_tokens: dict[str, set] = {}
+    condition_ts_last: dict[str, float] = {}  # last timestamp for tokens in this condition
+
+    for date in dates:
+        book_log = data_dir / f"book_log_{date}.jsonl"
+        if not book_log.exists():
+            continue
+        with open(book_log, encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                event_type = obj.get("event_type", "")
+                ts = obj.get("ts", 0.0)
+                data = obj.get("data", {})
+                mkt_hash = data.get("market", "")
+                if not mkt_hash:
+                    continue
+
+                if event_type == "book":
+                    token_id = obj.get("token_id", "")
+                    if not token_id:
+                        token_id = str(data.get("asset_id", ""))[:20]
+                    if token_id:
+                        if mkt_hash not in condition_tokens:
+                            condition_tokens[mkt_hash] = set()
+                        condition_tokens[mkt_hash].add(token_id)
+                        condition_ts_last[mkt_hash] = max(
+                            condition_ts_last.get(mkt_hash, 0.0), ts
+                        )
+
+                elif event_type == "price_change":
+                    for pc in data.get("price_changes", []):
+                        asset_id = str(pc.get("asset_id", ""))[:20]
+                        if asset_id and mkt_hash:
+                            if mkt_hash not in condition_tokens:
+                                condition_tokens[mkt_hash] = set()
+                            condition_tokens[mkt_hash].add(asset_id)
+                            condition_ts_last[mkt_hash] = max(
+                                condition_ts_last.get(mkt_hash, 0.0), ts
+                            )
+
+    logger.info("Found %d unique condition_ids in book_log", len(condition_tokens))
+
+    # Build: market close_epoch -> market window
+    close_to_window: dict[int, MarketWindow] = {}
+    for w in windows:
+        close_to_window[w.close_epoch] = w
+
+    # Match condition_id to market window:
+    # The last book event for a condition's tokens should be ~60-200s after close_epoch
+    # (bot unsubscribes shortly after settlement)
+    # Find the market window whose close_epoch is closest to (last_ts - ~120s)
+    all_close_epochs = sorted(close_to_window.keys())
+
+    # condition_id -> (up_token, dn_token) or None
+    condition_to_up_dn: dict[str, tuple[str, str] | None] = {}
+
+    for cond_hash, tokens in condition_tokens.items():
+        last_ts = condition_ts_last.get(cond_hash, 0.0)
+        token_list = list(tokens)
+
+        if len(token_list) != 2:
+            # Unexpected token count — skip
+            logger.debug("condition %s has %d tokens (expected 2), skipping", cond_hash, len(token_list))
+            condition_to_up_dn[cond_hash] = None
+            continue
+
+        # Find which market window this condition belongs to
+        # The last book event should be shortly after close_epoch (when bot drops the market)
+        # Estimate close_epoch = last_ts - ~100s (rough heuristic)
+        estimated_close = last_ts - 100.0
+        best_window = None
+        best_dist = float("inf")
+        for close_ep in all_close_epochs:
+            dist = abs(close_ep - estimated_close)
+            if dist < best_dist:
+                best_dist = dist
+                best_window = close_to_window[close_ep]
+
+        if best_window is None or best_dist > 900:  # more than 15m off = bad match
+            logger.debug(
+                "condition %s: no matching window (last_ts=%.0f, est_close=%.0f, best_dist=%.0f)",
+                cond_hash, last_ts, estimated_close, best_dist,
+            )
+            condition_to_up_dn[cond_hash] = None
+            continue
+
+        # Determine UP vs DN token
+        # Strategy: the UP token (priced as P(UP)) should be the one trading lower
+        # early in the window if price is drifting down, but at open they're symmetric
+        # Better: look at mid-window best_ask for each token
+        # The DOWN token has the complement price: if UP=0.45, DN=0.55
+        # In a binary market: UP.best_ask + DN.best_ask ≈ 1.0 at equilibrium
+        # We identify UP token by: it's the one where best_ask < 0.5 means P(UP) < 0.5
+        # Actually: use the initial book state at open_epoch
+        t0 = best_window.open_epoch
+        t1 = best_window.close_epoch
+        mid_ts = t0 + (t1 - t0) / 4  # use first quarter of window
+
+        asks_at_open = {}
+        for tok in token_list:
+            state = lookup_book_state(index, tok, mid_ts)
+            if state is not None:
+                asks_at_open[tok] = state[1]  # best_ask
             else:
-                break
-        if best_dn is None:
-            best_dn = dn_obs[0]
-        asks = best_dn["asks"]
-        if asks:
-            tick_size = best_dn.get("tick_size", 0.01)
-            min_ask = min(float(a["price"]) for a in asks)
-            return max(tick_size, min(1.0 - tick_size, min_ask))
+                # Try any time in the window
+                state = lookup_book_state(index, tok, t1)
+                if state is not None:
+                    asks_at_open[tok] = state[1]
+                else:
+                    asks_at_open[tok] = 0.5  # unknown
 
-    # --- Priority 2: approximate from UP bid (old schema fallback) ---
-    up_obs = [ob for ob in snapshot.orderbooks if ob.get("side") in ("UP", None)]
-    candidates = up_obs if up_obs else snapshot.orderbooks
+        # In a CLOB binary market:
+        # UP token: if market is near 50%, both trade ~0.5
+        # The trick is which is UP vs DN. We can use:
+        # The bot logs UP=high price (near 1.0) when near resolved,
+        # or we can use the fact that the market_id contains the open_epoch
+        # and compare with the actual outcome recorded in the window
+        # If outcome=UP: UP token settled at 1.0 (was bid high), DN at 0.0
+        # If outcome=DOWN: DN token settled at 1.0 (was bid high), UP at 0.0
 
-    best = None
-    for ob in candidates:
-        if ob["timestamp_ms"] <= target_ms:
-            best = ob
+        # Use the LAST snapshot (near settlement) to determine which token went to 1.0
+        # The winning token should have best_bid close to 1.0 just before settlement
+        final_asks = {}
+        for tok in token_list:
+            state = lookup_book_state(index, tok, t1 - 60)  # 60s before close
+            if state is not None:
+                final_asks[tok] = state[1]  # best_ask near 0.0 for winner (no one selling cheap)
+            else:
+                final_asks[tok] = 0.5
+
+        # The WINNING token should have best_ask near 0.01 (seller doesn't want to sell at discount)
+        # The LOSING token should have best_ask near 0.99 (nobody wants to buy it)
+        # So: the token with LOWER final best_ask is likely the winner
+        tok_a, tok_b = token_list[0], token_list[1]
+        ask_a = final_asks.get(tok_a, 0.5)
+        ask_b = final_asks.get(tok_b, 0.5)
+
+        outcome = best_window.outcome
+        if outcome == "UP":
+            # UP token won -> UP token has lower final ask (people don't sell cheaply)
+            if ask_a <= ask_b:
+                up_token = tok_a
+                dn_token = tok_b
+            else:
+                up_token = tok_b
+                dn_token = tok_a
+        elif outcome == "DOWN":
+            # DN token won -> DN token has lower final ask
+            if ask_a <= ask_b:
+                dn_token = tok_a
+                up_token = tok_b
+            else:
+                dn_token = tok_b
+                up_token = tok_a
         else:
-            break
-    if best is None and candidates:
-        best = candidates[0]
-    if best is None:
+            # No outcome — use price at open (lower ask = UP)
+            if ask_a <= ask_b:
+                up_token = tok_a
+                dn_token = tok_b
+            else:
+                up_token = tok_b
+                dn_token = tok_a
+
+        condition_to_up_dn[cond_hash] = (up_token, dn_token)
+        logger.debug(
+            "Matched condition %s -> market %s (up=%s, dn=%s)",
+            cond_hash[:20], best_window.market_id, up_token, dn_token,
+        )
+
+    # Apply mapping to windows
+    # We need a second pass: condition_hash -> window already done above
+    # Build reverse: (estimated) close_epoch from condition -> window
+    # And we already matched them in the loop above
+
+    # Re-do the assignment directly (build condition -> window map)
+    condition_to_window: dict[str, MarketWindow] = {}
+    for cond_hash, tokens in condition_tokens.items():
+        last_ts = condition_ts_last.get(cond_hash, 0.0)
+        estimated_close = last_ts - 100.0
+        best_window = None
+        best_dist = float("inf")
+        for close_ep in all_close_epochs:
+            dist = abs(close_ep - estimated_close)
+            if dist < best_dist:
+                best_dist = dist
+                best_window = close_to_window[close_ep]
+        if best_window is not None and best_dist <= 900:
+            condition_to_window[cond_hash] = best_window
+
+    # token_map: for caching
+    token_map: dict[str, tuple[str, str] | None] = condition_to_up_dn
+
+    # Apply to windows
+    _apply_token_map_with_window_map(token_map, condition_to_window, windows)
+
+    # Cache
+    try:
+        save_data = {
+            "token_map": token_map,
+            "condition_to_window_keys": {
+                k: v.market_id for k, v in condition_to_window.items()
+            },
+        }
+        with open(cache_path, "wb") as f:
+            pickle.dump(save_data, f, protocol=4)
+        logger.info("Token map cached to %s", cache_path)
+    except Exception as e:
+        logger.warning("Failed to cache token map: %s", e)
+
+
+def _apply_token_map(
+    cached: dict,
+    windows: list[MarketWindow],
+) -> None:
+    """Apply cached token map (simple version from first cache format)."""
+    # This handles the case where cache is just {condition: (up, dn)}
+    # We don't have condition_to_window in old cache format
+    pass  # Fall through to rebuild
+
+
+def _apply_token_map_with_window_map(
+    token_map: dict[str, tuple[str, str] | None],
+    condition_to_window: dict[str, MarketWindow],
+    windows: list[MarketWindow],
+) -> None:
+    """Apply the condition->up_dn mapping to actual MarketWindow objects."""
+    mid_to_window = {w.market_id: w for w in windows}
+
+    for cond_hash, up_dn in token_map.items():
+        window = condition_to_window.get(cond_hash)
+        if window is None:
+            continue
+        w = mid_to_window.get(window.market_id)
+        if w is None:
+            continue
+        if up_dn is not None:
+            up_token, dn_token = up_dn
+            w.up_token_id = up_token
+            w.dn_token_id = dn_token
+
+
+# ---------------------------------------------------------------------------
+# Price series loading (for FV computation)
+# ---------------------------------------------------------------------------
+
+def load_price_series(
+    data_dir: pathlib.Path,
+    dates: list[str],
+    start_epoch: float,
+    end_epoch: float,
+    asset: str = "BTC",
+    source: str = "binance",
+) -> list[tuple[float, float]]:
+    """Load (ts, price) pairs from price_log files for the given window."""
+    result: list[tuple[float, float]] = []
+    for date in dates:
+        price_log = data_dir / f"price_log_{date}.jsonl"
+        if not price_log.exists():
+            continue
+        with open(price_log, encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                ts = obj.get("ts", 0.0)
+                if start_epoch <= ts <= end_epoch:
+                    if obj.get("asset", "") == asset and obj.get("source", "") == source:
+                        price = obj.get("price")
+                        if price is not None:
+                            result.append((ts, float(price)))
+    result.sort(key=lambda x: x[0])
+    return result
+
+
+def _get_price_at(price_series: list[tuple[float, float]], ts: float) -> float | None:
+    """Binary search for most recent price at or before ts."""
+    if not price_series:
         return None
-
-    bids = best["bids"]
-    if not bids:
-        return None
-    tick_size = best.get("tick_size", 0.01)
-    # Best bid on UP token → DN ask ≈ 1 - UP_bid
-    max_bid = max(float(b["price"]) for b in bids)
-    dn_ask = round(1.0 - max_bid, 10)
-    return max(tick_size, min(1.0 - tick_size, dn_ask))
-
-
-def order_would_fill(order_price: float, best_ask: float | None) -> bool:
-    """Check if a passive buy order at order_price would fill.
-
-    In a CLOB, a passive buy (limit order) fills when the market ask drops to
-    or below our bid price. Since we're posting bids, we fill when:
-    our_price >= current_best_ask
-
-    This is a simplification — we ignore queue position.
-    """
-    if best_ask is None:
-        return False
-    return order_price >= best_ask
-
-
-def candle_midpoint_at(snapshot: MarketSnapshot, epoch_sec: int) -> float | None:
-    """Get UP token midpoint price from candles at epoch_sec (used as fallback)."""
-    # Find the candle whose window contains epoch_sec
-    # Candles are 1-minute intervals, end_period_ts is the end of the candle
-    for c in snapshot.candles:
-        end_ts = c["end_period_ts"]
-        start_ts = end_ts - 60
-        if start_ts <= epoch_sec <= end_ts:
-            close_dollars = c["price"].get("close_dollars", "0.5")
-            try:
-                return float(close_dollars)
-            except (ValueError, TypeError):
-                return None
-    return None
+    lo, hi = 0, len(price_series) - 1
+    result_idx = -1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if price_series[mid][0] <= ts:
+            result_idx = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    if result_idx < 0:
+        return price_series[0][1]
+    return price_series[result_idx][1]
 
 
 # ---------------------------------------------------------------------------
@@ -460,22 +853,22 @@ class Fill:
     side: str        # "UP" or "DN"
     price: float
     qty: float
-    epoch_sec: int
-    cost: float      # price * qty
+    epoch_sec: float
+    cost: float
 
 
 @dataclass
 class Event:
-    epoch_sec: int
-    kind: str        # "FILL", "CANCEL", "ABORT", "POST", "FV_GATE_BLOCK"
+    epoch_sec: float
+    kind: str
     detail: str
 
 
 @dataclass
 class MarketResult:
-    slug: str
+    market_id: str
     outcome: str | None
-    outcome_correct: bool | None  # did our FV prediction agree with outcome?
+    outcome_correct: bool | None
     fills: list[Fill]
     events: list[Event]
     pnl: float
@@ -485,37 +878,68 @@ class MarketResult:
     pair_cost: float
     up_qty: float
     dn_qty: float
-    fv_at_entry: float   # FV p_up when we first posted
+    fv_at_entry: float
     certainty_at_entry: float
     aborted: bool
-    fv_blocked: bool     # True if FV gate blocked posting
-    # Confidence bucket for calibration (based on certainty at entry)
+    fv_blocked: bool
     cert_bucket: str
-    # For per-hour breakdown
-    market_hour: int     # hour of day (UTC) when window opened
+    market_hour: int
+    has_book_data: bool  # True if we had local book data for this market
 
 
 # ---------------------------------------------------------------------------
 # Main simulation function
 # ---------------------------------------------------------------------------
 
-def simulate_market(snapshot: MarketSnapshot, cfg: BacktestConfig) -> MarketResult:
-    """Simulate the strategy over one historical market window."""
-    window_dur = snapshot.window_end - snapshot.window_start
+def simulate_market(
+    window: MarketWindow,
+    book_index: dict[str, list[tuple[float, float, float]]],
+    all_prices: list[tuple[float, float]],
+    cfg: BacktestConfig,
+) -> MarketResult:
+    """Simulate the strategy over one market window using local book_log data."""
     budget = cfg.bankroll * cfg.position_size_fraction
 
     events: list[Event] = []
     fills: list[Fill] = []
+    tick_size = 0.01
+
+    open_ep = float(window.open_epoch)
+    close_ep = float(window.close_epoch)
+    window_dur = close_ep - open_ep
 
     # -------------------------------------------------------------------
-    # Step 1: Build Binance price series for FV computation
+    # Check if we have book data for this market
     # -------------------------------------------------------------------
-    # Start price = Chainlink PTB (price_to_beat) if available, else first Binance tick
-    start_price: float | None = None
-    if snapshot.price_to_beat and snapshot.price_to_beat > 0:
-        start_price = snapshot.price_to_beat
+    has_book_data = False
+    if window.up_token_id and window.dn_token_id:
+        up_state = lookup_book_state(book_index, window.up_token_id, open_ep)
+        dn_state = lookup_book_state(book_index, window.dn_token_id, open_ep)
+        has_book_data = up_state is not None or dn_state is not None
 
-    # Build price-time mapping for vol estimation
+    # -------------------------------------------------------------------
+    # Get Binance prices for this window (+/- buffer for vol estimation)
+    # -------------------------------------------------------------------
+    pre_window_start = open_ep - cfg.vol_window_sec * 2
+    window_prices = [
+        (ts, price) for ts, price in all_prices
+        if pre_window_start <= ts <= close_ep
+    ]
+
+    # Price at open (for start_price / PTB)
+    start_price = _get_price_at(window_prices, open_ep)
+
+    if start_price is None:
+        # No price data — use 0.5 FV
+        fv_up = 0.5
+        cert = 0.5
+        events.append(Event(open_ep, "NO_PRICE_DATA", "No Binance prices available"))
+        return _empty_result(window, fv_up, cert, open_ep, fv_blocked=False, events=events)
+
+    # -------------------------------------------------------------------
+    # Vol estimation over pre-window period
+    # -------------------------------------------------------------------
+    vol_annual = cfg.vol_fallback_annual
     vol_est = None
     if _POLYBOT_IMPORTED:
         try:
@@ -523,98 +947,73 @@ def simulate_market(snapshot: MarketSnapshot, cfg: BacktestConfig) -> MarketResu
                 min_samples=cfg.vol_min_samples,
                 fallback_vol_annual=cfg.vol_fallback_annual,
             )
+            for ts, price in window_prices:
+                vol_est.push(ts, price)
+            if vol_est.is_ready:
+                vol_annual = vol_est.vol_annualized(cfg.vol_window_sec)
         except Exception:
             pass
 
-    # Feed all binance prices into vol estimator in order
-    for bp in snapshot.binance:
-        ts_sec = bp["timestamp_ms"] / 1000.0
-        if vol_est is not None:
-            vol_est.push(ts_sec, bp["value"])
-
-    # Use the mid-window vol as representative
-    if vol_est is not None and vol_est.is_ready:
-        vol_annual = vol_est.vol_annualized(cfg.vol_window_sec)
-    else:
-        # Simple fallback: compute realized vol from price series
-        prices = [bp["value"] for bp in snapshot.binance if bp["value"] > 0]
+    if vol_est is None or not (hasattr(vol_est, 'is_ready') and vol_est.is_ready):
+        prices = [p for _, p in window_prices if p > 0]
         if len(prices) >= 2:
             log_rets = [math.log(prices[i] / prices[i - 1]) for i in range(1, len(prices))]
-            mean_r = sum(log_rets) / len(log_rets)
-            var = sum((r - mean_r) ** 2 for r in log_rets) / max(len(log_rets) - 1, 1)
-            vol_per_sec = math.sqrt(var)
-            vol_annual = vol_per_sec * math.sqrt(365.25 * 24 * 3600)
-        else:
-            vol_annual = cfg.vol_fallback_annual
+            if log_rets:
+                mean_r = sum(log_rets) / len(log_rets)
+                var = sum((r - mean_r) ** 2 for r in log_rets) / max(len(log_rets) - 1, 1)
+                vol_per_sec = math.sqrt(max(var, 0))
+                vol_annual = vol_per_sec * math.sqrt(365.25 * 24 * 3600)
 
     # -------------------------------------------------------------------
-    # Step 2: Entry decision (at window start)
+    # Entry decision (at window open)
     # -------------------------------------------------------------------
-    entry_sec = snapshot.window_start
-    time_remaining_at_entry = snapshot.window_end - entry_sec
+    entry_spot = _get_price_at(window_prices, open_ep) or start_price
+    time_remaining_at_entry = window_dur
 
-    # Get current spot price at entry
-    entry_binance = next(
-        (bp for bp in snapshot.binance if bp["timestamp_ms"] / 1000.0 >= entry_sec),
-        snapshot.binance[0] if snapshot.binance else None,
-    )
-    entry_spot = float(entry_binance["value"]) if entry_binance else start_price
-
-    if start_price is None:
-        start_price = entry_spot
-
-    # Compute FV at entry
     fv_up = _p_fair_up(start_price, entry_spot, time_remaining_at_entry, vol_annual)
     cert = _fv_certainty(fv_up)
 
     fv_blocked = False
 
     # -------------------------------------------------------------------
-    # Step 3: Trend filter (optional)
+    # Trend filter
     # -------------------------------------------------------------------
-    if cfg.trend_filter_enabled and snapshot.binance:
-        # Look at price change over trend_filter_window_sec before entry
-        lookback_ms = entry_sec * 1000 - cfg.trend_filter_window_sec * 1000
-        lookback_price = None
-        for bp in snapshot.binance:
-            if bp["timestamp_ms"] >= lookback_ms:
-                lookback_price = bp["value"]
-                break
+    if cfg.trend_filter_enabled:
+        lookback_price = _get_price_at(window_prices, open_ep - cfg.trend_filter_window_sec)
         if lookback_price and entry_spot:
             pct_change = abs(entry_spot - lookback_price) / lookback_price
             if pct_change < cfg.trend_filter_threshold_pct:
-                # Market is ranging — skip entry
-                events.append(Event(entry_sec, "TREND_FILTER_SKIP",
-                    f"pct_change={pct_change:.4f} < threshold={cfg.trend_filter_threshold_pct}"))
-                return _empty_result(snapshot, fv_up, cert, entry_sec, fv_blocked=False, events=events)
+                events.append(Event(open_ep, "TREND_FILTER_SKIP",
+                    f"pct_change={pct_change:.4f}"))
+                return _empty_result(window, fv_up, cert, open_ep, fv_blocked=False, events=events)
 
     # -------------------------------------------------------------------
-    # Step 4: FV gate (optional)
+    # FV gate
     # -------------------------------------------------------------------
     if cfg.fv_gate_enabled and cert >= cfg.fv_gate_certainty_threshold:
-        # Block posting the losing side; only post directional
         fv_blocked = True
-        events.append(Event(entry_sec, "FV_GATE_BLOCK",
+        events.append(Event(open_ep, "FV_GATE_BLOCK",
             f"cert={cert:.3f} >= threshold={cfg.fv_gate_certainty_threshold}"))
 
     # -------------------------------------------------------------------
-    # Step 5: Get best asks at entry for UP and DN tokens
+    # Get initial book state for UP and DN tokens
     # -------------------------------------------------------------------
-    up_ask = best_ask_at(snapshot, entry_sec)
-    dn_ask = best_dn_ask_at(snapshot, entry_sec)
+    if window.up_token_id:
+        up_state = lookup_book_state(book_index, window.up_token_id, open_ep)
+        up_ask_initial = up_state[1] if up_state else 0.50
+    else:
+        up_ask_initial = 0.50
 
-    if up_ask is None:
-        up_ask = 0.50  # default midpoint
-    if dn_ask is None:
-        dn_ask = 0.50
+    if window.dn_token_id:
+        dn_state = lookup_book_state(book_index, window.dn_token_id, open_ep)
+        dn_ask_initial = dn_state[1] if dn_state else 0.50
+    else:
+        dn_ask_initial = 0.50
 
     # -------------------------------------------------------------------
-    # Step 6: Build ladders for UP and DN sides
+    # Build ladders
     # -------------------------------------------------------------------
-    tick_size = 0.01  # standard Polymarket tick
-
     if fv_blocked:
-        # Only post the side FV says is winning (within directional cap)
         winning_side = "UP" if fv_up >= 0.5 else "DN"
         if winning_side == "UP":
             up_budget = min(budget, cfg.directional_budget_cap)
@@ -627,7 +1026,7 @@ def simulate_market(snapshot: MarketSnapshot, cfg: BacktestConfig) -> MarketResu
         dn_budget = budget / 2.0
 
     up_rungs = _build_ladder(
-        best_ask=up_ask,
+        best_ask=up_ask_initial,
         budget=up_budget,
         rungs=cfg.rungs,
         spacing=cfg.spacing,
@@ -639,7 +1038,7 @@ def simulate_market(snapshot: MarketSnapshot, cfg: BacktestConfig) -> MarketResu
     ) if up_budget > 0 else []
 
     dn_rungs = _build_ladder(
-        best_ask=dn_ask,
+        best_ask=dn_ask_initial,
         budget=dn_budget,
         rungs=cfg.rungs,
         spacing=cfg.spacing,
@@ -650,206 +1049,188 @@ def simulate_market(snapshot: MarketSnapshot, cfg: BacktestConfig) -> MarketResu
         max_rung_price=1.0 - tick_size,
     ) if dn_budget > 0 else []
 
-    events.append(Event(entry_sec, "POST",
-        f"up_rungs={len(up_rungs)} dn_rungs={len(dn_rungs)} fv={fv_up:.3f} cert={cert:.3f}"))
+    events.append(Event(open_ep, "POST",
+        f"up_rungs={len(up_rungs)} dn_rungs={len(dn_rungs)} "
+        f"fv={fv_up:.3f} cert={cert:.3f} "
+        f"up_ask={up_ask_initial:.2f} dn_ask={dn_ask_initial:.2f}"))
 
     # -------------------------------------------------------------------
-    # Step 7: Walk through the window tick-by-tick, checking fills
+    # Walk through window at 30-second intervals, checking fills
     # -------------------------------------------------------------------
-    # We walk second by second through the Binance price series
-    # For each tick we check if any of our resting orders would fill
-
-    # Track fill state
-    up_orders: list[tuple[float, float]] = list(up_rungs)  # (price, qty) still unfilled
+    up_orders: list[tuple[float, float]] = list(up_rungs)
     dn_orders: list[tuple[float, float]] = list(dn_rungs)
     up_filled: list[Fill] = []
     dn_filled: list[Fill] = []
 
-    # Track FV cancel
     fv_cancelled_up = False
     fv_cancelled_dn = False
-
-    # Track running costs (for abort check)
     up_cost_accum = 0.0
     dn_cost_accum = 0.0
-
     aborted = False
 
-    prev_up_ask = up_ask
-    prev_dn_ask = dn_ask
+    # Generate time steps (every 30 seconds)
+    STEP_SEC = 30.0
+    tick_ts = open_ep
+    while tick_ts <= close_ep and (up_orders or dn_orders):
+        # Get current spot price
+        spot_now = _get_price_at(window_prices, tick_ts)
+        if spot_now is None:
+            tick_ts += STEP_SEC
+            continue
 
-    # Build a time index of binance ticks in the window
-    window_ticks = [
-        bp for bp in snapshot.binance
-        if snapshot.window_start * 1000 <= bp["timestamp_ms"] <= snapshot.window_end * 1000
-    ]
-
-    for bp in window_ticks:
-        tick_sec = int(bp["timestamp_ms"] / 1000)
-        spot_now = bp["value"]
-
-        # Update vol estimator (already done above, but for completeness)
-        # Recompute FV at this tick for cancel/abort decisions
-        secs_remaining = snapshot.window_end - tick_sec
+        secs_remaining = close_ep - tick_ts
         fv_now = _p_fair_up(start_price, spot_now, secs_remaining, vol_annual)
         cert_now = _fv_certainty(fv_now)
 
         # Get current book state
-        cur_up_ask = best_ask_at(snapshot, tick_sec) or prev_up_ask
-        cur_dn_ask = best_dn_ask_at(snapshot, tick_sec) or prev_dn_ask
-        prev_up_ask = cur_up_ask
-        prev_dn_ask = cur_dn_ask
+        cur_up_ask = 0.50
+        cur_dn_ask = 0.50
+        if window.up_token_id:
+            state = lookup_book_state(book_index, window.up_token_id, tick_ts)
+            if state is not None:
+                cur_up_ask = state[1]
+        if window.dn_token_id:
+            state = lookup_book_state(book_index, window.dn_token_id, tick_ts)
+            if state is not None:
+                cur_dn_ask = state[1]
 
-        # --- FV cancel ---
+        # FV cancel
         if cfg.fv_cancel_enabled and cert_now >= cfg.fv_cancel_certainty_threshold:
             losing_side = "DN" if fv_now >= 0.5 else "UP"
             if losing_side == "UP" and not fv_cancelled_up and up_orders:
                 up_orders = []
                 fv_cancelled_up = True
-                events.append(Event(tick_sec, "CANCEL",
-                    f"FV cancel UP side: fv={fv_now:.3f} cert={cert_now:.3f}"))
+                events.append(Event(tick_ts, "CANCEL",
+                    f"FV cancel UP: fv={fv_now:.3f} cert={cert_now:.3f}"))
             elif losing_side == "DN" and not fv_cancelled_dn and dn_orders:
                 dn_orders = []
                 fv_cancelled_dn = True
-                events.append(Event(tick_sec, "CANCEL",
-                    f"FV cancel DN side: fv={fv_now:.3f} cert={cert_now:.3f}"))
+                events.append(Event(tick_ts, "CANCEL",
+                    f"FV cancel DN: fv={fv_now:.3f} cert={cert_now:.3f}"))
 
-        # --- Check UP fills ---
+        # Check UP fills: our resting buy fills when market ask <= our bid price
         for order in list(up_orders):
             price, qty = order
-            if order_would_fill(price, cur_up_ask):
+            if price >= cur_up_ask:  # our bid >= market ask -> fill
                 cost = price * qty
                 up_cost_accum += cost
-                f = Fill("UP", price, qty, tick_sec, cost)
+                f = Fill("UP", price, qty, tick_ts, cost)
                 up_filled.append(f)
                 fills.append(f)
                 up_orders.remove(order)
-                events.append(Event(tick_sec, "FILL", f"UP fill: price={price:.2f} qty={qty:.1f}"))
+                events.append(Event(tick_ts, "FILL",
+                    f"UP fill: price={price:.2f} qty={qty:.1f} ask={cur_up_ask:.2f}"))
 
-        # --- Check DN fills ---
+        # Check DN fills
         for order in list(dn_orders):
             price, qty = order
-            if order_would_fill(price, cur_dn_ask):
+            if price >= cur_dn_ask:
                 cost = price * qty
                 dn_cost_accum += cost
-                f = Fill("DN", price, qty, tick_sec, cost)
+                f = Fill("DN", price, qty, tick_ts, cost)
                 dn_filled.append(f)
                 fills.append(f)
                 dn_orders.remove(order)
-                events.append(Event(tick_sec, "FILL", f"DN fill: price={price:.2f} qty={qty:.1f}"))
+                events.append(Event(tick_ts, "FILL",
+                    f"DN fill: price={price:.2f} qty={qty:.1f} ask={cur_dn_ask:.2f}"))
 
-        # --- One-sided abort check ---
+        # One-sided abort
         if cfg.one_sided_abort_enabled and not aborted:
             total_cost = up_cost_accum + dn_cost_accum
             committed_pct = total_cost / max(budget, 0.01)
             if committed_pct >= cfg.one_sided_abort_cost_pct:
                 up_q = sum(f.qty for f in up_filled)
                 dn_q = sum(f.qty for f in dn_filled)
-                heavy = max(up_q, dn_q)
-                light = min(up_q, dn_q)
-                if heavy > 0 and light == 0:
-                    ratio = heavy / max(light, 0.001)
-                else:
-                    ratio = heavy / max(light, 0.001) if light > 0 else 0
-                if light == 0 and heavy > 0 and ratio >= cfg.one_sided_abort_ratio:
-                    # Cancel unfilled orders on the filled side (stop adding to imbalance)
-                    if up_q > dn_q:
-                        cancelled = len(up_orders)
-                        up_orders = []
-                        events.append(Event(tick_sec, "ABORT",
-                            f"One-sided abort: UP heavy ({up_q:.1f} vs {dn_q:.1f}), cancelled {cancelled} UP orders"))
-                    else:
-                        cancelled = len(dn_orders)
-                        dn_orders = []
-                        events.append(Event(tick_sec, "ABORT",
-                            f"One-sided abort: DN heavy ({dn_q:.1f} vs {up_q:.1f}), cancelled {cancelled} DN orders"))
-                    aborted = True
+                if up_q > 0 or dn_q > 0:
+                    heavy = max(up_q, dn_q)
+                    light = min(up_q, dn_q)
+                    if light == 0 and heavy > 0:
+                        if up_q > dn_q:
+                            cancelled = len(up_orders)
+                            up_orders = []
+                            events.append(Event(tick_ts, "ABORT",
+                                f"UP heavy ({up_q:.1f} vs {dn_q:.1f}), cancelled {cancelled}"))
+                        else:
+                            cancelled = len(dn_orders)
+                            dn_orders = []
+                            events.append(Event(tick_ts, "ABORT",
+                                f"DN heavy ({dn_q:.1f} vs {up_q:.1f}), cancelled {cancelled}"))
+                        aborted = True
+
+        tick_ts += STEP_SEC
 
     # -------------------------------------------------------------------
-    # Step 8: Compute PnL at settlement
+    # PnL computation
     # -------------------------------------------------------------------
     up_qty = sum(f.qty for f in up_filled)
     dn_qty = sum(f.qty for f in dn_filled)
     up_cost = sum(f.cost for f in up_filled)
     dn_cost = sum(f.cost for f in dn_filled)
-    total_cost = up_cost + dn_cost
 
     pnl = 0.0
     paired = False
-    pair_cost = total_cost / max(min(up_qty, dn_qty), 0.001) if (up_qty > 0 and dn_qty > 0) else 0.0
+    pair_cost = 0.0
 
-    if snapshot.outcome is None:
-        # Market unresolved — can't compute PnL
+    if window.outcome is None:
         pnl = 0.0
-    else:
-        # Pair cost guard: did we pass the guard?
-        if up_qty > 0 and dn_qty > 0:
-            paired_qty = min(up_qty, dn_qty)
-            # Avg cost per paired share
-            avg_up_price = up_cost / max(up_qty, 0.001)
-            avg_dn_price = dn_cost / max(dn_qty, 0.001)
-            implied_pair_cost = avg_up_price + avg_dn_price
-            pair_cost = implied_pair_cost
+    elif up_qty > 0 and dn_qty > 0:
+        avg_up_price = up_cost / max(up_qty, 0.001)
+        avg_dn_price = dn_cost / max(dn_qty, 0.001)
+        pair_cost = avg_up_price + avg_dn_price
+        paired_qty = min(up_qty, dn_qty)
 
-            if pair_cost <= cfg.max_pair_cost:
-                paired = True
-                # Paired gain: $1.00 per pair regardless of outcome
-                paired_gain = paired_qty * 1.0
-                paired_spend = paired_qty * pair_cost
-                paired_pnl = paired_gain - paired_spend
-            else:
-                paired = False
-                paired_pnl = 0.0
-
-            # Unpaired excess shares (one-sided PnL)
-            if snapshot.outcome == "UP":
-                winner_qty = up_qty - dn_qty if up_qty > dn_qty else 0
-                loser_qty = dn_qty - up_qty if dn_qty > up_qty else 0
-                loser_cost = dn_cost - (dn_cost / max(dn_qty, 0.001)) * min(up_qty, dn_qty) if dn_qty > up_qty else 0
-                winner_cost = up_cost - (up_cost / max(up_qty, 0.001)) * min(up_qty, dn_qty) if up_qty > dn_qty else 0
-            else:  # DOWN
-                winner_qty = dn_qty - up_qty if dn_qty > up_qty else 0
-                loser_qty = up_qty - dn_qty if up_qty > dn_qty else 0
-                loser_cost = up_cost - (up_cost / max(up_qty, 0.001)) * min(up_qty, dn_qty) if up_qty > dn_qty else 0
-                winner_cost = dn_cost - (dn_cost / max(dn_qty, 0.001)) * min(up_qty, dn_qty) if dn_qty > up_qty else 0
-
-            one_sided_gain = winner_qty * 1.0 - winner_cost - loser_cost
-
-            pnl = paired_pnl + one_sided_gain if paired else one_sided_gain
-
-        elif up_qty > 0:
-            # UP-only position
-            if snapshot.outcome == "UP":
-                pnl = up_qty * 1.0 - up_cost
-            else:
-                pnl = -up_cost
-        elif dn_qty > 0:
-            # DN-only position
-            if snapshot.outcome == "DOWN":
-                pnl = dn_qty * 1.0 - dn_cost
-            else:
-                pnl = -dn_cost
+        if pair_cost <= cfg.max_pair_cost:
+            paired = True
+            paired_gain = paired_qty * 1.0
+            paired_spend = paired_qty * pair_cost
+            paired_pnl = paired_gain - paired_spend
         else:
-            pnl = 0.0
+            paired_pnl = 0.0
+
+        # One-sided excess
+        if window.outcome == "UP":
+            winner_excess = max(0, up_qty - dn_qty)
+            loser_excess = max(0, dn_qty - up_qty)
+            winner_avg = avg_up_price
+            loser_avg = avg_dn_price
+        else:
+            winner_excess = max(0, dn_qty - up_qty)
+            loser_excess = max(0, up_qty - dn_qty)
+            winner_avg = avg_dn_price
+            loser_avg = avg_up_price
+
+        one_sided_pnl = winner_excess * (1.0 - winner_avg) - loser_excess * loser_avg
+        pnl = paired_pnl + one_sided_pnl
+
+    elif up_qty > 0:
+        pnl = up_qty * (1.0 - 1.0) if window.outcome == "UP" else -up_cost
+        if window.outcome == "UP":
+            pnl = up_qty * 1.0 - up_cost
+        else:
+            pnl = -up_cost
+    elif dn_qty > 0:
+        if window.outcome == "DOWN":
+            pnl = dn_qty * 1.0 - dn_cost
+        else:
+            pnl = -dn_cost
+    else:
+        pnl = 0.0
 
     # FV prediction correctness
-    if snapshot.outcome is not None:
+    outcome_correct = None
+    if window.outcome is not None:
         fv_predicted_up = fv_up >= 0.5
-        actual_up = snapshot.outcome == "UP"
+        actual_up = window.outcome == "UP"
         outcome_correct = fv_predicted_up == actual_up
-    else:
-        outcome_correct = None
 
-    # Confidence bucket
     cert_bucket = _cert_bucket(cert)
-
-    # Market hour (UTC)
-    import datetime as dt_mod
-    market_hour = dt_mod.datetime.fromtimestamp(snapshot.window_start, dt_mod.timezone.utc).hour
+    market_hour = datetime.datetime.fromtimestamp(
+        window.open_epoch, datetime.timezone.utc
+    ).hour
 
     return MarketResult(
-        slug=snapshot.slug,
-        outcome=snapshot.outcome,
+        market_id=window.market_id,
+        outcome=window.outcome,
         outcome_correct=outcome_correct,
         fills=fills,
         events=events,
@@ -866,22 +1247,24 @@ def simulate_market(snapshot: MarketSnapshot, cfg: BacktestConfig) -> MarketResu
         fv_blocked=fv_blocked,
         cert_bucket=cert_bucket,
         market_hour=market_hour,
+        has_book_data=has_book_data,
     )
 
 
 def _empty_result(
-    snapshot: MarketSnapshot,
+    window: MarketWindow,
     fv_up: float,
     cert: float,
-    entry_sec: int,
+    entry_sec: float,
     fv_blocked: bool,
     events: list[Event],
 ) -> MarketResult:
-    """Return a no-trade result."""
-    import datetime as dt_mod
+    market_hour = datetime.datetime.fromtimestamp(
+        window.open_epoch, datetime.timezone.utc
+    ).hour
     return MarketResult(
-        slug=snapshot.slug,
-        outcome=snapshot.outcome,
+        market_id=window.market_id,
+        outcome=window.outcome,
         outcome_correct=None,
         fills=[],
         events=events,
@@ -897,12 +1280,12 @@ def _empty_result(
         aborted=False,
         fv_blocked=fv_blocked,
         cert_bucket=_cert_bucket(cert),
-        market_hour=dt_mod.datetime.fromtimestamp(snapshot.window_start, dt_mod.timezone.utc).hour,
+        market_hour=market_hour,
+        has_book_data=False,
     )
 
 
 def _cert_bucket(cert: float) -> str:
-    """Return calibration bucket label for a certainty value."""
     if cert < 0.60:
         return "0.50-0.60"
     elif cert < 0.70:
@@ -920,7 +1303,6 @@ def _cert_bucket(cert: float) -> str:
 # ---------------------------------------------------------------------------
 
 def aggregate_results(results: list[MarketResult], cfg: BacktestConfig) -> dict:
-    """Compute aggregate metrics from per-market results."""
     if not results:
         return {"error": "no results"}
 
@@ -928,31 +1310,27 @@ def aggregate_results(results: list[MarketResult], cfg: BacktestConfig) -> dict:
     n = len(results)
     pnl_per_market = total_pnl / n
 
-    # Win rate (markets with pnl > 0)
     wins = sum(1 for r in results if r.pnl > 0)
     win_rate = wins / n
 
-    # Paired rate (markets where both sides filled)
     paired_count = sum(1 for r in results if r.paired)
     paired_rate = paired_count / n
 
-    # One-sided rate (only one side filled)
     one_sided = sum(1 for r in results if (r.up_qty > 0) != (r.dn_qty > 0))
     one_sided_rate = one_sided / n
 
-    # No-fill rate
     no_fill = sum(1 for r in results if r.up_qty == 0 and r.dn_qty == 0)
     no_fill_rate = no_fill / n
 
-    # FV gate blocked rate
     fv_blocked_count = sum(1 for r in results if r.fv_blocked)
     fv_blocked_rate = fv_blocked_count / n
 
-    # Worst loss
+    has_book_data_count = sum(1 for r in results if r.has_book_data)
+    book_coverage_rate = has_book_data_count / n
+
     max_loss = min(r.pnl for r in results)
     max_gain = max(r.pnl for r in results)
 
-    # Max drawdown (cumulative)
     cumulative = []
     running = 0.0
     for r in results:
@@ -966,7 +1344,6 @@ def aggregate_results(results: list[MarketResult], cfg: BacktestConfig) -> dict:
         drawdown = (peak - c) / max(abs(peak), 1.0)
         max_drawdown = max(max_drawdown, drawdown)
 
-    # Sharpe-like: mean/std of per-market PnL
     pnls = [r.pnl for r in results]
     mean_pnl = sum(pnls) / len(pnls)
     if len(pnls) > 1:
@@ -976,7 +1353,6 @@ def aggregate_results(results: list[MarketResult], cfg: BacktestConfig) -> dict:
     else:
         sharpe_like = 0.0
 
-    # Calibration table
     buckets: dict[str, list] = {}
     for r in results:
         b = r.cert_bucket
@@ -994,7 +1370,6 @@ def aggregate_results(results: list[MarketResult], cfg: BacktestConfig) -> dict:
             "win_rate": round(win_r, 4) if win_r is not None else None,
         }
 
-    # Per-hour PnL
     hour_pnl: dict[int, float] = {}
     hour_count: dict[int, int] = {}
     for r in results:
@@ -1004,17 +1379,18 @@ def aggregate_results(results: list[MarketResult], cfg: BacktestConfig) -> dict:
     per_hour_pnl = {str(h): round(v, 4) for h, v in sorted(hour_pnl.items())}
     per_hour_count = {str(h): c for h, c in sorted(hour_count.items())}
 
-    # Worst markets (bottom 5)
     sorted_results = sorted(results, key=lambda r: r.pnl)
     worst_markets = [
         {
-            "market_id": r.slug,
+            "market_id": r.market_id,
             "pnl": r.pnl,
             "outcome": r.outcome,
             "paired": r.paired,
             "up_qty": r.up_qty,
             "dn_qty": r.dn_qty,
+            "has_book_data": r.has_book_data,
             "reason": (
+                "no_book_data" if not r.has_book_data else
                 "fv_blocked" if r.fv_blocked else
                 "aborted" if r.aborted else
                 "no_fills" if (r.up_qty == 0 and r.dn_qty == 0) else
@@ -1025,7 +1401,6 @@ def aggregate_results(results: list[MarketResult], cfg: BacktestConfig) -> dict:
         for r in sorted_results[:5]
     ]
 
-    # FV accuracy (over markets where we have an outcome)
     fv_correct = [r for r in results if r.outcome_correct is not None]
     fv_accuracy = sum(1 for r in fv_correct if r.outcome_correct) / len(fv_correct) if fv_correct else None
 
@@ -1034,6 +1409,7 @@ def aggregate_results(results: list[MarketResult], cfg: BacktestConfig) -> dict:
         "config": cfg.to_dict(),
         "markets_simulated": n,
         "markets_with_outcome": sum(1 for r in results if r.outcome is not None),
+        "book_coverage_rate": round(book_coverage_rate, 4),
         "total_pnl": round(total_pnl, 4),
         "mean_pnl_per_market": round(pnl_per_market, 4),
         "win_rate": round(win_rate, 4),
@@ -1060,41 +1436,77 @@ def aggregate_results(results: list[MarketResult], cfg: BacktestConfig) -> dict:
 def run_backtest(
     data_dir: pathlib.Path,
     cfg: BacktestConfig,
+    start_date: str,
+    end_date: str,
     output_path: pathlib.Path | None = None,
     verbose: bool = False,
+    cache_dir: pathlib.Path | None = None,
 ) -> dict:
-    """Run backtest over all JSONL files in data_dir."""
-    jsonl_files = sorted(data_dir.glob("*.jsonl"))
-    if not jsonl_files:
-        logger.warning("No JSONL files found in %s", data_dir)
-        return {"error": "no data files found", "data_dir": str(data_dir)}
+    """Run backtest using local book_log data."""
+    # Compute date range
+    start_dt = datetime.date.fromisoformat(start_date)
+    end_dt = datetime.date.fromisoformat(end_date)
+    dates = []
+    d = start_dt
+    while d <= end_dt:
+        dates.append(str(d))
+        d += datetime.timedelta(days=1)
 
-    logger.info("Found %d snapshot files in %s", len(jsonl_files), data_dir)
+    start_epoch = int(datetime.datetime(
+        start_dt.year, start_dt.month, start_dt.day,
+        tzinfo=datetime.timezone.utc
+    ).timestamp())
+    end_epoch = int(datetime.datetime(
+        end_dt.year, end_dt.month, end_dt.day,
+        tzinfo=datetime.timezone.utc
+    ).timestamp()) + 86400  # include all of end_date
 
+    settlement_log = data_dir / "settlement_log.jsonl"
+
+    # Build book index (cached)
+    book_index = build_book_index(data_dir, dates, cache_dir=cache_dir or data_dir)
+
+    # Load market windows
+    windows = load_market_windows(data_dir, dates, settlement_log, start_epoch, end_epoch)
+    if not windows:
+        logger.error("No market windows found for date range %s to %s", start_date, end_date)
+        return {"error": "no market windows found"}
+
+    # Map tokens to markets
+    map_tokens_to_markets(book_index, windows, data_dir, dates, cache_dir=cache_dir or data_dir)
+
+    no_token_count = sum(1 for w in windows if w.up_token_id is None)
+    logger.info(
+        "Markets: %d total, %d without token mapping",
+        len(windows), no_token_count,
+    )
+
+    # Load price series for all dates
+    logger.info("Loading price series for FV computation...")
+    all_prices: list[tuple[float, float]] = []
+    for date in dates:
+        all_prices.extend(
+            load_price_series(data_dir, [date], start_epoch - 3600, end_epoch, "BTC", "binance")
+        )
+    all_prices.sort(key=lambda x: x[0])
+    logger.info("Loaded %d BTC price points", len(all_prices))
+
+    # Simulate each market
     results: list[MarketResult] = []
-    skipped = 0
-
-    for fpath in jsonl_files:
-        snapshot = load_snapshot(fpath)
-        if snapshot is None:
-            skipped += 1
-            continue
-
-        result = simulate_market(snapshot, cfg)
+    for w in sorted(windows, key=lambda x: x.open_epoch):
+        result = simulate_market(w, book_index, all_prices, cfg)
         results.append(result)
 
         if verbose:
-            outcome_str = snapshot.outcome or "?"
             logger.info(
-                "%-45s  outcome=%-4s  pnl=%+7.2f  paired=%-5s  fv=%.3f  cert=%.3f",
-                snapshot.slug, outcome_str, result.pnl,
-                str(result.paired), result.fv_at_entry, result.certainty_at_entry,
+                "%-45s  outcome=%-4s  pnl=%+7.2f  paired=%-5s  book=%-5s  fv=%.3f",
+                w.market_id[-30:], w.outcome or "?", result.pnl,
+                str(result.paired), str(result.has_book_data), result.fv_at_entry,
             )
 
-    logger.info("Simulated %d markets, skipped %d", len(results), skipped)
+    logger.info("Simulated %d markets", len(results))
 
     agg = aggregate_results(results, cfg)
-    agg["skipped_files"] = skipped
 
     if output_path is not None:
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1107,15 +1519,20 @@ def run_backtest(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Backtester for PolyBot strategy against Dome historical snapshots"
+        description="PolyBot paired MM backtester using local book_log data"
     )
-    parser.add_argument("--data-dir", required=True, help="Directory with .jsonl snapshot files")
-    parser.add_argument(
-        "--config", default=None,
-        help="Path to YAML config file (BacktestConfig fields). Defaults to baseline_current.yaml"
-    )
+    parser.add_argument("--data-dir", default="data",
+        help="Directory containing book_log, market_event_log, settlement_log, price_log files")
+    parser.add_argument("--config", default=None,
+        help="Path to YAML config file. Defaults to baseline_current.yaml")
     parser.add_argument("--output", default=None, help="Output JSON file path")
-    parser.add_argument("--verbose", "-v", action="store_true", help="Log per-market results")
+    parser.add_argument("--start", default="2026-04-10",
+        help="Start date (YYYY-MM-DD), inclusive")
+    parser.add_argument("--end", default="2026-04-11",
+        help="End date (YYYY-MM-DD), inclusive")
+    parser.add_argument("--verbose", "-v", action="store_true")
+    parser.add_argument("--cache-dir", default=None,
+        help="Directory for index caches (default: data_dir)")
     args = parser.parse_args()
 
     data_dir = pathlib.Path(args.data_dir)
@@ -1124,24 +1541,33 @@ def main() -> None:
         sys.exit(1)
 
     if args.config:
-        config_path = pathlib.Path(args.config)
-        cfg = BacktestConfig.from_yaml(config_path)
+        cfg = BacktestConfig.from_yaml(pathlib.Path(args.config))
     else:
         cfg = BacktestConfig()
         cfg.name = "default"
 
-    if args.output:
-        output_path = pathlib.Path(args.output)
-    else:
-        output_path = pathlib.Path("results") / f"{cfg.name}.json"
+    output_path = pathlib.Path(args.output) if args.output else (
+        pathlib.Path("results") / f"{cfg.name}.json"
+    )
 
-    agg = run_backtest(data_dir, cfg, output_path, verbose=args.verbose)
+    cache_dir = pathlib.Path(args.cache_dir) if args.cache_dir else data_dir
 
-    # Print summary to stdout
+    agg = run_backtest(
+        data_dir=data_dir,
+        cfg=cfg,
+        start_date=args.start,
+        end_date=args.end,
+        output_path=output_path,
+        verbose=args.verbose,
+        cache_dir=cache_dir,
+    )
+
     print(f"\n{'='*60}")
     print(f"BACKTEST RESULTS: {cfg.name}")
     print(f"{'='*60}")
+    print(f"Date range        : {args.start} to {args.end}")
     print(f"Markets simulated : {agg.get('markets_simulated', 0)}")
+    print(f"Book data coverage: {agg.get('book_coverage_rate', 0):.1%}")
     print(f"Total PnL         : ${agg.get('total_pnl', 0):.2f}")
     print(f"PnL / market      : ${agg.get('mean_pnl_per_market', 0):.4f}")
     print(f"Win rate          : {agg.get('win_rate', 0):.1%}")
