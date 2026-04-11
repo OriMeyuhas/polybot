@@ -674,3 +674,196 @@ class TestRunBacktest:
         assert out_path.exists()
         data = json.loads(out_path.read_text())
         assert data["markets_simulated"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Test: DN orderbook reading from real snapshots
+# ---------------------------------------------------------------------------
+
+def _make_snapshot_with_dn_orderbooks(
+    dn_best_ask: float = 0.43,
+    **kwargs,
+) -> "MarketSnapshot":
+    """Build a MarketSnapshot that includes real DN-side orderbooks (new schema)."""
+    snap = _make_snapshot(**kwargs)
+    # Replace orderbooks with entries that have explicit side tags
+    window_start = snap.window_start
+    window_dur = snap.window_end - snap.window_start
+    up_asks = [{"price": str(round(snap.orderbooks[0]["asks"][0]["price"] if snap.orderbooks else "0.55")), "size": "1000"}]
+    dn_asks = [{"price": str(round(dn_best_ask + 0.01 * i, 2)), "size": "1000"} for i in range(5)]
+    dn_bids = [{"price": str(round(1.0 - dn_best_ask - 0.01 * i - 0.01, 2)), "size": "1000"} for i in range(5)]
+
+    new_orderbooks = []
+    for i in range(10):
+        ts = (window_start + i * (window_dur // 10)) * 1000
+        # UP entry
+        new_orderbooks.append({
+            "timestamp_ms": ts,
+            "asks": [{"price": str(round(0.55 + 0.01 * j, 2)), "size": "1000"} for j in range(5)],
+            "bids": [{"price": str(round(0.45 - 0.01 * j, 2)), "size": "1000"} for j in range(5)],
+            "tick_size": 0.01,
+            "asset_id": "up_token_123",
+            "side": "UP",
+        })
+        # DN entry with real prices
+        new_orderbooks.append({
+            "timestamp_ms": ts,
+            "asks": dn_asks,
+            "bids": dn_bids,
+            "tick_size": 0.01,
+            "asset_id": "dn_token_456",
+            "side": "DN",
+        })
+    snap.orderbooks = new_orderbooks
+    snap.dn_orderbooks = [ob for ob in new_orderbooks if ob.get("side") == "DN"]
+    return snap
+
+
+class TestDNOrderbookReading:
+    def test_reads_dn_orderbook_when_present(self):
+        """When DN orderbook entries exist in snapshot, best_dn_ask_at should return their real ask."""
+        from tools.backtester import best_dn_ask_at
+
+        snap = _make_snapshot(outcome="DOWN")
+        window_start = snap.window_start
+
+        # Inject DN orderbook entries into orderbooks list
+        dn_ob = {
+            "timestamp_ms": window_start * 1000,
+            "asks": [{"price": "0.43", "size": "500"}],
+            "bids": [{"price": "0.39", "size": "500"}],
+            "tick_size": 0.01,
+            "asset_id": "dn_token_456",
+            "side": "DN",
+        }
+        snap.orderbooks.append(dn_ob)
+        snap.orderbooks.sort(key=lambda x: x["timestamp_ms"])
+
+        dn_ask = best_dn_ask_at(snap, window_start)
+        # With real DN data at 0.43, should return 0.43 (not derived from UP bid ~0.48)
+        assert dn_ask is not None
+        assert abs(dn_ask - 0.43) < 0.001, f"Expected 0.43, got {dn_ask}"
+
+    def test_falls_back_to_approximation_when_dn_missing(self):
+        """When no DN side orderbooks exist, best_dn_ask_at uses the UP bid approximation."""
+        from tools.backtester import best_dn_ask_at
+
+        # _make_snapshot creates UP-only orderbooks (no 'side' key or side='UP')
+        snap = _make_snapshot(outcome="DOWN", dn_best_ask=0.48)
+        # Ensure no DN entries
+        for ob in snap.orderbooks:
+            ob.pop("side", None)
+
+        dn_ask = best_dn_ask_at(snap, snap.window_start)
+        # Approximation: 1 - best_up_bid. UP bid ladder starts at 1-0.48=0.52
+        # so dn_ask ≈ 1 - 0.52 = 0.48
+        assert dn_ask is not None
+        assert 0.40 <= dn_ask <= 0.60, f"Approximation out of range: {dn_ask}"
+
+    def test_simulate_uses_real_dn_asks_for_fill_check(self):
+        """simulate_market with DN orderbooks should use real DN ask price for fill decisions.
+
+        Key: When side-tagged orderbooks are present, UP fills use UP-side entries only,
+        DN fills use DN-side entries only. This prevents cross-contamination.
+        """
+        window_start = 1_000_000
+        window_dur = 900
+
+        snap = _make_snapshot(
+            outcome="DOWN",
+            up_best_ask=0.55,
+            dn_best_ask=0.48,
+            window_start=window_start,
+            window_dur=window_dur,
+        )
+
+        # Override orderbooks: UP ask=0.55 (won't fill ladder at ~0.01-0.10),
+        # DN ask=0.01 (fills immediately for DN ladder)
+        snap.orderbooks = []
+        for i in range(10):
+            ts = (window_start + i * (window_dur // 10)) * 1000
+            snap.orderbooks.append({
+                "timestamp_ms": ts,
+                "asks": [{"price": "0.55", "size": "1000"}],
+                "bids": [{"price": "0.45", "size": "1000"}],
+                "tick_size": 0.01,
+                "asset_id": "up_token_123",
+                "side": "UP",
+            })
+            snap.orderbooks.append({
+                "timestamp_ms": ts,
+                "asks": [{"price": "0.01", "size": "1000"}],
+                "bids": [{"price": "0.99", "size": "1000"}],
+                "tick_size": 0.01,
+                "asset_id": "dn_token_456",
+                "side": "DN",
+            })
+        snap.orderbooks.sort(key=lambda x: x["timestamp_ms"])
+
+        cfg = BacktestConfig(fv_cancel_enabled=False, one_sided_abort_enabled=False, fv_gate_enabled=False)
+        result = simulate_market(snap, cfg)
+        # DN ladder prices (~0.01-0.10) fill against DN ask=0.01 -> fills
+        assert result.dn_qty > 0, "DN should have filled from cheap DN orderbook"
+        # UP ladder prices (~0.01-0.10) vs UP ask=0.55 -> no fill (our bids < 0.55)
+        assert result.up_qty == 0.0, "UP should NOT fill when UP ask=0.55 and our bids are below it"
+
+    def test_load_snapshot_preserves_dn_side_tag(self, tmp_path):
+        """load_snapshot should preserve 'side' tag from orderbook entries."""
+        from tools.backtester import load_snapshot
+
+        header = {
+            "type": "header",
+            "market_slug": "btc-dn-test-15m",
+            "condition_id": "0xtest",
+            "token_ids": ["up_id", "dn_id"],
+            "up_token_id": "up_id",
+            "window_start": 1_000_000,
+            "window_end": 1_000_900,
+            "fetched_at": 1_000_950,
+            "raw_market": {
+                "winning_side": "down",
+                "status": "resolved",
+                "extra_fields": {"price_to_beat": 72000.0, "final_price": 71800.0},
+            },
+        }
+        up_ob = {
+            "type": "orderbook",
+            "side": "UP",
+            "data": {
+                "asks": [{"price": "0.55", "size": "100"}],
+                "bids": [{"price": "0.45", "size": "100"}],
+                "tickSize": "0.01",
+                "assetId": "up_id",
+                "timestamp": 1_000_100_000,
+                "indexedAt": "x",
+                "hash": "x",
+                "market": "x",
+                "minOrderSize": "5",
+                "negRisk": False,
+            },
+        }
+        dn_ob = {
+            "type": "orderbook",
+            "side": "DN",
+            "data": {
+                "asks": [{"price": "0.43", "size": "100"}],
+                "bids": [{"price": "0.39", "size": "100"}],
+                "tickSize": "0.01",
+                "assetId": "dn_id",
+                "timestamp": 1_000_100_000,
+                "indexedAt": "x",
+                "hash": "x",
+                "market": "x",
+                "minOrderSize": "5",
+                "negRisk": False,
+            },
+        }
+        p = tmp_path / "btc-dn-test-15m.jsonl"
+        p.write_text("\n".join(json.dumps(x) for x in [header, up_ob, dn_ob]))
+
+        snap = load_snapshot(p)
+        assert snap is not None
+        assert len(snap.orderbooks) == 2
+        sides = {ob.get("side") for ob in snap.orderbooks}
+        assert "UP" in sides
+        assert "DN" in sides

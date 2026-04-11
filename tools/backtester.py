@@ -269,6 +269,8 @@ def load_snapshot(path: pathlib.Path) -> MarketSnapshot | None:
                 "bids": d.get("bids", []),
                 "tick_size": float(d.get("tickSize", 0.01)),
                 "asset_id": d.get("assetId", ""),
+                # "side" is present in new-schema files ("UP" or "DN"); absent in old files.
+                "side": obj.get("side"),
             })
         elif t == "binance":
             d = obj["data"]
@@ -337,46 +339,75 @@ def load_snapshot(path: pathlib.Path) -> MarketSnapshot | None:
 # ---------------------------------------------------------------------------
 
 def best_ask_at(snapshot: MarketSnapshot, epoch_sec: int) -> float | None:
-    """Return the best ask price (UP token) at or just before epoch_sec."""
+    """Return the best ask price (UP token) at or just before epoch_sec.
+
+    Prefers entries tagged with side="UP". Falls back to entries with no side tag
+    (old-schema files). Ignores DN-side entries.
+    """
     target_ms = epoch_sec * 1000
-    # Find last orderbook at or before target_ms
+
+    # Separate UP-side and untagged orderbooks (old-schema compatibility)
+    up_obs = [ob for ob in snapshot.orderbooks if ob.get("side") in ("UP", None)]
+    candidates = up_obs if up_obs else snapshot.orderbooks
+
+    # Find last entry at or before target_ms
     best = None
-    for ob in snapshot.orderbooks:
+    for ob in candidates:
         if ob["timestamp_ms"] <= target_ms:
             best = ob
         else:
             break
-    if best is None and snapshot.orderbooks:
-        best = snapshot.orderbooks[0]
+    if best is None and candidates:
+        best = candidates[0]
     if best is None:
         return None
     asks = best["asks"]
     if not asks:
         return None
-    # asks are sorted descending by price (highest price first in CLOB response)
     # We want the lowest ask = best ask for a buyer
     min_ask = min(float(a["price"]) for a in asks)
     return min_ask
 
 
 def best_dn_ask_at(snapshot: MarketSnapshot, epoch_sec: int) -> float | None:
-    """Return the implied best ask for DOWN token.
+    """Return the best ask price for the DOWN token at or just before epoch_sec.
 
-    Since UP + DOWN = $1 in a binary market, we can derive the DN ask:
-    dn_ask ≈ 1.0 - up_bid
-
-    We approximate: dn_ask ≈ 1.0 - (best_ask_up - tick_size)
-    Since we only have UP token orderbooks, use this approximation.
+    Priority:
+      1. Real DN-side orderbook entries (side="DN") — present in new-schema files.
+      2. Approximation from UP bid: dn_ask ≈ 1.0 - best_up_bid — fallback for old
+         files that only contain UP orderbook data.
     """
     target_ms = epoch_sec * 1000
+
+    # --- Priority 1: real DN-side orderbooks (new schema) ---
+    dn_obs = [ob for ob in snapshot.orderbooks if ob.get("side") == "DN"]
+    if dn_obs:
+        best_dn = None
+        for ob in dn_obs:
+            if ob["timestamp_ms"] <= target_ms:
+                best_dn = ob
+            else:
+                break
+        if best_dn is None:
+            best_dn = dn_obs[0]
+        asks = best_dn["asks"]
+        if asks:
+            tick_size = best_dn.get("tick_size", 0.01)
+            min_ask = min(float(a["price"]) for a in asks)
+            return max(tick_size, min(1.0 - tick_size, min_ask))
+
+    # --- Priority 2: approximate from UP bid (old schema fallback) ---
+    up_obs = [ob for ob in snapshot.orderbooks if ob.get("side") in ("UP", None)]
+    candidates = up_obs if up_obs else snapshot.orderbooks
+
     best = None
-    for ob in snapshot.orderbooks:
+    for ob in candidates:
         if ob["timestamp_ms"] <= target_ms:
             best = ob
         else:
             break
-    if best is None and snapshot.orderbooks:
-        best = snapshot.orderbooks[0]
+    if best is None and candidates:
+        best = candidates[0]
     if best is None:
         return None
 
@@ -384,9 +415,8 @@ def best_dn_ask_at(snapshot: MarketSnapshot, epoch_sec: int) -> float | None:
     if not bids:
         return None
     tick_size = best.get("tick_size", 0.01)
-    # Best bid on UP token
+    # Best bid on UP token → DN ask ≈ 1 - UP_bid
     max_bid = max(float(b["price"]) for b in bids)
-    # DN ask = 1 - UP_bid approximately
     dn_ask = round(1.0 - max_bid, 10)
     return max(tick_size, min(1.0 - tick_size, dn_ask))
 

@@ -8,13 +8,23 @@ Usage:
 For each market window it fetches:
   1. Market metadata (market_slug → condition_id, token_ids)
   2. Candlesticks (1m interval) for the window
-  3. Orderbook snapshots for the UP token
-  4. Binance BTCUSDT prices
-  5. Chainlink BTC/USD prices
+  3. Orderbook snapshots for the UP token (token_ids[0])
+  4. Orderbook snapshots for the DN token (token_ids[1]), if present
+  5. Binance BTCUSDT prices
+  6. Chainlink BTC/USD prices
 
 Output: one JSONL file per market under <out>/<market_slug>.jsonl
   Line 1: {"type": "header", "market_slug": ..., "condition_id": ..., ...}
-  Following lines: {"type": "candle"|"orderbook"|"binance"|"chainlink", "data": {...}}
+  Following lines:
+    {"type": "candle",     "data": {...}}
+    {"type": "orderbook",  "side": "UP", "data": {...}}   ← UP token orderbook
+    {"type": "orderbook",  "side": "DN", "data": {...}}   ← DN token orderbook (new)
+    {"type": "binance",    "data": {...}}
+    {"type": "chainlink",  "data": {...}}
+
+The "side" field on orderbook entries distinguishes the UP and DN token books.
+Old files (pre-schema-upgrade) have no "side" field; the backtester falls back
+to the UP-bid approximation for those.
 """
 from __future__ import annotations
 
@@ -132,6 +142,7 @@ def fetch_market_snapshot(
                 token_ids.append(str(side_b["id"]))
 
     up_token_id = token_ids[0] if token_ids else ""
+    dn_token_id = token_ids[1] if len(token_ids) > 1 else ""
 
     lines.append({
         "type": "header",
@@ -139,6 +150,7 @@ def fetch_market_snapshot(
         "condition_id": condition_id,
         "token_ids": token_ids,
         "up_token_id": up_token_id,
+        "dn_token_id": dn_token_id,
         "window_start": window_start,
         "window_end": window_end,
         "fetched_at": int(time.time()),
@@ -153,13 +165,21 @@ def fetch_market_snapshot(
     else:
         logger.warning("%s: no condition_id — skipping candles", slug)
 
-    # 3. Orderbook snapshots (UP token)
+    # 3. Orderbook snapshots — UP token
     if up_token_id:
         snapshots = client.get_orderbook_snapshots(up_token_id, window_start, window_end)
         for s in snapshots:
-            lines.append({"type": "orderbook", "data": s})
+            lines.append({"type": "orderbook", "side": "UP", "data": s})
     else:
-        logger.warning("%s: no UP token_id — skipping orderbook", slug)
+        logger.warning("%s: no UP token_id — skipping UP orderbook", slug)
+
+    # 4. Orderbook snapshots — DN token (enables accurate paired-fill simulation)
+    if dn_token_id:
+        dn_snapshots = client.get_orderbook_snapshots(dn_token_id, window_start, window_end)
+        for s in dn_snapshots:
+            lines.append({"type": "orderbook", "side": "DN", "data": s})
+    else:
+        logger.warning("%s: no DN token_id — skipping DN orderbook", slug)
 
     # 4. Binance prices
     binance_prices = client.get_binance_prices(currency_binance, window_start, window_end)
@@ -208,7 +228,9 @@ def run(
     skipped = 0
     fetched = 0
 
-    with DomeClient() as client:
+    cache_dir = out_dir / "_cache"
+    # Historical data is immutable -- 30 day TTL is fine
+    with DomeClient(cache_dir=cache_dir, cache_ttl_sec=30 * 86_400) as client:
         for idx, (w_start, w_end) in enumerate(windows, 1):
             slug = _market_slug(asset, timeframe, w_start)
             out_file = out_dir / f"{slug}.jsonl"
@@ -224,8 +246,8 @@ def run(
                 lines = fetch_market_snapshot(
                     client, slug, w_start, w_end, currency_binance, currency_chainlink
                 )
-                # Estimate requests: market + candles + orderbook + binance + chainlink = 5
-                total_requests += 5
+                # Estimate requests: market + candles + UP-ob + DN-ob + binance + chainlink = 6
+                total_requests += 6
 
                 jsonl_text = "\n".join(json.dumps(ln) for ln in lines)
                 out_file.write_text(jsonl_text, encoding="utf-8")

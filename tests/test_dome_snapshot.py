@@ -105,9 +105,13 @@ class TestFetchMarketSnapshot:
         client.get_candlesticks.assert_called_once_with("cond123", 1000, 1900, interval="1m")
 
     def test_calls_orderbook_with_up_token(self):
+        """get_orderbook_snapshots is called for the UP token (first call)."""
         client = _make_client_mock()
         fetch_market_snapshot(client, "slug", 1000, 1900, "btcusdt", "btc/usd")
-        client.get_orderbook_snapshots.assert_called_once_with("tok_yes", 1000, 1900)
+        # Now called twice: once for UP (tok_yes), once for DN (tok_no)
+        assert client.get_orderbook_snapshots.call_count == 2
+        first_call_token = client.get_orderbook_snapshots.call_args_list[0].args[0]
+        assert first_call_token == "tok_yes"
 
     def test_calls_binance_with_correct_currency(self):
         client = _make_client_mock()
@@ -176,8 +180,11 @@ class TestFetchMarketSnapshot:
         assert lines[0]["condition_id"] == "dome_cid"
         assert lines[0]["up_token_id"] == "36281616"
         assert lines[0]["token_ids"] == ["36281616", "96090662"]
-        # Should call orderbook with side_a's token ID
-        client.get_orderbook_snapshots.assert_called_once_with("36281616", 1000, 1900)
+        # Should call orderbook for both side_a (UP) and side_b (DN)
+        assert client.get_orderbook_snapshots.call_count == 2
+        calls = {c.args[0] for c in client.get_orderbook_snapshots.call_args_list}
+        assert "36281616" in calls   # UP / side_a
+        assert "96090662" in calls   # DN / side_b
 
 
 # ---------------------------------------------------------------------------
@@ -300,3 +307,80 @@ class TestRunIdempotency:
             )
         actual_slugs = [c.args[0] for c in instance.get_market.call_args_list]
         assert actual_slugs == expected_slugs
+
+
+# ---------------------------------------------------------------------------
+# New tests: both UP and DN orderbooks fetched
+# ---------------------------------------------------------------------------
+
+class TestSnapshotPullsBothSides:
+    def test_snapshot_pulls_both_up_and_dn_orderbooks(self):
+        """fetch_market_snapshot must call get_orderbook_snapshots for both UP and DN token IDs."""
+        client = _make_client_mock()
+        # Market has two tokens: tok_yes (UP) and tok_no (DN)
+        client.get_market.return_value = {
+            "condition_id": "cond_both",
+            "token_ids": ["tok_yes", "tok_no"],
+        }
+        lines = fetch_market_snapshot(client, "slug", 1000, 1900, "btcusdt", "btc/usd")
+
+        # get_orderbook_snapshots should have been called twice
+        assert client.get_orderbook_snapshots.call_count == 2
+        calls = {c.args[0] for c in client.get_orderbook_snapshots.call_args_list}
+        assert "tok_yes" in calls
+        assert "tok_no" in calls
+
+    def test_output_file_has_up_and_dn_snapshots(self, tmp_path):
+        """JSONL output must contain orderbook entries tagged with side='UP' and side='DN'."""
+        client = _make_client_mock()
+        client.get_market.return_value = {
+            "condition_id": "cond_sides",
+            "token_ids": ["tok_up", "tok_dn"],
+        }
+        # Return different data for each token so we can distinguish them
+        def _ob_for_token(token_id, start, end):
+            price = "0.60" if token_id == "tok_up" else "0.42"
+            return [{"asks": [{"price": price, "size": "100"}], "bids": []}]
+
+        client.get_orderbook_snapshots.side_effect = _ob_for_token
+
+        lines = fetch_market_snapshot(client, "slug", 1000, 1900, "btcusdt", "btc/usd")
+
+        ob_lines = [ln for ln in lines if ln["type"] == "orderbook"]
+        sides = {ln["side"] for ln in ob_lines}
+        assert "UP" in sides, "Missing UP side in orderbook lines"
+        assert "DN" in sides, "Missing DN side in orderbook lines"
+
+    def test_dn_token_absent_skips_gracefully(self):
+        """If only one token is present (no DN token), skip DN orderbook fetch without error."""
+        client = _make_client_mock()
+        client.get_market.return_value = {
+            "condition_id": "cond_up_only",
+            "token_ids": ["tok_yes"],  # no DN token
+        }
+        lines = fetch_market_snapshot(client, "slug", 1000, 1900, "btcusdt", "btc/usd")
+
+        # Only called once (for UP)
+        assert client.get_orderbook_snapshots.call_count == 1
+        ob_lines = [ln for ln in lines if ln["type"] == "orderbook"]
+        # All entries must be UP side
+        for ln in ob_lines:
+            assert ln["side"] == "UP"
+
+    def test_side_a_side_b_shape_fetches_both(self):
+        """Dome side_a/side_b shape: both token IDs fetched for orderbooks."""
+        client = _make_client_mock()
+        client.get_market.return_value = {
+            "markets": [
+                {
+                    "condition_id": "dome_cid",
+                    "side_a": {"id": "36281616", "label": "Up"},
+                    "side_b": {"id": "96090662", "label": "Down"},
+                }
+            ],
+            "pagination": {"total": 1},
+        }
+        fetch_market_snapshot(client, "slug", 1000, 1900, "btcusdt", "btc/usd")
+        calls = {c.args[0] for c in client.get_orderbook_snapshots.call_args_list}
+        assert "36281616" in calls   # UP / side_a
+        assert "96090662" in calls   # DN / side_b
