@@ -47,6 +47,7 @@ class LadderState:
     directional_done: bool = False  # True after directional buy placed
     throttle_heavy_side: Side | None = None  # Set when imbalance > 0.30 but both sides have fills
     fv_cancel_history: list = field(default_factory=list)  # epoch timestamps of recent FV cancels
+    is_directional: bool = False  # True if ladder was posted intentionally one-sided (FV gate, spot skip)
 
 
 MIN_ORDER_SIZE = 5.0  # Polymarket minimum for GTC orders
@@ -1141,6 +1142,11 @@ class LadderManager:
             anchor_up = up_rungs[-1][0] if up_rungs else best_ask_up
             anchor_dn = dn_rungs[-1][0] if dn_rungs else best_ask_dn
 
+            # Mark as directional if budget was fully allocated to one side
+            # (FV gate, spot skip, or budget_dn/up == 0 for any reason).
+            # This prevents #50 one-sided abort from killing intentional directional ladders.
+            _is_directional = (budget_up <= 0.0 or budget_dn <= 0.0)
+
             self.ladders[market.market_id] = LadderState(
                 market_id=market.market_id,
                 asset=market.asset,
@@ -1152,6 +1158,7 @@ class LadderManager:
                 current_ask_up=best_ask_up,
                 current_ask_dn=best_ask_dn,
                 timeframe_sec=market.timeframe_sec,
+                is_directional=_is_directional,
             )
 
             # Skip if no rungs could be built on either side
@@ -1632,10 +1639,21 @@ class LadderManager:
         if market_id not in self.ladders:
             return False
 
+        state = self.ladders.get(market_id)
         up_qty = self.tracker.filled_qty(market_id, Side.UP)
         dn_qty = self.tracker.filled_qty(market_id, Side.DOWN)
         if up_qty + dn_qty < 1.0:
             return False
+
+        # Skip check for intentionally directional ladders (FV gate / spot skip posted
+        # a one-sided budget). These are EXPECTED to be single-side and the guard would
+        # otherwise kill them on the first fill. Clear the flag once BOTH sides have
+        # meaningful fills (reprice added the other side) so the guard reactivates.
+        if state is not None and state.is_directional:
+            if up_qty > 0 and dn_qty > 0:
+                state.is_directional = False  # both sides now — re-enable guard
+            else:
+                return False
 
         up_cost = self.tracker.filled_cost(market_id, Side.UP)
         dn_cost = self.tracker.filled_cost(market_id, Side.DOWN)
