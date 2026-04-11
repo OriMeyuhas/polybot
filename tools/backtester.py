@@ -1810,27 +1810,45 @@ def simulate_market_dome(
     # Fill simulation for dome data
     #
     # Dome orderbook is a batch snapshot at window open (~first 16 seconds).
-    # Our passive limit orders are placed BELOW the initial ask by design
-    # (we're providing liquidity to whoever wants to cross the spread).
+    # Our passive limit orders are placed BELOW the initial ask by design.
     #
-    # During 15 minutes, BTC binary options move enough to hit all rungs
-    # within our ladder range. A conservative-realistic model:
+    # Binary option price dynamics during a 15-minute window:
+    #   - If UP wins: UP price rises from ~0.5 to ~1.0.
+    #     DN price falls from ~0.5 to ~0.0. Our DN buy orders fill
+    #     as DN price sweeps DOWN through our bids.
+    #   - If DN wins: Opposite — UP price falls, our UP buys fill.
     #
-    #   Tick 1 (t=open): Rungs AT OR ABOVE the initial ask fill immediately
-    #                     (they cross the spread at entry)
-    #   Remainder:        Rungs BELOW the initial ask fill progressively.
-    #                     We assume ALL ladder rungs fill during the window
-    #                     since 15m is long enough for price to sweep through
-    #                     a 0.10-wide range. This is consistent with 0% no-fill
-    #                     rate observed in local book_log validation.
+    # ADVERSE SELECTION: The LOSING side always fills (price sweeps to 0).
+    # The WINNING side fills ONLY when price first dips toward our bids
+    # before reversing up. This is the key uncertainty.
     #
-    # To keep the simulation conservative, we fill rungs at the MIDPOINT of
-    # the window (t = open + window_dur/2) to model that they fill early/mid
-    # rather than all at open.
+    # Fill model (calibrated from local book_log data — 66% paired rate):
+    #   - LOSING side: always fills (all rungs, at their posted prices)
+    #   - WINNING side: fills with 66% probability (two-way price motion)
+    #     Uses seeded RNG for reproducibility.
+    #
+    # This matches our observed 66% paired rate in 122 real markets.
     # -----------------------------------------------------------------------
-    mid_ts = open_ep + window_dur / 2.0
+    import random as _random
+    # Deterministic seed from market epoch for reproducibility
+    _epoch = dome.window_start
+    _rng = _random.Random(_epoch)
 
-    # Tick 1: immediate fills (our bid >= ask = cross the spread)
+    # Calibrated paired probability from local book_log validation
+    WINNING_SIDE_FILL_PROB = 0.66
+
+    # Determine LOSING side (always fills)
+    if dome.outcome == "UP":
+        losing_side = "DN"  # DN resolves 0, DN ask falls through our bids
+    elif dome.outcome == "DOWN":
+        losing_side = "UP"  # UP resolves 0, UP ask falls through our bids
+    else:
+        losing_side = None
+
+    mid_ts = open_ep + window_dur / 2.0
+    early_ts = open_ep + window_dur * 0.25  # winning side fills earlier (2-way motion)
+
+    # Step 1: Immediate fills (our bid >= initial ask = cross the spread)
     for order in list(up_orders):
         price, qty = order
         if price >= up_ask_initial:
@@ -1855,30 +1873,59 @@ def simulate_market_dome(
             events.append(Event(open_ep, "FILL",
                 f"DN fill (cross): price={price:.2f} qty={qty:.1f} ask={dn_ask_initial:.2f}"))
 
-    # Tick 2 (mid-window): fill remaining passive orders (they fill as market moves)
-    # These represent orders that the market sweeps through during the 15m window.
-    for order in list(up_orders):
-        price, qty = order
-        # All passive orders fill during the window — binary price sweeps ±0.30+ in 15m
-        cost = price * qty
-        up_cost_accum += cost
-        f = Fill("UP", price, qty, mid_ts, cost)
-        up_filled.append(f)
-        fills.append(f)
-        up_orders.remove(order)
-        events.append(Event(mid_ts, "FILL",
-            f"UP fill (passive): price={price:.2f} qty={qty:.1f} ask={up_ask_initial:.2f}"))
+    # Step 2: Fill LOSING side (always fills — price sweeps to 0)
+    if losing_side == "UP" and up_orders:
+        for order in list(up_orders):
+            price, qty = order
+            cost = price * qty
+            up_cost_accum += cost
+            f = Fill("UP", price, qty, mid_ts, cost)
+            up_filled.append(f)
+            fills.append(f)
+            up_orders.remove(order)
+            events.append(Event(mid_ts, "FILL",
+                f"UP fill (loser sweep): price={price:.2f} qty={qty:.1f}"))
 
-    for order in list(dn_orders):
-        price, qty = order
-        cost = price * qty
-        dn_cost_accum += cost
-        f = Fill("DN", price, qty, mid_ts, cost)
-        dn_filled.append(f)
-        fills.append(f)
-        dn_orders.remove(order)
-        events.append(Event(mid_ts, "FILL",
-            f"DN fill (passive): price={price:.2f} qty={qty:.1f} ask={dn_ask_initial:.2f}"))
+    elif losing_side == "DN" and dn_orders:
+        for order in list(dn_orders):
+            price, qty = order
+            cost = price * qty
+            dn_cost_accum += cost
+            f = Fill("DN", price, qty, mid_ts, cost)
+            dn_filled.append(f)
+            fills.append(f)
+            dn_orders.remove(order)
+            events.append(Event(mid_ts, "FILL",
+                f"DN fill (loser sweep): price={price:.2f} qty={qty:.1f}"))
+
+    # Step 3: Fill WINNING side with 66% probability (two-way price motion)
+    winning_side_fills = _rng.random() < WINNING_SIDE_FILL_PROB
+    if winning_side_fills:
+        if losing_side == "DN" and up_orders:
+            # Outcome=UP, winner=UP → up_orders may have remaining unfilled
+            for order in list(up_orders):
+                price, qty = order
+                cost = price * qty
+                up_cost_accum += cost
+                f = Fill("UP", price, qty, early_ts, cost)
+                up_filled.append(f)
+                fills.append(f)
+                up_orders.remove(order)
+                events.append(Event(early_ts, "FILL",
+                    f"UP fill (winner 2-way): price={price:.2f} qty={qty:.1f}"))
+
+        elif losing_side == "UP" and dn_orders:
+            # Outcome=DOWN, winner=DN → dn_orders may have remaining unfilled
+            for order in list(dn_orders):
+                price, qty = order
+                cost = price * qty
+                dn_cost_accum += cost
+                f = Fill("DN", price, qty, early_ts, cost)
+                dn_filled.append(f)
+                fills.append(f)
+                dn_orders.remove(order)
+                events.append(Event(early_ts, "FILL",
+                    f"DN fill (winner 2-way): price={price:.2f} qty={qty:.1f}"))
 
     # Tick 2: near window close (~100s before end) — FV cancel check
     tick2_ts = close_ep - 100.0

@@ -1040,8 +1040,13 @@ class TestSimulateMarketDome:
         # Expect some fills since rung prices are below ask
         assert result.outcome == "UP"
 
-    def test_all_passive_orders_fill_in_dome_mode(self):
-        """Dome mode fills ALL passive orders (market sweeps ladder in 15m window)."""
+    def test_losing_side_always_fills_in_dome_mode(self):
+        """Dome mode always fills the LOSING side (price sweeps to 0).
+
+        outcome=UP → losing side is DN → dn_qty > 0 always.
+        UP side (winner) fills with 66% probability, so we can't assert up_qty > 0
+        without knowing the RNG seed.
+        """
         cfg = BacktestConfig(
             bankroll=500.0,
             position_size_fraction=0.05,
@@ -1053,12 +1058,62 @@ class TestSimulateMarketDome:
             fv_cancel_enabled=False,
             one_sided_abort_enabled=False,
         )
-        # Market ask is moderate — our rungs are all below ask but still fill
         dome = self._make_dome(up_ask=0.55, dn_ask=0.55, outcome="UP")
         result = simulate_market_dome(dome, cfg)
-        # All rungs should fill in dome mode (passive mid-window fill assumption)
-        assert result.up_qty > 0.0
+        # DN (loser) always fills for outcome=UP
         assert result.dn_qty > 0.0
+        # UP may or may not fill (66% probability — depends on seed)
+        # If UP fills too, we have a paired result
+        if result.up_qty > 0.0:
+            assert result.paired or result.pair_cost > 0
+
+    def test_winning_side_fills_66pct_across_markets(self):
+        """Across many markets, approximately 66% should achieve paired fills."""
+        cfg = BacktestConfig(
+            bankroll=500.0,
+            position_size_fraction=0.05,
+            rungs=3,
+            width=0.10,
+            spacing=0.02,
+            size_skew=1.0,
+            fv_gate_enabled=False,
+            fv_cancel_enabled=False,
+            one_sided_abort_enabled=False,
+            max_pair_cost=0.98,
+        )
+        # Simulate 200 markets (distinct epochs → distinct RNG seeds)
+        paired_count = 0
+        n = 200
+        import random
+        for i in range(n):
+            epoch = 1_000_000 + i * 900
+            dome = DomeMarketData(
+                market_slug=f"btc-updown-15m-{epoch}",
+                condition_id="0xABCD",
+                up_token_id="UP_TOKEN",
+                dn_token_id="DN_TOKEN",
+                window_start=epoch,
+                window_end=epoch + 900,
+                outcome="UP",  # DN is loser, fills always
+                up_best_bid=0.48,
+                up_best_ask=0.52,
+                dn_best_bid=0.48,
+                dn_best_ask=0.52,
+                ptb=70000.0,
+                binance_at_close=70500.0,
+                chainlink_at_close=70500.0,
+                binance_series=[(float(epoch + 800 + j), 70000.0 + j * 5) for j in range(100)],
+                has_orderbook=True,
+                ob_up_count=5,
+                ob_dn_count=5,
+            )
+            result = simulate_market_dome(dome, cfg)
+            if result.paired:
+                paired_count += 1
+
+        paired_rate = paired_count / n
+        # Should be ~66%, allow ±15% tolerance
+        assert 0.51 <= paired_rate <= 0.81, f"paired_rate={paired_rate:.2f} not in [0.51, 0.81]"
 
     def test_pnl_positive_for_paired_win(self):
         """Paired win produces positive PnL when pair_cost < 1.0."""
