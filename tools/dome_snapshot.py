@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pathlib
 import sys
 import time
@@ -31,6 +32,15 @@ from typing import Iterator
 _TOOLS_DIR = pathlib.Path(__file__).parent
 if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
+
+# Load DOME_API_KEY from project .env if not already set in env
+if not os.environ.get("DOME_API_KEY"):
+    _env_path = _TOOLS_DIR.parent / ".env"
+    if _env_path.exists():
+        for _line in _env_path.read_text().splitlines():
+            if _line.startswith("DOME_API_KEY="):
+                os.environ["DOME_API_KEY"] = _line.split("=", 1)[1].strip()
+                break
 
 from dome_client import DomeClient, DomeAPIError
 
