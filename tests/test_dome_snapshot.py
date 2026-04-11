@@ -146,6 +146,39 @@ class TestFetchMarketSnapshot:
         lines = fetch_market_snapshot(client, "slug", 1000, 1900, "btcusdt", "btc/usd")
         assert lines[0]["condition_id"] == "list_cid"
 
+    def test_market_wrapped_in_markets_key(self):
+        """Handle real Dome response shape {"markets": [...], "pagination": {...}}."""
+        client = _make_client_mock()
+        client.get_market.return_value = {
+            "markets": [
+                {"condition_id": "real_cid", "token_ids": ["yes_tok", "no_tok"]}
+            ],
+            "pagination": {"total": 1},
+        }
+        lines = fetch_market_snapshot(client, "slug", 1000, 1900, "btcusdt", "btc/usd")
+        assert lines[0]["condition_id"] == "real_cid"
+        assert lines[0]["up_token_id"] == "yes_tok"
+
+    def test_market_with_side_a_side_b_token_ids(self):
+        """Handle actual Dome shape where token IDs live in side_a.id / side_b.id."""
+        client = _make_client_mock()
+        client.get_market.return_value = {
+            "markets": [
+                {
+                    "condition_id": "dome_cid",
+                    "side_a": {"id": "36281616", "label": "Up"},
+                    "side_b": {"id": "96090662", "label": "Down"},
+                }
+            ],
+            "pagination": {"total": 1},
+        }
+        lines = fetch_market_snapshot(client, "slug", 1000, 1900, "btcusdt", "btc/usd")
+        assert lines[0]["condition_id"] == "dome_cid"
+        assert lines[0]["up_token_id"] == "36281616"
+        assert lines[0]["token_ids"] == ["36281616", "96090662"]
+        # Should call orderbook with side_a's token ID
+        client.get_orderbook_snapshots.assert_called_once_with("36281616", 1000, 1900)
+
 
 # ---------------------------------------------------------------------------
 # Run — skip-if-exists + force

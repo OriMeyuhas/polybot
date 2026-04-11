@@ -94,18 +94,32 @@ def fetch_market_snapshot(
     # Extract condition_id and token_ids from the response
     # Dome returns the market object directly or wrapped — handle both
     market_obj = market_data
-    if "market" in market_data:
+    if "markets" in market_data:
+        # Shape: {"markets": [...], "pagination": {...}}
+        markets_list = market_data["markets"]
+        market_obj = markets_list[0] if markets_list else {}
+    elif "market" in market_data:
         market_obj = market_data["market"]
     elif isinstance(market_data, list) and market_data:
         market_obj = market_data[0]
 
     condition_id: str = market_obj.get("condition_id", "")
-    # token_ids may be a list or comma-separated string
+
+    # token_ids: prefer explicit list, fall back to side_a/side_b token IDs (real Dome shape)
     token_ids_raw = market_obj.get("token_ids", [])
     if isinstance(token_ids_raw, str):
         token_ids = [t.strip() for t in token_ids_raw.split(",") if t.strip()]
     else:
         token_ids = list(token_ids_raw)
+
+    if not token_ids:
+        # Real Dome shape uses side_a.id / side_b.id as token IDs
+        side_a = market_obj.get("side_a", {})
+        side_b = market_obj.get("side_b", {})
+        if side_a.get("id"):
+            token_ids = [str(side_a["id"])]
+            if side_b.get("id"):
+                token_ids.append(str(side_b["id"]))
 
     up_token_id = token_ids[0] if token_ids else ""
 
