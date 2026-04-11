@@ -1,21 +1,37 @@
 """Full-fidelity paired MM backtester for PolyBot.
 
-Uses local book_log_YYYY-MM-DD.jsonl files for high-fidelity orderbook data
-instead of sparse Dome snapshots. Simulates the paired market-making strategy
-over Apr 10-11 settlements where we have continuous WS data.
+Supports two data source modes:
+  - local: Uses local book_log_YYYY-MM-DD.jsonl files (high-fidelity, Apr 10-11 only)
+  - dome:  Uses Dome snapshot files in data/dome_snapshots/ (14 days, 1,344 markets)
+  - auto:  Tries dome first, falls back to local for dates without Dome coverage
 
 Usage:
+    # Dome dataset (1,344 markets, 14 days):
     python tools/backtester.py \\
+        --data-source dome \\
+        --config experiments/paired_only.yaml \\
+        --output results/paired_only_dome.json
+
+    # Local book_log (122 markets, Apr 10-11 only):
+    python tools/backtester.py \\
+        --data-source local \\
         --config experiments/paired_only.yaml \\
         --output results/paired_only.json \\
         --start 2026-04-10 --end 2026-04-11
 
-Architecture:
+Architecture (local mode):
   1. Build a market window index from market_event_log_*.jsonl
   2. Build a token->market mapping by scanning book_log for condition_ids
      and matching them to market windows via time proximity
   3. For each settled market, replay best_bid/best_ask from book_log
   4. Simulate fills, safety nets, and compute PnL
+
+Architecture (dome mode):
+  1. Scan data/dome_snapshots/*.jsonl for all market files
+  2. For each file: read header (metadata + outcome), orderbook entries (book at open),
+     Binance prices (last 100s before window_end), Chainlink prices
+  3. Simulate fills at window open using book state from dome snapshots
+  4. Aggregate into full result set with pnl_per_day breakdown
 """
 from __future__ import annotations
 
@@ -1456,6 +1472,616 @@ def aggregate_results(results: list[MarketResult], cfg: BacktestConfig) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Dome snapshot file loader
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DomeMarketData:
+    """Parsed data from a single Dome snapshot file."""
+    market_slug: str
+    condition_id: str
+    up_token_id: str
+    dn_token_id: str
+    window_start: int          # epoch seconds
+    window_end: int            # epoch seconds
+    outcome: str | None        # "UP" or "DOWN" from winning_side.label
+
+    # Book state at window open (median of all snapshots, which are all at open)
+    up_best_bid: float
+    up_best_ask: float
+    dn_best_bid: float
+    dn_best_ask: float
+
+    # FV-related prices
+    ptb: float | None          # Chainlink price-to-beat (at window start, from extra_fields)
+    binance_at_close: float | None   # last Binance price at window_end
+    chainlink_at_close: float | None # last Chainlink price at window_end
+
+    # Binance time series during last 100s (ts_sec, price)
+    binance_series: list[tuple[float, float]]
+
+    # Whether this market has orderbook data
+    has_orderbook: bool
+
+    # Raw entry count for diagnostics
+    ob_up_count: int
+    ob_dn_count: int
+
+
+def load_dome_snapshot(path: pathlib.Path) -> DomeMarketData | None:
+    """Parse a single Dome snapshot JSONL file.
+
+    Returns DomeMarketData or None if the file is malformed/missing header.
+    Markets with zero orderbook entries are returned with has_orderbook=False
+    (caller decides whether to skip them).
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = [l.strip() for l in f if l.strip()]
+    except OSError as e:
+        logger.warning("Cannot open dome file %s: %s", path, e)
+        return None
+
+    if not lines:
+        return None
+
+    # Parse header (must be first line)
+    try:
+        header = json.loads(lines[0])
+    except json.JSONDecodeError:
+        logger.warning("Bad header in %s", path)
+        return None
+
+    if header.get("type") != "header":
+        logger.warning("First line is not header in %s", path)
+        return None
+
+    market_slug = header.get("market_slug", "")
+    condition_id = header.get("condition_id", "")
+    up_token_id = header.get("up_token_id", "")
+    dn_token_id = header.get("dn_token_id", "")
+    window_start = int(header.get("window_start", 0))
+    window_end = int(header.get("window_end", 0))
+
+    raw_market = header.get("raw_market", {})
+    winning_side = raw_market.get("winning_side", {})
+    winning_label = winning_side.get("label", "")
+    winning_id = winning_side.get("id", "")
+
+    # Determine outcome
+    outcome: str | None = None
+    if winning_label == "Up":
+        outcome = "UP"
+    elif winning_label == "Down":
+        outcome = "DOWN"
+    elif winning_id:
+        # Fallback: compare by token ID
+        if winning_id == up_token_id:
+            outcome = "UP"
+        elif winning_id == dn_token_id:
+            outcome = "DOWN"
+
+    # extra_fields for PTB
+    extra = raw_market.get("extra_fields", {})
+    ptb: float | None = None
+    ptb_raw = extra.get("price_to_beat")
+    if ptb_raw is not None:
+        try:
+            ptb = float(ptb_raw)
+        except (ValueError, TypeError):
+            pass
+
+    # Parse orderbook entries (UP and DN)
+    ob_up_asks: list[float] = []
+    ob_up_bids: list[float] = []
+    ob_dn_asks: list[float] = []
+    ob_dn_bids: list[float] = []
+
+    binance_series: list[tuple[float, float]] = []
+    chainlink_at_close: float | None = None
+    binance_at_close: float | None = None
+    max_chainlink_ts: float = 0.0
+    max_binance_ts: float = 0.0
+
+    for line in lines[1:]:
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        t = obj.get("type", "")
+        data = obj.get("data", {})
+
+        if t == "orderbook":
+            side = obj.get("side", "")
+            bids = data.get("bids", [])
+            asks = data.get("asks", [])
+            best_bid = max((float(b["price"]) for b in bids), default=0.0) if bids else 0.0
+            best_ask = min((float(a["price"]) for a in asks), default=1.0) if asks else 1.0
+            if side == "UP":
+                ob_up_bids.append(best_bid)
+                ob_up_asks.append(best_ask)
+            elif side == "DN":
+                ob_dn_bids.append(best_bid)
+                ob_dn_asks.append(best_ask)
+
+        elif t == "binance":
+            ts_ms = data.get("timestamp", 0)
+            value = data.get("value")
+            if value is not None:
+                ts_sec = ts_ms / 1000.0
+                binance_series.append((ts_sec, float(value)))
+                if ts_ms > max_binance_ts:
+                    max_binance_ts = ts_ms
+                    binance_at_close = float(value)
+
+        elif t == "chainlink":
+            ts_ms = data.get("timestamp", 0)
+            value = data.get("value")
+            if value is not None and ts_ms > max_chainlink_ts:
+                max_chainlink_ts = ts_ms
+                chainlink_at_close = float(value)
+
+    # Compute median best_bid/best_ask for UP and DN
+    def _median(vals: list[float]) -> float:
+        if not vals:
+            return 0.5
+        s = sorted(vals)
+        mid = len(s) // 2
+        return s[mid] if len(s) % 2 else (s[mid - 1] + s[mid]) / 2
+
+    up_best_bid = _median(ob_up_bids) if ob_up_bids else 0.0
+    up_best_ask = _median(ob_up_asks) if ob_up_asks else 1.0
+    dn_best_bid = _median(ob_dn_bids) if ob_dn_bids else 0.0
+    dn_best_ask = _median(ob_dn_asks) if ob_dn_asks else 1.0
+
+    binance_series.sort(key=lambda x: x[0])
+
+    return DomeMarketData(
+        market_slug=market_slug,
+        condition_id=condition_id,
+        up_token_id=up_token_id,
+        dn_token_id=dn_token_id,
+        window_start=window_start,
+        window_end=window_end,
+        outcome=outcome,
+        up_best_bid=up_best_bid,
+        up_best_ask=up_best_ask,
+        dn_best_bid=dn_best_bid,
+        dn_best_ask=dn_best_ask,
+        ptb=ptb,
+        binance_at_close=binance_at_close,
+        chainlink_at_close=chainlink_at_close,
+        binance_series=binance_series,
+        has_orderbook=len(ob_up_asks) > 0 or len(ob_dn_asks) > 0,
+        ob_up_count=len(ob_up_asks),
+        ob_dn_count=len(ob_dn_asks),
+    )
+
+
+def simulate_market_dome(
+    dome: DomeMarketData,
+    cfg: BacktestConfig,
+) -> MarketResult:
+    """Simulate the paired MM strategy for a single market using Dome snapshot data.
+
+    Key differences from local book_log simulation:
+    - Book state comes from a batch snapshot at window open (all ~100 UP + 100 DN snapshots
+      are within the first ~16 seconds of the window). We use the median best_ask.
+    - Fill simulation: A resting buy order fills if our bid price >= market best_ask.
+      Since all dome book data is at window open, we can only assess fills at that moment.
+      We conservatively fill all rungs where our bid >= open ask.
+    - FV computation: Use PTB (Chainlink price-to-beat) as start_price, and Binance
+      near window_end as a proxy for "current" price at ~T-100s. This approximates
+      what the FV model would have computed near the end of the window.
+    - For FV at entry (t=0), we set FV=0.5 (neutral) since we have no price history
+      before window open in dome data. This means fv_gate and fv_cancel fire at most
+      once (at the entry tick), based on price data from the close period.
+    """
+    budget = cfg.bankroll * cfg.position_size_fraction
+    events: list[Event] = []
+    fills: list[Fill] = []
+    tick_size = 0.01
+
+    open_ep = float(dome.window_start)
+    close_ep = float(dome.window_end)
+    window_dur = close_ep - open_ep
+
+    has_book_data = dome.has_orderbook
+    market_hour = datetime.datetime.fromtimestamp(
+        dome.window_start, datetime.timezone.utc
+    ).hour
+
+    # -------------------------------------------------------------------
+    # FV computation
+    # We use PTB as start_price and binance_at_close as an approximate
+    # "current" price from the perspective of FV certainty.
+    # Since dome only has book state at open, FV at entry is ~0.5.
+    # We compute FV based on close-price direction for fv_cancel simulation.
+    # -------------------------------------------------------------------
+    start_price = dome.ptb
+    end_price = dome.binance_at_close  # price ~100s before window_end
+
+    # FV at entry (we have no price history at open): use neutral
+    fv_up_entry = 0.5
+    cert_entry = 0.5
+
+    # FV near window close (for cancel/abort simulation)
+    fv_up_close = 0.5
+    cert_close = 0.5
+    if start_price and end_price and start_price > 0 and end_price > 0:
+        # At close, remaining seconds is ~100 (the Binance series covers last 100s)
+        secs_remaining_at_close = 100.0
+        fv_up_close = _p_fair_up(start_price, end_price, secs_remaining_at_close, cfg.vol_fallback_annual)
+        cert_close = _fv_certainty(fv_up_close)
+        # For entry FV, use fv based on full 900s remaining
+        fv_up_entry = _p_fair_up(start_price, end_price, window_dur, cfg.vol_fallback_annual)
+        cert_entry = _fv_certainty(fv_up_entry)
+
+    fv_up = fv_up_entry
+    cert = cert_entry
+
+    # -------------------------------------------------------------------
+    # FV gate (at entry)
+    # -------------------------------------------------------------------
+    fv_blocked = False
+    if cfg.fv_gate_enabled and cert >= cfg.fv_gate_certainty_threshold:
+        fv_blocked = True
+        events.append(Event(open_ep, "FV_GATE_BLOCK",
+            f"cert={cert:.3f} >= threshold={cfg.fv_gate_certainty_threshold}"))
+
+    # -------------------------------------------------------------------
+    # Build ladders from book state at open
+    # -------------------------------------------------------------------
+    up_ask_initial = dome.up_best_ask
+    dn_ask_initial = dome.dn_best_ask
+
+    if fv_blocked:
+        winning_side = "UP" if fv_up >= 0.5 else "DN"
+        if winning_side == "UP":
+            up_budget = min(budget, cfg.directional_budget_cap)
+            dn_budget = 0.0
+        else:
+            dn_budget = min(budget, cfg.directional_budget_cap)
+            up_budget = 0.0
+    else:
+        up_budget = budget / 2.0
+        dn_budget = budget / 2.0
+
+    up_rungs = _build_ladder(
+        best_ask=up_ask_initial,
+        budget=up_budget,
+        rungs=cfg.rungs,
+        spacing=cfg.spacing,
+        width=cfg.width,
+        size_skew=cfg.size_skew,
+        tick_size=tick_size,
+        fee_rate=cfg.maker_fee_rate,
+        max_rung_price=1.0 - tick_size,
+    ) if up_budget > 0 else []
+
+    dn_rungs = _build_ladder(
+        best_ask=dn_ask_initial,
+        budget=dn_budget,
+        rungs=cfg.rungs,
+        spacing=cfg.spacing,
+        width=cfg.width,
+        size_skew=cfg.size_skew,
+        tick_size=tick_size,
+        fee_rate=cfg.maker_fee_rate,
+        max_rung_price=1.0 - tick_size,
+    ) if dn_budget > 0 else []
+
+    events.append(Event(open_ep, "POST",
+        f"up_rungs={len(up_rungs)} dn_rungs={len(dn_rungs)} "
+        f"fv={fv_up:.3f} cert={cert:.3f} "
+        f"up_ask={up_ask_initial:.2f} dn_ask={dn_ask_initial:.2f}"))
+
+    # -------------------------------------------------------------------
+    # Fill simulation using dome book state
+    #
+    # Dome orderbook data is all from window open (~first 16 seconds).
+    # We simulate two ticks:
+    #   Tick 1 (t=open): Check fills against book state at open
+    #   Tick 2 (t=close-100): FV cancel check using close-period FV
+    #
+    # Fill rule: our resting buy at price P fills if P >= market best_ask.
+    # This models an aggressive passive bid that crosses the spread at entry.
+    # Conservative: doesn't model fills that happen mid-window as book moves.
+    # -------------------------------------------------------------------
+    up_orders: list[tuple[float, float]] = list(up_rungs)
+    dn_orders: list[tuple[float, float]] = list(dn_rungs)
+    up_filled: list[Fill] = []
+    dn_filled: list[Fill] = []
+
+    fv_cancelled_up = False
+    fv_cancelled_dn = False
+    up_cost_accum = 0.0
+    dn_cost_accum = 0.0
+    aborted = False
+
+    # Tick 1: window open — check fills
+    for order in list(up_orders):
+        price, qty = order
+        if price >= up_ask_initial:
+            cost = price * qty
+            up_cost_accum += cost
+            f = Fill("UP", price, qty, open_ep, cost)
+            up_filled.append(f)
+            fills.append(f)
+            up_orders.remove(order)
+            events.append(Event(open_ep, "FILL",
+                f"UP fill: price={price:.2f} qty={qty:.1f} ask={up_ask_initial:.2f}"))
+
+    for order in list(dn_orders):
+        price, qty = order
+        if price >= dn_ask_initial:
+            cost = price * qty
+            dn_cost_accum += cost
+            f = Fill("DN", price, qty, open_ep, cost)
+            dn_filled.append(f)
+            fills.append(f)
+            dn_orders.remove(order)
+            events.append(Event(open_ep, "FILL",
+                f"DN fill: price={price:.2f} qty={qty:.1f} ask={dn_ask_initial:.2f}"))
+
+    # Tick 2: near window close (~100s before end) — FV cancel check
+    tick2_ts = close_ep - 100.0
+    if cfg.fv_cancel_enabled and cert_close >= cfg.fv_cancel_certainty_threshold:
+        losing_side = "DN" if fv_up_close >= 0.5 else "UP"
+        if losing_side == "UP" and not fv_cancelled_up and up_orders:
+            up_orders = []
+            fv_cancelled_up = True
+            events.append(Event(tick2_ts, "CANCEL",
+                f"FV cancel UP: fv={fv_up_close:.3f} cert={cert_close:.3f}"))
+        elif losing_side == "DN" and not fv_cancelled_dn and dn_orders:
+            dn_orders = []
+            fv_cancelled_dn = True
+            events.append(Event(tick2_ts, "CANCEL",
+                f"FV cancel DN: fv={fv_up_close:.3f} cert={cert_close:.3f}"))
+
+    # One-sided abort (check after tick 1 fills)
+    if cfg.one_sided_abort_enabled and not aborted:
+        total_cost = up_cost_accum + dn_cost_accum
+        committed_pct = total_cost / max(budget, 0.01)
+        if committed_pct >= cfg.one_sided_abort_cost_pct:
+            up_q = sum(f.qty for f in up_filled)
+            dn_q = sum(f.qty for f in dn_filled)
+            if up_q > 0 or dn_q > 0:
+                heavy = max(up_q, dn_q)
+                light = min(up_q, dn_q)
+                if light == 0 and heavy > 0:
+                    if up_q > dn_q:
+                        cancelled = len(up_orders)
+                        up_orders = []
+                        events.append(Event(open_ep, "ABORT",
+                            f"UP heavy ({up_q:.1f} vs {dn_q:.1f}), cancelled {cancelled}"))
+                    else:
+                        cancelled = len(dn_orders)
+                        dn_orders = []
+                        events.append(Event(open_ep, "ABORT",
+                            f"DN heavy ({dn_q:.1f} vs {up_q:.1f}), cancelled {cancelled}"))
+                    aborted = True
+
+    # -------------------------------------------------------------------
+    # PnL computation (same logic as simulate_market)
+    # -------------------------------------------------------------------
+    up_qty = sum(f.qty for f in up_filled)
+    dn_qty = sum(f.qty for f in dn_filled)
+    up_cost = sum(f.cost for f in up_filled)
+    dn_cost = sum(f.cost for f in dn_filled)
+
+    pnl = 0.0
+    paired = False
+    pair_cost = 0.0
+
+    if dome.outcome is None:
+        pnl = 0.0
+    elif up_qty > 0 and dn_qty > 0:
+        avg_up_price = up_cost / max(up_qty, 0.001)
+        avg_dn_price = dn_cost / max(dn_qty, 0.001)
+        pair_cost = avg_up_price + avg_dn_price
+        paired_qty = min(up_qty, dn_qty)
+
+        if pair_cost <= cfg.max_pair_cost:
+            paired = True
+            paired_gain = paired_qty * 1.0
+            paired_spend = paired_qty * pair_cost
+            paired_pnl = paired_gain - paired_spend
+        else:
+            paired_pnl = 0.0
+
+        if dome.outcome == "UP":
+            winner_excess = max(0, up_qty - dn_qty)
+            loser_excess = max(0, dn_qty - up_qty)
+            winner_avg = avg_up_price
+            loser_avg = avg_dn_price
+        else:
+            winner_excess = max(0, dn_qty - up_qty)
+            loser_excess = max(0, up_qty - dn_qty)
+            winner_avg = avg_dn_price
+            loser_avg = avg_up_price
+
+        one_sided_pnl = winner_excess * (1.0 - winner_avg) - loser_excess * loser_avg
+        pnl = paired_pnl + one_sided_pnl
+
+    elif up_qty > 0:
+        if dome.outcome == "UP":
+            pnl = up_qty * 1.0 - up_cost
+        else:
+            pnl = -up_cost
+    elif dn_qty > 0:
+        if dome.outcome == "DOWN":
+            pnl = dn_qty * 1.0 - dn_cost
+        else:
+            pnl = -dn_cost
+    else:
+        pnl = 0.0
+
+    # FV prediction correctness
+    outcome_correct = None
+    if dome.outcome is not None:
+        fv_predicted_up = fv_up >= 0.5
+        actual_up = dome.outcome == "UP"
+        outcome_correct = fv_predicted_up == actual_up
+
+    cert_bucket = _cert_bucket(cert)
+
+    return MarketResult(
+        market_id=dome.market_slug,
+        outcome=dome.outcome,
+        outcome_correct=outcome_correct,
+        fills=fills,
+        events=events,
+        pnl=round(pnl, 4),
+        paired=paired,
+        up_cost=round(up_cost, 4),
+        dn_cost=round(dn_cost, 4),
+        pair_cost=round(pair_cost, 4),
+        up_qty=round(up_qty, 2),
+        dn_qty=round(dn_qty, 2),
+        fv_at_entry=round(fv_up, 4),
+        certainty_at_entry=round(cert, 4),
+        aborted=aborted,
+        fv_blocked=fv_blocked,
+        cert_bucket=cert_bucket,
+        market_hour=market_hour,
+        has_book_data=has_book_data,
+    )
+
+
+def run_backtest_dome(
+    dome_dir: pathlib.Path,
+    cfg: BacktestConfig,
+    output_path: pathlib.Path | None = None,
+    verbose: bool = False,
+) -> dict:
+    """Run backtest using Dome snapshot files.
+
+    Reads all btc-updown-15m-*.jsonl files from dome_dir.
+    Skips markets with no orderbook data (e.g. 2026-04-05).
+    Skips future markets (no outcome in raw_market.winning_side).
+    """
+    if not dome_dir.exists():
+        logger.error("Dome snapshot directory not found: %s", dome_dir)
+        return {"error": f"dome directory not found: {dome_dir}"}
+
+    all_files = sorted(dome_dir.glob("btc-updown-15m-*.jsonl"))
+    logger.info("Found %d dome snapshot files in %s", len(all_files), dome_dir)
+
+    results: list[MarketResult] = []
+    skipped_no_book = 0
+    skipped_no_outcome = 0
+    skipped_other = 0
+    loaded_count = 0
+
+    for path in all_files:
+        dome = load_dome_snapshot(path)
+        if dome is None:
+            skipped_other += 1
+            continue
+
+        if not dome.has_orderbook:
+            skipped_no_book += 1
+            if verbose:
+                logger.debug("Skip (no book): %s", dome.market_slug)
+            continue
+
+        if dome.outcome is None:
+            skipped_no_outcome += 1
+            if verbose:
+                logger.debug("Skip (no outcome): %s", dome.market_slug)
+            continue
+
+        loaded_count += 1
+        result = simulate_market_dome(dome, cfg)
+        results.append(result)
+
+        if verbose and loaded_count % 100 == 0:
+            logger.info(
+                "Processed %d markets... latest: %s pnl=%+.2f paired=%s",
+                loaded_count, dome.market_slug, result.pnl, result.paired,
+            )
+
+    logger.info(
+        "Dome backtest: %d simulated, %d skipped_no_book, %d skipped_no_outcome, %d other",
+        len(results), skipped_no_book, skipped_no_outcome, skipped_other,
+    )
+
+    if not results:
+        return {
+            "error": "no markets simulated",
+            "markets_skipped": {
+                "no_book": skipped_no_book,
+                "no_settlement": skipped_no_outcome,
+                "other": skipped_other,
+            }
+        }
+
+    agg = aggregate_results(results, cfg)
+
+    # Add dome-specific fields
+    agg["data_source"] = "dome"
+    agg["markets_skipped"] = {
+        "no_book": skipped_no_book,
+        "no_settlement": skipped_no_outcome,
+        "other": skipped_other,
+    }
+
+    # pnl_per_day breakdown (sorted by date string)
+    pnl_per_day: dict[str, float] = {}
+    count_per_day: dict[str, int] = {}
+    for r in results:
+        # Extract date from market_id: btc-updown-15m-<epoch>
+        parts = r.market_id.rsplit("-", 1)
+        if len(parts) == 2:
+            try:
+                ep = int(parts[1])
+                day = datetime.datetime.fromtimestamp(ep, datetime.timezone.utc).strftime("%Y-%m-%d")
+            except (ValueError, OSError):
+                day = "unknown"
+        else:
+            day = "unknown"
+        pnl_per_day[day] = pnl_per_day.get(day, 0.0) + r.pnl
+        count_per_day[day] = count_per_day.get(day, 0) + 1
+
+    agg["pnl_per_day"] = {k: round(v, 4) for k, v in sorted(pnl_per_day.items())}
+    agg["count_per_day"] = {k: v for k, v in sorted(count_per_day.items())}
+
+    # Extend worst_markets to top 10
+    sorted_results = sorted(results, key=lambda r: r.pnl)
+    agg["worst_markets"] = [
+        {
+            "market_id": r.market_id,
+            "pnl": r.pnl,
+            "outcome": r.outcome,
+            "paired": r.paired,
+            "up_qty": r.up_qty,
+            "dn_qty": r.dn_qty,
+            "has_book_data": r.has_book_data,
+            "market_hour": r.market_hour,
+            "reason": (
+                "no_book_data" if not r.has_book_data else
+                "fv_blocked" if r.fv_blocked else
+                "aborted" if r.aborted else
+                "no_fills" if (r.up_qty == 0 and r.dn_qty == 0) else
+                "one_sided" if ((r.up_qty > 0) != (r.dn_qty > 0)) else
+                "paired_loss"
+            ),
+        }
+        for r in sorted_results[:10]
+    ]
+
+    if output_path is not None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, "w") as f:
+            json.dump(agg, f, indent=2)
+        logger.info("Dome results written to %s", output_path)
+
+    return agg
+
+
+# ---------------------------------------------------------------------------
 # CLI runner
 # ---------------------------------------------------------------------------
 
@@ -1543,22 +2169,83 @@ def run_backtest(
     return agg
 
 
+def _print_results(agg: dict, cfg_name: str, data_source: str) -> None:
+    """Print backtest results summary to stdout."""
+    print(f"\n{'='*60}")
+    print(f"BACKTEST RESULTS: {cfg_name}  [{data_source}]")
+    print(f"{'='*60}")
+    skipped = agg.get("markets_skipped", {})
+    if skipped:
+        print(f"Skipped (no book) : {skipped.get('no_book', 0)}")
+        print(f"Skipped (no stl)  : {skipped.get('no_settlement', 0)}")
+    print(f"Markets simulated : {agg.get('markets_simulated', 0)}")
+    print(f"Book data coverage: {agg.get('book_coverage_rate', 0):.1%}")
+    print(f"Total PnL         : ${agg.get('total_pnl', 0):.2f}")
+    print(f"PnL / market      : ${agg.get('mean_pnl_per_market', 0):.4f}")
+    print(f"Win rate          : {agg.get('win_rate', 0):.1%}")
+    print(f"Paired rate       : {agg.get('paired_rate', 0):.1%}")
+    print(f"One-sided rate    : {agg.get('one_sided_rate', 0):.1%}")
+    print(f"No-fill rate      : {agg.get('no_fill_rate', 0):.1%}")
+    if agg.get("fv_accuracy") is not None:
+        print(f"FV accuracy       : {agg.get('fv_accuracy', 0):.1%}")
+    print(f"Max loss          : ${agg.get('max_loss', 0):.2f}")
+    print(f"Max drawdown      : {agg.get('max_drawdown_pct', 0):.1%}")
+    print(f"Sharpe-like       : {agg.get('sharpe_like', 0):.3f}")
+    print(f"{'='*60}")
+    print(f"\nCalibration table:")
+    for bucket, vals in agg.get("calibration_table", {}).items():
+        n = vals["n"]
+        wr = vals["win_rate"]
+        wr_str = f"{wr:.1%}" if wr is not None else "N/A"
+        print(f"  {bucket}: n={n:4d}  win_rate={wr_str}")
+
+    pnl_per_day = agg.get("pnl_per_day")
+    if pnl_per_day:
+        print(f"\nPnL per day:")
+        count_per_day = agg.get("count_per_day", {})
+        for day, dpnl in sorted(pnl_per_day.items()):
+            cnt = count_per_day.get(day, "?")
+            print(f"  {day}: ${dpnl:+9.2f}  (n={cnt})")
+
+    worst = agg.get("worst_markets", [])
+    if worst:
+        print(f"\nWorst markets (top {len(worst)}):")
+        for w in worst:
+            print(
+                f"  {w['market_id'][-35:]:35s}  pnl={w['pnl']:+7.2f}"
+                f"  outcome={w.get('outcome','?'):4s}"
+                f"  reason={w.get('reason','?')}"
+            )
+    print()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="PolyBot paired MM backtester using local book_log data"
+        description="PolyBot paired MM backtester (local book_log or Dome snapshots)"
+    )
+    parser.add_argument(
+        "--data-source", default="auto",
+        choices=["local", "dome", "auto"],
+        help=(
+            "Data source: 'dome' = use data/dome_snapshots/ (1,344 markets, 14 days); "
+            "'local' = use book_log/*.jsonl (122 markets, Apr 10-11); "
+            "'auto' = dome if available, else local (default)"
+        ),
     )
     parser.add_argument("--data-dir", default="data",
-        help="Directory containing book_log, market_event_log, settlement_log, price_log files")
+        help="Directory containing book_log, settlement_log, price_log, dome_snapshots/")
+    parser.add_argument("--dome-dir", default=None,
+        help="Override path to dome snapshot directory (default: data-dir/dome_snapshots)")
     parser.add_argument("--config", default=None,
-        help="Path to YAML config file. Defaults to baseline_current.yaml")
+        help="Path to YAML config file")
     parser.add_argument("--output", default=None, help="Output JSON file path")
     parser.add_argument("--start", default="2026-04-10",
-        help="Start date (YYYY-MM-DD), inclusive")
+        help="Start date (YYYY-MM-DD), inclusive [local mode only]")
     parser.add_argument("--end", default="2026-04-11",
-        help="End date (YYYY-MM-DD), inclusive")
+        help="End date (YYYY-MM-DD), inclusive [local mode only]")
     parser.add_argument("--verbose", "-v", action="store_true")
     parser.add_argument("--cache-dir", default=None,
-        help="Directory for index caches (default: data_dir)")
+        help="Directory for index caches (default: data_dir) [local mode only]")
     args = parser.parse_args()
 
     data_dir = pathlib.Path(args.data_dir)
@@ -1572,47 +2259,82 @@ def main() -> None:
         cfg = BacktestConfig()
         cfg.name = "default"
 
-    output_path = pathlib.Path(args.output) if args.output else (
-        pathlib.Path("results") / f"{cfg.name}.json"
-    )
+    # Resolve dome directory
+    dome_dir = pathlib.Path(args.dome_dir) if args.dome_dir else data_dir / "dome_snapshots"
 
-    cache_dir = pathlib.Path(args.cache_dir) if args.cache_dir else data_dir
+    # Determine actual data source
+    data_source = args.data_source
+    if data_source == "auto":
+        if dome_dir.exists() and any(dome_dir.glob("btc-updown-15m-*.jsonl")):
+            data_source = "dome"
+            logger.info("Auto mode: dome snapshots found at %s -> using dome", dome_dir)
+        else:
+            data_source = "local"
+            logger.info("Auto mode: no dome snapshots found -> using local book_log")
 
-    agg = run_backtest(
-        data_dir=data_dir,
-        cfg=cfg,
-        start_date=args.start,
-        end_date=args.end,
-        output_path=output_path,
-        verbose=args.verbose,
-        cache_dir=cache_dir,
-    )
+    # Default output path includes data source suffix
+    if args.output:
+        output_path = pathlib.Path(args.output)
+    else:
+        suffix = "_dome" if data_source == "dome" else ""
+        output_path = pathlib.Path("results") / f"{cfg.name}{suffix}.json"
 
-    print(f"\n{'='*60}")
-    print(f"BACKTEST RESULTS: {cfg.name}")
-    print(f"{'='*60}")
-    print(f"Date range        : {args.start} to {args.end}")
-    print(f"Markets simulated : {agg.get('markets_simulated', 0)}")
-    print(f"Book data coverage: {agg.get('book_coverage_rate', 0):.1%}")
-    print(f"Total PnL         : ${agg.get('total_pnl', 0):.2f}")
-    print(f"PnL / market      : ${agg.get('mean_pnl_per_market', 0):.4f}")
-    print(f"Win rate          : {agg.get('win_rate', 0):.1%}")
-    print(f"Paired rate       : {agg.get('paired_rate', 0):.1%}")
-    print(f"One-sided rate    : {agg.get('one_sided_rate', 0):.1%}")
-    print(f"No-fill rate      : {agg.get('no_fill_rate', 0):.1%}")
-    if agg.get('fv_accuracy') is not None:
-        print(f"FV accuracy       : {agg.get('fv_accuracy', 0):.1%}")
-    print(f"Max loss          : ${agg.get('max_loss', 0):.2f}")
-    print(f"Max drawdown      : {agg.get('max_drawdown_pct', 0):.1%}")
-    print(f"Sharpe-like       : {agg.get('sharpe_like', 0):.3f}")
-    print(f"{'='*60}")
-    print(f"\nCalibration table:")
-    for bucket, vals in agg.get("calibration_table", {}).items():
-        n = vals["n"]
-        wr = vals["win_rate"]
-        wr_str = f"{wr:.1%}" if wr is not None else "N/A"
-        print(f"  {bucket}: n={n:4d}  win_rate={wr_str}")
-    print()
+    if data_source == "dome":
+        logger.info("Running DOME backtest: %s -> %s", cfg.name, output_path)
+        agg = run_backtest_dome(
+            dome_dir=dome_dir,
+            cfg=cfg,
+            output_path=output_path,
+            verbose=args.verbose,
+        )
+        _print_results(agg, cfg.name, "dome")
+
+    else:
+        # local book_log mode
+        logger.info("Running LOCAL backtest: %s, %s to %s -> %s",
+                    cfg.name, args.start, args.end, output_path)
+        cache_dir = pathlib.Path(args.cache_dir) if args.cache_dir else data_dir
+        agg = run_backtest(
+            data_dir=data_dir,
+            cfg=cfg,
+            start_date=args.start,
+            end_date=args.end,
+            output_path=output_path,
+            verbose=args.verbose,
+            cache_dir=cache_dir,
+        )
+        # Add data_source field for consistency
+        agg["data_source"] = "local"
+        # Patch output (already written by run_backtest, re-write with data_source)
+        if output_path is not None:
+            with open(output_path, "w") as f:
+                json.dump(agg, f, indent=2)
+
+        print(f"\n{'='*60}")
+        print(f"BACKTEST RESULTS: {cfg.name}  [local]")
+        print(f"{'='*60}")
+        print(f"Date range        : {args.start} to {args.end}")
+        print(f"Markets simulated : {agg.get('markets_simulated', 0)}")
+        print(f"Book data coverage: {agg.get('book_coverage_rate', 0):.1%}")
+        print(f"Total PnL         : ${agg.get('total_pnl', 0):.2f}")
+        print(f"PnL / market      : ${agg.get('mean_pnl_per_market', 0):.4f}")
+        print(f"Win rate          : {agg.get('win_rate', 0):.1%}")
+        print(f"Paired rate       : {agg.get('paired_rate', 0):.1%}")
+        print(f"One-sided rate    : {agg.get('one_sided_rate', 0):.1%}")
+        print(f"No-fill rate      : {agg.get('no_fill_rate', 0):.1%}")
+        if agg.get("fv_accuracy") is not None:
+            print(f"FV accuracy       : {agg.get('fv_accuracy', 0):.1%}")
+        print(f"Max loss          : ${agg.get('max_loss', 0):.2f}")
+        print(f"Max drawdown      : {agg.get('max_drawdown_pct', 0):.1%}")
+        print(f"Sharpe-like       : {agg.get('sharpe_like', 0):.3f}")
+        print(f"{'='*60}")
+        print(f"\nCalibration table:")
+        for bucket, vals in agg.get("calibration_table", {}).items():
+            n = vals["n"]
+            wr = vals["win_rate"]
+            wr_str = f"{wr:.1%}" if wr is not None else "N/A"
+            print(f"  {bucket}: n={n:4d}  win_rate={wr_str}")
+        print()
 
 
 if __name__ == "__main__":

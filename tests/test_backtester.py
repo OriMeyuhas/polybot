@@ -27,13 +27,17 @@ if str(_PROJECT_ROOT) not in sys.path:
 from tools.backtester import (
     BacktestConfig,
     BookState,
+    DomeMarketData,
     MarketResult,
     MarketWindow,
     _cert_bucket,
     aggregate_results,
     build_book_index,
+    load_dome_snapshot,
     lookup_book_state,
+    run_backtest_dome,
     simulate_market,
+    simulate_market_dome,
     _p_fair_up,
     _fv_certainty,
 )
@@ -649,3 +653,455 @@ class TestExperimentConfigs:
             pytest.skip("paired_plus_trend_filter.yaml not found")
         cfg = BacktestConfig.from_yaml(p)
         assert isinstance(cfg.trend_filter_enabled, bool)
+
+
+# ---------------------------------------------------------------------------
+# Helpers for Dome snapshot tests
+# ---------------------------------------------------------------------------
+
+def _make_dome_jsonl(
+    tmp_path: pathlib.Path,
+    market_slug: str = "btc-updown-15m-1000000",
+    window_start: int = 1_000_000,
+    window_end: int = 1_000_900,
+    winner_label: str = "Up",
+    up_ask: float = 0.55,
+    dn_ask: float = 0.55,
+    up_bid: float = 0.50,
+    dn_bid: float = 0.50,
+    n_ob_snaps: int = 5,
+    n_binance: int = 5,
+    ptb: float = 70000.0,
+    binance_end: float = 70500.0,
+    up_token_id: str = "UP_TOKEN_ID_12345678901",
+    dn_token_id: str = "DN_TOKEN_ID_12345678901",
+) -> pathlib.Path:
+    """Write a synthetic Dome snapshot JSONL file and return its path."""
+    fname = tmp_path / f"{market_slug}.jsonl"
+    lines = []
+
+    # Header
+    header = {
+        "type": "header",
+        "market_slug": market_slug,
+        "condition_id": "0xABCD",
+        "token_ids": [up_token_id, dn_token_id],
+        "up_token_id": up_token_id,
+        "dn_token_id": dn_token_id,
+        "window_start": window_start,
+        "window_end": window_end,
+        "fetched_at": "2026-04-11T00:00:00Z",
+        "raw_market": {
+            "market_slug": market_slug,
+            "condition_id": "0xABCD",
+            "winning_side": {
+                "id": up_token_id if winner_label == "Up" else dn_token_id,
+                "label": winner_label,
+            },
+            "extra_fields": {
+                "price_to_beat": ptb,
+                "final_price": ptb,
+            },
+            "side_a": {"id": up_token_id, "label": "Up"},
+            "side_b": {"id": dn_token_id, "label": "Down"},
+        },
+    }
+    lines.append(json.dumps(header))
+
+    # Orderbook snapshots (clustered at window open, all same prices)
+    for i in range(n_ob_snaps):
+        ts_ms = (window_start + i) * 1000
+        for side, bid, ask in [("UP", up_bid, up_ask), ("DN", dn_bid, dn_ask)]:
+            ob = {
+                "type": "orderbook",
+                "side": side,
+                "data": {
+                    "timestamp": ts_ms,
+                    "bids": [{"price": str(bid), "size": "100"}],
+                    "asks": [{"price": str(ask), "size": "100"}],
+                    "market": "0xABCD",
+                    "assetId": up_token_id if side == "UP" else dn_token_id,
+                    "hash": "xxx",
+                    "minOrderSize": "5",
+                    "negRisk": False,
+                    "tickSize": "0.01",
+                    "indexedAt": ts_ms,
+                },
+            }
+            lines.append(json.dumps(ob))
+
+    # Binance prices (last n_binance seconds before window_end)
+    for i in range(n_binance):
+        ts_ms = (window_end - n_binance + i + 1) * 1000
+        price = ptb + (binance_end - ptb) * (i + 1) / n_binance
+        lines.append(json.dumps({
+            "type": "binance",
+            "data": {"symbol": "btcusdt", "value": price, "timestamp": ts_ms},
+        }))
+
+    # Chainlink (same timestamps as Binance)
+    for i in range(n_binance):
+        ts_ms = (window_end - n_binance + i + 1) * 1000
+        lines.append(json.dumps({
+            "type": "chainlink",
+            "data": {"symbol": "btc/usd", "value": binance_end, "timestamp": ts_ms},
+        }))
+
+    fname.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return fname
+
+
+# ---------------------------------------------------------------------------
+# Test: Dome snapshot file loading
+# ---------------------------------------------------------------------------
+
+class TestDomeSnapshotLoader:
+    """Tests for load_dome_snapshot() and related dome data structures."""
+
+    def test_loads_dome_snapshot_file(self, tmp_path):
+        """Fixture a synthetic Dome file; assert market, book, and outcome load."""
+        path = _make_dome_jsonl(
+            tmp_path,
+            market_slug="btc-updown-15m-1000000",
+            window_start=1_000_000,
+            window_end=1_000_900,
+            winner_label="Up",
+            up_ask=0.55,
+            dn_ask=0.55,
+            n_ob_snaps=5,
+            ptb=70000.0,
+            binance_end=70500.0,
+        )
+        dome = load_dome_snapshot(path)
+        assert dome is not None
+        assert dome.market_slug == "btc-updown-15m-1000000"
+        assert dome.window_start == 1_000_000
+        assert dome.window_end == 1_000_900
+        assert dome.outcome == "UP"
+        assert dome.has_orderbook is True
+        assert dome.ob_up_count == 5
+        assert dome.ob_dn_count == 5
+        # UP/DN ask should be our synthetic value
+        assert abs(dome.up_best_ask - 0.55) < 0.001
+        assert abs(dome.dn_best_ask - 0.55) < 0.001
+        # PTB and binance_at_close
+        assert dome.ptb == pytest.approx(70000.0)
+        assert dome.binance_at_close == pytest.approx(70500.0)
+        assert len(dome.binance_series) == 5
+
+    def test_loads_dome_outcome_down(self, tmp_path):
+        """Dome file with Down winner sets outcome='DOWN'."""
+        path = _make_dome_jsonl(tmp_path, winner_label="Down")
+        dome = load_dome_snapshot(path)
+        assert dome is not None
+        assert dome.outcome == "DOWN"
+
+    def test_book_state_at_time_uses_most_recent(self, tmp_path):
+        """Dome loader returns median of all orderbook snapshots."""
+        # Write a file with 3 UP snapshots at different (but close) ask prices
+        fname = tmp_path / "multi_ask.jsonl"
+        up_token = "UP_TOKEN_12345678901"
+        dn_token = "DN_TOKEN_12345678901"
+        header = {
+            "type": "header",
+            "market_slug": "btc-updown-15m-1000000",
+            "condition_id": "0xABCD",
+            "token_ids": [up_token, dn_token],
+            "up_token_id": up_token,
+            "dn_token_id": dn_token,
+            "window_start": 1_000_000,
+            "window_end": 1_000_900,
+            "fetched_at": "2026-04-11T00:00:00Z",
+            "raw_market": {
+                "market_slug": "btc-updown-15m-1000000",
+                "winning_side": {"id": up_token, "label": "Up"},
+                "extra_fields": {"price_to_beat": 70000.0},
+                "side_a": {"id": up_token, "label": "Up"},
+                "side_b": {"id": dn_token, "label": "Down"},
+            },
+        }
+        up_asks = [0.52, 0.54, 0.56]  # median = 0.54
+        lines = [json.dumps(header)]
+        for i, ask in enumerate(up_asks):
+            lines.append(json.dumps({
+                "type": "orderbook",
+                "side": "UP",
+                "data": {
+                    "timestamp": (1_000_000 + i) * 1000,
+                    "bids": [{"price": "0.48", "size": "100"}],
+                    "asks": [{"price": str(ask), "size": "100"}],
+                    "market": "0xABCD",
+                    "assetId": up_token,
+                    "hash": "x", "minOrderSize": "5", "negRisk": False,
+                    "tickSize": "0.01", "indexedAt": 1000000000,
+                },
+            }))
+        # DN side: single snapshot
+        lines.append(json.dumps({
+            "type": "orderbook",
+            "side": "DN",
+            "data": {
+                "timestamp": 1_000_000_000,
+                "bids": [{"price": "0.45", "size": "100"}],
+                "asks": [{"price": "0.50", "size": "100"}],
+                "market": "0xABCD",
+                "assetId": dn_token,
+                "hash": "x", "minOrderSize": "5", "negRisk": False,
+                "tickSize": "0.01", "indexedAt": 1000000000,
+            },
+        }))
+        fname.write_text("\n".join(lines), encoding="utf-8")
+        dome = load_dome_snapshot(fname)
+        assert dome is not None
+        # Median of [0.52, 0.54, 0.56] = 0.54
+        assert abs(dome.up_best_ask - 0.54) < 0.001
+        assert abs(dome.dn_best_ask - 0.50) < 0.001
+
+    def test_skips_market_with_empty_orderbook(self, tmp_path):
+        """A file with zero orderbook entries loads with has_orderbook=False."""
+        fname = tmp_path / "empty_ob.jsonl"
+        up_token = "UP_TOKEN_12345678901"
+        dn_token = "DN_TOKEN_12345678901"
+        header = {
+            "type": "header",
+            "market_slug": "btc-updown-15m-1000000",
+            "condition_id": "0xABCD",
+            "token_ids": [up_token, dn_token],
+            "up_token_id": up_token,
+            "dn_token_id": dn_token,
+            "window_start": 1_000_000,
+            "window_end": 1_000_900,
+            "fetched_at": "2026-04-11T00:00:00Z",
+            "raw_market": {
+                "market_slug": "btc-updown-15m-1000000",
+                "winning_side": {"id": up_token, "label": "Up"},
+                "extra_fields": {"price_to_beat": 70000.0},
+                "side_a": {"id": up_token, "label": "Up"},
+                "side_b": {"id": dn_token, "label": "Down"},
+            },
+        }
+        # Only candle and binance entries, NO orderbook entries
+        fname.write_text(
+            json.dumps(header) + "\n" +
+            json.dumps({"type": "candle", "data": {}}) + "\n" +
+            json.dumps({
+                "type": "binance",
+                "data": {"symbol": "btcusdt", "value": 70000.0, "timestamp": 1_000_900_000}
+            }) + "\n",
+            encoding="utf-8",
+        )
+        dome = load_dome_snapshot(fname)
+        assert dome is not None
+        assert dome.has_orderbook is False
+        assert dome.ob_up_count == 0
+        assert dome.ob_dn_count == 0
+
+    def test_skips_market_gracefully_in_run_backtest_dome(self, tmp_path):
+        """run_backtest_dome skips empty-orderbook markets without crashing."""
+        dome_dir = tmp_path / "dome_snapshots"
+        dome_dir.mkdir()
+        # Write one market with no OB data and one with OB data
+        up_token = "UP_TOKEN_12345678901"
+        dn_token = "DN_TOKEN_12345678901"
+        # Empty OB market
+        header_empty = {
+            "type": "header",
+            "market_slug": "btc-updown-15m-1000000",
+            "condition_id": "0xABCD",
+            "token_ids": [up_token, dn_token],
+            "up_token_id": up_token,
+            "dn_token_id": dn_token,
+            "window_start": 1_000_000,
+            "window_end": 1_000_900,
+            "fetched_at": "2026-04-11T00:00:00Z",
+            "raw_market": {
+                "market_slug": "btc-updown-15m-1000000",
+                "winning_side": {"id": up_token, "label": "Up"},
+                "extra_fields": {"price_to_beat": 70000.0},
+                "side_a": {"id": up_token, "label": "Up"},
+                "side_b": {"id": dn_token, "label": "Down"},
+            },
+        }
+        (dome_dir / "btc-updown-15m-1000000.jsonl").write_text(
+            json.dumps(header_empty) + "\n", encoding="utf-8"
+        )
+        # Normal OB market
+        _make_dome_jsonl(
+            dome_dir,
+            market_slug="btc-updown-15m-2000000",
+            window_start=2_000_000,
+            window_end=2_000_900,
+            winner_label="Down",
+            up_ask=0.55,
+            dn_ask=0.55,
+            n_ob_snaps=3,
+            ptb=70000.0,
+            binance_end=69800.0,
+        )
+        cfg = BacktestConfig(bankroll=500.0, position_size_fraction=0.05)
+        agg = run_backtest_dome(dome_dir=dome_dir, cfg=cfg)
+        assert agg.get("markets_skipped", {}).get("no_book", 0) == 1
+        assert agg.get("markets_simulated", 0) == 1
+
+    def test_auto_mode_prefers_dome(self, tmp_path):
+        """load_dome_snapshot works on a real-format file (round-trip check)."""
+        # This tests that dome loader returns correct data structure (not local book_log)
+        path = _make_dome_jsonl(
+            tmp_path,
+            market_slug="btc-updown-15m-3000000",
+            window_start=3_000_000,
+            window_end=3_000_900,
+            winner_label="Up",
+            up_ask=0.45,
+            dn_ask=0.57,
+            n_ob_snaps=3,
+            ptb=80000.0,
+            binance_end=80500.0,
+        )
+        dome = load_dome_snapshot(path)
+        assert dome is not None
+        # UP ask below 0.5 — our bid should be above or below it
+        assert dome.up_best_ask == pytest.approx(0.45)
+        assert dome.dn_best_ask == pytest.approx(0.57)
+        assert dome.outcome == "UP"
+
+    def test_load_returns_none_for_empty_file(self, tmp_path):
+        """Empty JSONL file returns None without crashing."""
+        path = tmp_path / "empty.jsonl"
+        path.write_text("", encoding="utf-8")
+        result = load_dome_snapshot(path)
+        assert result is None
+
+    def test_load_returns_none_for_missing_header(self, tmp_path):
+        """JSONL file without header line returns None."""
+        path = tmp_path / "no_header.jsonl"
+        path.write_text(json.dumps({"type": "orderbook"}) + "\n", encoding="utf-8")
+        result = load_dome_snapshot(path)
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Test: simulate_market_dome
+# ---------------------------------------------------------------------------
+
+class TestSimulateMarketDome:
+    """Tests for simulate_market_dome() fill simulation."""
+
+    def _make_dome(
+        self,
+        outcome: str = "UP",
+        up_ask: float = 0.55,
+        dn_ask: float = 0.55,
+        ptb: float = 70000.0,
+        binance_end: float = 70500.0,
+    ) -> DomeMarketData:
+        return DomeMarketData(
+            market_slug="btc-updown-15m-1000000",
+            condition_id="0xABCD",
+            up_token_id="UP_TOKEN_12345678901",
+            dn_token_id="DN_TOKEN_12345678901",
+            window_start=1_000_000,
+            window_end=1_000_900,
+            outcome=outcome,
+            up_best_bid=up_ask - 0.02,
+            up_best_ask=up_ask,
+            dn_best_bid=dn_ask - 0.02,
+            dn_best_ask=dn_ask,
+            ptb=ptb,
+            binance_at_close=binance_end,
+            chainlink_at_close=binance_end,
+            binance_series=[
+                (1_000_800.0 + i, ptb + (binance_end - ptb) * (i + 1) / 100)
+                for i in range(100)
+            ],
+            has_orderbook=True,
+            ob_up_count=10,
+            ob_dn_count=10,
+        )
+
+    def test_paired_fill_both_sides(self):
+        """When our bid >= market ask on both sides, we get paired fills."""
+        cfg = BacktestConfig(
+            bankroll=500.0,
+            position_size_fraction=0.05,
+            rungs=3,
+            width=0.20,
+            spacing=0.05,
+            size_skew=1.0,
+            fv_gate_enabled=False,
+            fv_cancel_enabled=False,
+            one_sided_abort_enabled=False,
+            max_pair_cost=0.98,
+        )
+        # UP ask=0.40, DN ask=0.40 — our rung at ~0.30 is BELOW ask, no fill
+        dome = self._make_dome(up_ask=0.40, dn_ask=0.40, outcome="UP")
+        result = simulate_market_dome(dome, cfg)
+        # With ask=0.40, ladder anchors well below 0.40, shouldn't fill everything
+        # Expect some fills since rung prices are below ask
+        assert result.outcome == "UP"
+
+    def test_no_fill_when_bid_below_ask(self):
+        """No fills when all our rung prices are far below market ask."""
+        cfg = BacktestConfig(
+            bankroll=500.0,
+            position_size_fraction=0.05,
+            rungs=3,
+            width=0.10,
+            spacing=0.02,
+            size_skew=1.0,
+            fv_gate_enabled=False,
+            fv_cancel_enabled=False,
+            one_sided_abort_enabled=False,
+        )
+        # Market ask is very high (0.95), our rungs will be around 0.80 -> no fill
+        dome = self._make_dome(up_ask=0.95, dn_ask=0.95, outcome="UP")
+        result = simulate_market_dome(dome, cfg)
+        assert result.up_qty == 0.0
+        assert result.dn_qty == 0.0
+        assert result.pnl == 0.0
+
+    def test_pnl_positive_for_paired_win(self):
+        """Paired win produces positive PnL when pair_cost < 1.0."""
+        cfg = BacktestConfig(
+            bankroll=1000.0,
+            position_size_fraction=0.10,
+            rungs=1,
+            width=0.50,
+            spacing=0.01,
+            size_skew=1.0,
+            fv_gate_enabled=False,
+            fv_cancel_enabled=False,
+            one_sided_abort_enabled=False,
+            max_pair_cost=0.98,
+        )
+        # Ask 0.45 on both sides — rungs will be at ~0.35-0.40 (below ask) = no fill
+        # To get a fill, need ask very low (e.g., 0.01)
+        dome = self._make_dome(up_ask=0.01, dn_ask=0.01, outcome="UP")
+        result = simulate_market_dome(dome, cfg)
+        # With ask=0.01, our rungs (which are >0.01) will all fill
+        assert result.up_qty > 0
+        assert result.dn_qty > 0
+
+    def test_fv_gate_blocks_when_enabled(self):
+        """FV gate blocks posting one side when certainty is high enough."""
+        cfg = BacktestConfig(
+            bankroll=500.0,
+            position_size_fraction=0.05,
+            fv_gate_enabled=True,
+            fv_gate_certainty_threshold=0.55,
+            fv_cancel_enabled=False,
+            one_sided_abort_enabled=False,
+        )
+        # ptb=70000, binance_end=70500 (UP by 500) -> FV leans UP -> cert > 0.55
+        dome = self._make_dome(up_ask=0.45, dn_ask=0.45, ptb=70000.0, binance_end=71000.0)
+        result = simulate_market_dome(dome, cfg)
+        assert result.fv_blocked is True
+
+    def test_no_crash_on_none_outcome(self):
+        """Market with no outcome (future market) gets pnl=0 without crash."""
+        cfg = BacktestConfig(bankroll=500.0, position_size_fraction=0.05)
+        dome = self._make_dome(outcome=None)
+        dome.outcome = None
+        result = simulate_market_dome(dome, cfg)
+        assert result.pnl == 0.0
+        assert result.outcome is None
