@@ -994,14 +994,27 @@ class TestSimulateMarketDome:
         dn_ask: float = 0.55,
         ptb: float = 70000.0,
         binance_end: float = 70500.0,
+        ob_up_series: list | None = None,
+        ob_dn_series: list | None = None,
     ) -> DomeMarketData:
+        ws = 1_000_000
+        we = 1_000_900
+        # Default book series: constant asks throughout window (100 snapshots, 9s apart)
+        if ob_up_series is None:
+            ob_up_series = [
+                (float(ws + i * 9), up_ask - 0.02, up_ask) for i in range(100)
+            ]
+        if ob_dn_series is None:
+            ob_dn_series = [
+                (float(ws + i * 9), dn_ask - 0.02, dn_ask) for i in range(100)
+            ]
         return DomeMarketData(
             market_slug="btc-updown-15m-1000000",
             condition_id="0xABCD",
             up_token_id="UP_TOKEN_12345678901",
             dn_token_id="DN_TOKEN_12345678901",
-            window_start=1_000_000,
-            window_end=1_000_900,
+            window_start=ws,
+            window_end=we,
             outcome=outcome,
             up_best_bid=up_ask - 0.02,
             up_best_ask=up_ask,
@@ -1015,8 +1028,10 @@ class TestSimulateMarketDome:
                 for i in range(100)
             ],
             has_orderbook=True,
-            ob_up_count=10,
-            ob_dn_count=10,
+            ob_up_count=len(ob_up_series),
+            ob_dn_count=len(ob_dn_series),
+            ob_up_series=ob_up_series,
+            ob_dn_series=ob_dn_series,
         )
 
     def test_paired_fill_both_sides(self):
@@ -1040,12 +1055,11 @@ class TestSimulateMarketDome:
         # Expect some fills since rung prices are below ask
         assert result.outcome == "UP"
 
-    def test_losing_side_always_fills_in_dome_mode(self):
-        """Dome mode always fills the LOSING side (price sweeps to 0).
+    def test_losing_side_fills_when_ask_drops(self):
+        """When the losing side's ask drops below our bid, fills happen.
 
-        outcome=UP → losing side is DN → dn_qty > 0 always.
-        UP side (winner) fills with 66% probability, so we can't assert up_qty > 0
-        without knowing the RNG seed.
+        outcome=UP → DN is the loser → DN ask should drop toward 0.
+        We simulate this with a book series where DN ask drops to 0.01 mid-window.
         """
         cfg = BacktestConfig(
             bankroll=500.0,
@@ -1058,17 +1072,28 @@ class TestSimulateMarketDome:
             fv_cancel_enabled=False,
             one_sided_abort_enabled=False,
         )
-        dome = self._make_dome(up_ask=0.55, dn_ask=0.55, outcome="UP")
+        ws = 1_000_000
+        # DN ask drops from 0.55 to 0.01 over the window (loser sweep)
+        dn_series = [
+            (float(ws + i * 9), max(0.01, 0.55 - i * 0.006), max(0.01, 0.55 - i * 0.005))
+            for i in range(100)
+        ]
+        # UP ask stays constant (winner doesn't move much initially)
+        up_series = [(float(ws + i * 9), 0.53, 0.55) for i in range(100)]
+        dome = self._make_dome(
+            up_ask=0.55, dn_ask=0.55, outcome="UP",
+            ob_up_series=up_series, ob_dn_series=dn_series,
+        )
         result = simulate_market_dome(dome, cfg)
-        # DN (loser) always fills for outcome=UP
+        # DN (loser) fills because ask dropped to 0.01
         assert result.dn_qty > 0.0
-        # UP may or may not fill (66% probability — depends on seed)
-        # If UP fills too, we have a paired result
-        if result.up_qty > 0.0:
-            assert result.paired or result.pair_cost > 0
 
-    def test_winning_side_fills_66pct_across_markets(self):
-        """Across many markets, approximately 66% should achieve paired fills."""
+    def test_fills_driven_by_book_state(self):
+        """Fills are determined by real book state, not probabilistic heuristic.
+
+        When both sides' asks drop below our bids at some point in the window,
+        we get paired fills. When only one side drops, we get one-sided fills.
+        """
         cfg = BacktestConfig(
             bankroll=500.0,
             position_size_fraction=0.05,
@@ -1081,39 +1106,36 @@ class TestSimulateMarketDome:
             one_sided_abort_enabled=False,
             max_pair_cost=0.98,
         )
-        # Simulate 200 markets (distinct epochs → distinct RNG seeds)
-        paired_count = 0
-        n = 200
-        import random
-        for i in range(n):
-            epoch = 1_000_000 + i * 900
-            dome = DomeMarketData(
-                market_slug=f"btc-updown-15m-{epoch}",
-                condition_id="0xABCD",
-                up_token_id="UP_TOKEN",
-                dn_token_id="DN_TOKEN",
-                window_start=epoch,
-                window_end=epoch + 900,
-                outcome="UP",  # DN is loser, fills always
-                up_best_bid=0.48,
-                up_best_ask=0.52,
-                dn_best_bid=0.48,
-                dn_best_ask=0.52,
-                ptb=70000.0,
-                binance_at_close=70500.0,
-                chainlink_at_close=70500.0,
-                binance_series=[(float(epoch + 800 + j), 70000.0 + j * 5) for j in range(100)],
-                has_orderbook=True,
-                ob_up_count=5,
-                ob_dn_count=5,
-            )
-            result = simulate_market_dome(dome, cfg)
-            if result.paired:
-                paired_count += 1
+        ws = 1_000_000
+        # Both sides' asks drop: paired fills
+        up_series = [
+            (float(ws + i * 9), max(0.01, 0.50 - i * 0.005), max(0.02, 0.52 - i * 0.005))
+            for i in range(100)
+        ]
+        dn_series = [
+            (float(ws + i * 9), max(0.01, 0.50 - i * 0.005), max(0.02, 0.52 - i * 0.005))
+            for i in range(100)
+        ]
+        dome = self._make_dome(
+            up_ask=0.52, dn_ask=0.52, outcome="UP",
+            ob_up_series=up_series, ob_dn_series=dn_series,
+        )
+        result = simulate_market_dome(dome, cfg)
+        assert result.up_qty > 0 and result.dn_qty > 0, "Both sides should fill"
 
-        paired_rate = paired_count / n
-        # Should be ~66%, allow ±15% tolerance
-        assert 0.51 <= paired_rate <= 0.81, f"paired_rate={paired_rate:.2f} not in [0.51, 0.81]"
+        # Only DN ask drops (UP stays high): one-sided fills on DN only
+        up_static = [(float(ws + i * 9), 0.50, 0.52) for i in range(100)]
+        dn_drops = [
+            (float(ws + i * 9), max(0.01, 0.50 - i * 0.006), max(0.02, 0.52 - i * 0.006))
+            for i in range(100)
+        ]
+        dome2 = self._make_dome(
+            up_ask=0.52, dn_ask=0.52, outcome="UP",
+            ob_up_series=up_static, ob_dn_series=dn_drops,
+        )
+        result2 = simulate_market_dome(dome2, cfg)
+        assert result2.dn_qty > 0, "DN side should fill (ask dropped)"
+        assert result2.up_qty == 0, "UP side should NOT fill (ask never dropped)"
 
     def test_pnl_positive_for_paired_win(self):
         """Paired win produces positive PnL when pair_cost < 1.0."""
@@ -1129,9 +1151,14 @@ class TestSimulateMarketDome:
             one_sided_abort_enabled=False,
             max_pair_cost=0.98,
         )
-        # Ask 0.45 on both sides — rungs will be at ~0.35-0.40 (below ask) = no fill
-        # To get a fill, need ask very low (e.g., 0.01)
-        dome = self._make_dome(up_ask=0.01, dn_ask=0.01, outcome="UP")
+        ws = 1_000_000
+        # Both asks start and stay at 0.01 — our rungs (which are >0.01) fill immediately
+        up_series = [(float(ws + i * 9), 0.00, 0.01) for i in range(100)]
+        dn_series = [(float(ws + i * 9), 0.00, 0.01) for i in range(100)]
+        dome = self._make_dome(
+            up_ask=0.01, dn_ask=0.01, outcome="UP",
+            ob_up_series=up_series, ob_dn_series=dn_series,
+        )
         result = simulate_market_dome(dome, cfg)
         # With ask=0.01, our rungs (which are >0.01) will all fill
         assert result.up_qty > 0

@@ -1507,6 +1507,10 @@ class DomeMarketData:
     ob_up_count: int
     ob_dn_count: int
 
+    # Full orderbook time series: list of (ts_sec, best_bid, best_ask) sorted by ts
+    ob_up_series: list[tuple[float, float, float]] = field(default_factory=list)
+    ob_dn_series: list[tuple[float, float, float]] = field(default_factory=list)
+
 
 def load_dome_snapshot(path: pathlib.Path) -> DomeMarketData | None:
     """Parse a single Dome snapshot JSONL file.
@@ -1577,6 +1581,10 @@ def load_dome_snapshot(path: pathlib.Path) -> DomeMarketData | None:
     ob_dn_asks: list[float] = []
     ob_dn_bids: list[float] = []
 
+    # Full time series: (ts_sec, best_bid, best_ask)
+    ob_up_series_raw: list[tuple[float, float, float]] = []
+    ob_dn_series_raw: list[tuple[float, float, float]] = []
+
     binance_series: list[tuple[float, float]] = []
     chainlink_at_close: float | None = None
     binance_at_close: float | None = None
@@ -1598,12 +1606,17 @@ def load_dome_snapshot(path: pathlib.Path) -> DomeMarketData | None:
             asks = data.get("asks", [])
             best_bid = max((float(b["price"]) for b in bids), default=0.0) if bids else 0.0
             best_ask = min((float(a["price"]) for a in asks), default=1.0) if asks else 1.0
+            # Timestamp in milliseconds from Dome API
+            ts_ms = data.get("timestamp", 0) or data.get("indexedAt", 0)
+            ts_sec = ts_ms / 1000.0
             if side == "UP":
                 ob_up_bids.append(best_bid)
                 ob_up_asks.append(best_ask)
+                ob_up_series_raw.append((ts_sec, best_bid, best_ask))
             elif side == "DN":
                 ob_dn_bids.append(best_bid)
                 ob_dn_asks.append(best_ask)
+                ob_dn_series_raw.append((ts_sec, best_bid, best_ask))
 
         elif t == "binance":
             ts_ms = data.get("timestamp", 0)
@@ -1637,6 +1650,10 @@ def load_dome_snapshot(path: pathlib.Path) -> DomeMarketData | None:
 
     binance_series.sort(key=lambda x: x[0])
 
+    # Sort orderbook series by timestamp
+    ob_up_series_raw.sort(key=lambda x: x[0])
+    ob_dn_series_raw.sort(key=lambda x: x[0])
+
     return DomeMarketData(
         market_slug=market_slug,
         condition_id=condition_id,
@@ -1656,6 +1673,8 @@ def load_dome_snapshot(path: pathlib.Path) -> DomeMarketData | None:
         has_orderbook=len(ob_up_asks) > 0 or len(ob_dn_asks) > 0,
         ob_up_count=len(ob_up_asks),
         ob_dn_count=len(ob_dn_asks),
+        ob_up_series=ob_up_series_raw,
+        ob_dn_series=ob_dn_series_raw,
     )
 
 
@@ -1784,17 +1803,16 @@ def simulate_market_dome(
         f"up_ask={up_ask_initial:.2f} dn_ask={dn_ask_initial:.2f}"))
 
     # -------------------------------------------------------------------
-    # Fill simulation using dome book state
+    # Fill simulation using real dome orderbook time series
     #
-    # Dome orderbook data is all from window open (~first 16 seconds).
-    # We simulate two ticks:
-    #   Tick 1 (t=open): Check fills against book state at open
-    #   Tick 2 (t=close-100): FV cancel check using close-period FV
-    #
-    # Fill rule: our resting buy at price P fills if P >= market best_ask.
-    # This models an aggressive passive bid that crosses the spread at entry.
-    # Conservative: doesn't model fills that happen mid-window as book moves.
+    # We have ~1785 orderbook snapshots per side spanning ~880s of the
+    # 900s window. Walk through at configurable tick intervals (default
+    # 30s). At each tick, binary-search for the latest book snapshot
+    # before that time. Fill rule: resting buy at price P fills if
+    # P >= market best_ask at that tick.
     # -------------------------------------------------------------------
+    import bisect as _bisect
+
     up_orders: list[tuple[float, float]] = list(up_rungs)
     dn_orders: list[tuple[float, float]] = list(dn_rungs)
     up_filled: list[Fill] = []
@@ -1806,164 +1824,110 @@ def simulate_market_dome(
     dn_cost_accum = 0.0
     aborted = False
 
-    # -----------------------------------------------------------------------
-    # Fill simulation for dome data
-    #
-    # Dome orderbook is a batch snapshot at window open (~first 16 seconds).
-    # Our passive limit orders are placed BELOW the initial ask by design.
-    #
-    # Binary option price dynamics during a 15-minute window:
-    #   - If UP wins: UP price rises from ~0.5 to ~1.0.
-    #     DN price falls from ~0.5 to ~0.0. Our DN buy orders fill
-    #     as DN price sweeps DOWN through our bids.
-    #   - If DN wins: Opposite — UP price falls, our UP buys fill.
-    #
-    # ADVERSE SELECTION: The LOSING side always fills (price sweeps to 0).
-    # The WINNING side fills ONLY when price first dips toward our bids
-    # before reversing up. This is the key uncertainty.
-    #
-    # Fill model (calibrated from local book_log data — 66% paired rate):
-    #   - LOSING side: always fills (all rungs, at their posted prices)
-    #   - WINNING side: fills with 66% probability (two-way price motion)
-    #     Uses seeded RNG for reproducibility.
-    #
-    # This matches our observed 66% paired rate in 122 real markets.
-    # -----------------------------------------------------------------------
-    import random as _random
-    # Deterministic seed from market epoch for reproducibility
-    _epoch = dome.window_start
-    _rng = _random.Random(_epoch)
+    # Pre-extract timestamp arrays for binary search
+    up_series = dome.ob_up_series  # sorted (ts_sec, best_bid, best_ask)
+    dn_series = dome.ob_dn_series
 
-    # Calibrated paired probability from local book_log validation
-    WINNING_SIDE_FILL_PROB = 0.66
+    def _book_at_idx(series: list[tuple[float, float, float]], ts_arr: list[float], t: float) -> tuple[float, float]:
+        """Return (best_bid, best_ask) from latest snapshot at or before time t."""
+        idx = _bisect.bisect_right(ts_arr, t) - 1
+        if idx < 0:
+            return (0.0, 1.0)  # no data yet
+        return (series[idx][1], series[idx][2])
 
-    # Determine LOSING side (always fills)
-    if dome.outcome == "UP":
-        losing_side = "DN"  # DN resolves 0, DN ask falls through our bids
-    elif dome.outcome == "DOWN":
-        losing_side = "UP"  # UP resolves 0, UP ask falls through our bids
-    else:
-        losing_side = None
-
-    mid_ts = open_ep + window_dur / 2.0
-    early_ts = open_ep + window_dur * 0.25  # winning side fills earlier (2-way motion)
-
-    # Step 1: Immediate fills (our bid >= initial ask = cross the spread)
-    for order in list(up_orders):
-        price, qty = order
-        if price >= up_ask_initial:
-            cost = price * qty
-            up_cost_accum += cost
-            f = Fill("UP", price, qty, open_ep, cost)
-            up_filled.append(f)
-            fills.append(f)
-            up_orders.remove(order)
-            events.append(Event(open_ep, "FILL",
-                f"UP fill (cross): price={price:.2f} qty={qty:.1f} ask={up_ask_initial:.2f}"))
-
-    for order in list(dn_orders):
-        price, qty = order
-        if price >= dn_ask_initial:
-            cost = price * qty
-            dn_cost_accum += cost
-            f = Fill("DN", price, qty, open_ep, cost)
-            dn_filled.append(f)
-            fills.append(f)
-            dn_orders.remove(order)
-            events.append(Event(open_ep, "FILL",
-                f"DN fill (cross): price={price:.2f} qty={qty:.1f} ask={dn_ask_initial:.2f}"))
-
-    # Step 2: Fill LOSING side (always fills — price sweeps to 0)
-    if losing_side == "UP" and up_orders:
-        for order in list(up_orders):
-            price, qty = order
-            cost = price * qty
-            up_cost_accum += cost
-            f = Fill("UP", price, qty, mid_ts, cost)
-            up_filled.append(f)
-            fills.append(f)
-            up_orders.remove(order)
-            events.append(Event(mid_ts, "FILL",
-                f"UP fill (loser sweep): price={price:.2f} qty={qty:.1f}"))
-
-    elif losing_side == "DN" and dn_orders:
-        for order in list(dn_orders):
-            price, qty = order
-            cost = price * qty
-            dn_cost_accum += cost
-            f = Fill("DN", price, qty, mid_ts, cost)
-            dn_filled.append(f)
-            fills.append(f)
-            dn_orders.remove(order)
-            events.append(Event(mid_ts, "FILL",
-                f"DN fill (loser sweep): price={price:.2f} qty={qty:.1f}"))
-
-    # Step 3: Fill WINNING side with 66% probability (two-way price motion)
-    winning_side_fills = _rng.random() < WINNING_SIDE_FILL_PROB
-    if winning_side_fills:
-        if losing_side == "DN" and up_orders:
-            # Outcome=UP, winner=UP → up_orders may have remaining unfilled
-            for order in list(up_orders):
-                price, qty = order
-                cost = price * qty
-                up_cost_accum += cost
-                f = Fill("UP", price, qty, early_ts, cost)
-                up_filled.append(f)
-                fills.append(f)
-                up_orders.remove(order)
-                events.append(Event(early_ts, "FILL",
-                    f"UP fill (winner 2-way): price={price:.2f} qty={qty:.1f}"))
-
-        elif losing_side == "UP" and dn_orders:
-            # Outcome=DOWN, winner=DN → dn_orders may have remaining unfilled
-            for order in list(dn_orders):
-                price, qty = order
-                cost = price * qty
-                dn_cost_accum += cost
-                f = Fill("DN", price, qty, early_ts, cost)
-                dn_filled.append(f)
-                fills.append(f)
-                dn_orders.remove(order)
-                events.append(Event(early_ts, "FILL",
-                    f"DN fill (winner 2-way): price={price:.2f} qty={qty:.1f}"))
-
-    # Tick 2: near window close (~100s before end) — FV cancel check
+    # Build merged timeline of all unique snapshot timestamps from both sides
+    # This is more efficient than fixed-interval ticking: we only check at
+    # times when the book actually changed.
+    all_ts_set: set[float] = set()
+    up_ts_arr = [s[0] for s in up_series]
+    dn_ts_arr = [s[0] for s in dn_series]
+    all_ts_set.update(up_ts_arr)
+    all_ts_set.update(dn_ts_arr)
+    # Also add tick2 for FV cancel check
     tick2_ts = close_ep - 100.0
-    if cfg.fv_cancel_enabled and cert_close >= cfg.fv_cancel_certainty_threshold:
-        losing_side = "DN" if fv_up_close >= 0.5 else "UP"
-        if losing_side == "UP" and not fv_cancelled_up and up_orders:
-            up_orders = []
-            fv_cancelled_up = True
-            events.append(Event(tick2_ts, "CANCEL",
-                f"FV cancel UP: fv={fv_up_close:.3f} cert={cert_close:.3f}"))
-        elif losing_side == "DN" and not fv_cancelled_dn and dn_orders:
-            dn_orders = []
-            fv_cancelled_dn = True
-            events.append(Event(tick2_ts, "CANCEL",
-                f"FV cancel DN: fv={fv_up_close:.3f} cert={cert_close:.3f}"))
+    all_ts_set.add(tick2_ts)
+    all_timestamps = sorted(all_ts_set)
 
-    # One-sided abort (check after tick 1 fills)
-    if cfg.one_sided_abort_enabled and not aborted:
-        total_cost = up_cost_accum + dn_cost_accum
-        committed_pct = total_cost / max(budget, 0.01)
-        if committed_pct >= cfg.one_sided_abort_cost_pct:
-            up_q = sum(f.qty for f in up_filled)
-            dn_q = sum(f.qty for f in dn_filled)
-            if up_q > 0 or dn_q > 0:
-                heavy = max(up_q, dn_q)
-                light = min(up_q, dn_q)
-                if light == 0 and heavy > 0:
-                    if up_q > dn_q:
-                        cancelled = len(up_orders)
-                        up_orders = []
-                        events.append(Event(open_ep, "ABORT",
-                            f"UP heavy ({up_q:.1f} vs {dn_q:.1f}), cancelled {cancelled}"))
-                    else:
-                        cancelled = len(dn_orders)
-                        dn_orders = []
-                        events.append(Event(open_ep, "ABORT",
-                            f"DN heavy ({dn_q:.1f} vs {up_q:.1f}), cancelled {cancelled}"))
-                    aborted = True
+    fv_cancel_done = False
+
+    for t in all_timestamps:
+        if not up_orders and not dn_orders:
+            break
+
+        # Get current book state via binary search
+        up_bb, up_ba = _book_at_idx(up_series, up_ts_arr, t)
+        dn_bb, dn_ba = _book_at_idx(dn_series, dn_ts_arr, t)
+
+        # Check UP fills: our bid >= market best_ask
+        if up_orders:
+            remaining_up = []
+            for price, qty in up_orders:
+                if price >= up_ba:
+                    cost = price * qty
+                    up_cost_accum += cost
+                    f = Fill("UP", price, qty, t, cost)
+                    up_filled.append(f)
+                    fills.append(f)
+                    events.append(Event(t, "FILL",
+                        f"UP fill: price={price:.2f} qty={qty:.1f} ask={up_ba:.2f}"))
+                else:
+                    remaining_up.append((price, qty))
+            up_orders = remaining_up
+
+        # Check DN fills: our bid >= market best_ask
+        if dn_orders:
+            remaining_dn = []
+            for price, qty in dn_orders:
+                if price >= dn_ba:
+                    cost = price * qty
+                    dn_cost_accum += cost
+                    f = Fill("DN", price, qty, t, cost)
+                    dn_filled.append(f)
+                    fills.append(f)
+                    events.append(Event(t, "FILL",
+                        f"DN fill: price={price:.2f} qty={qty:.1f} ask={dn_ba:.2f}"))
+                else:
+                    remaining_dn.append((price, qty))
+            dn_orders = remaining_dn
+
+        # FV cancel check at tick2 (~100s before end)
+        if not fv_cancel_done and t >= tick2_ts:
+            fv_cancel_done = True
+            if cfg.fv_cancel_enabled and cert_close >= cfg.fv_cancel_certainty_threshold:
+                predicted_loser = "DN" if fv_up_close >= 0.5 else "UP"
+                if predicted_loser == "UP" and not fv_cancelled_up and up_orders:
+                    up_orders = []
+                    fv_cancelled_up = True
+                    events.append(Event(t, "CANCEL",
+                        f"FV cancel UP: fv={fv_up_close:.3f} cert={cert_close:.3f}"))
+                elif predicted_loser == "DN" and not fv_cancelled_dn and dn_orders:
+                    dn_orders = []
+                    fv_cancelled_dn = True
+                    events.append(Event(t, "CANCEL",
+                        f"FV cancel DN: fv={fv_up_close:.3f} cert={cert_close:.3f}"))
+
+        # One-sided abort check (run once after first fills)
+        if cfg.one_sided_abort_enabled and not aborted:
+            total_cost = up_cost_accum + dn_cost_accum
+            committed_pct = total_cost / max(budget, 0.01)
+            if committed_pct >= cfg.one_sided_abort_cost_pct:
+                up_q = sum(f.qty for f in up_filled)
+                dn_q = sum(f.qty for f in dn_filled)
+                if up_q > 0 or dn_q > 0:
+                    heavy = max(up_q, dn_q)
+                    light = min(up_q, dn_q)
+                    if light == 0 and heavy > 0:
+                        if up_q > dn_q:
+                            cancelled = len(up_orders)
+                            up_orders = []
+                            events.append(Event(t, "ABORT",
+                                f"UP heavy ({up_q:.1f} vs {dn_q:.1f}), cancelled {cancelled}"))
+                        else:
+                            cancelled = len(dn_orders)
+                            dn_orders = []
+                            events.append(Event(t, "ABORT",
+                                f"DN heavy ({dn_q:.1f} vs {up_q:.1f}), cancelled {cancelled}"))
+                        aborted = True
 
     # -------------------------------------------------------------------
     # PnL computation (same logic as simulate_market)
@@ -2057,6 +2021,7 @@ def run_backtest_dome(
     cfg: BacktestConfig,
     output_path: pathlib.Path | None = None,
     verbose: bool = False,
+    limit: int | None = None,
 ) -> dict:
     """Run backtest using Dome snapshot files.
 
@@ -2098,6 +2063,10 @@ def run_backtest_dome(
         loaded_count += 1
         result = simulate_market_dome(dome, cfg)
         results.append(result)
+
+        if limit is not None and loaded_count >= limit:
+            logger.info("Reached --limit=%d, stopping", limit)
+            break
 
         if verbose and loaded_count % 100 == 0:
             logger.info(
@@ -2348,6 +2317,8 @@ def main() -> None:
     parser.add_argument("--verbose", "-v", action="store_true")
     parser.add_argument("--cache-dir", default=None,
         help="Directory for index caches (default: data_dir) [local mode only]")
+    parser.add_argument("--limit", type=int, default=None,
+        help="Limit number of markets to simulate (for testing)")
     args = parser.parse_args()
 
     data_dir = pathlib.Path(args.data_dir)
@@ -2388,6 +2359,7 @@ def main() -> None:
             cfg=cfg,
             output_path=output_path,
             verbose=args.verbose,
+            limit=args.limit,
         )
         _print_results(agg, cfg.name, "dome")
 
