@@ -151,20 +151,75 @@ class DomeClient:
         token_id: str,
         start_sec: int,
         end_sec: int,
+        max_pages: int = 30,
+        page_size: int = 200,
     ) -> list[dict]:
-        """Return orderbook snapshots for *token_id*.
+        """Return ALL orderbook snapshots for *token_id* via cursor pagination.
 
         Dome's orderbooks endpoint uses epoch MILLISECONDS — converted internally.
+        The API uses ``paginationKey`` (camelCase) as the cursor parameter.
+
+        Walks pages until ``has_more=False`` or *max_pages* is reached.
+        The full combined result is cached as a single unit keyed on
+        ``(token_id, start_sec, end_sec)`` so re-runs don't re-fetch individual
+        pages and the cache stays consistent.
         """
-        raw = self._get(
-            "/v1/polymarket/orderbooks",
-            {
+        # Build a stable cache key for the full combined result.
+        # We bypass the per-request _get() cache and handle it ourselves so
+        # that the cached value is the merged snapshot list, not a single page.
+        cache_key_url: str | None = None
+        if self._cache_dir is not None:
+            from urllib.parse import urlencode
+            cache_key_url = (
+                f"{self._base_url}/v1/polymarket/orderbooks"
+                f"?{urlencode({'token_id': token_id, 'start_time': start_sec * 1000, 'end_time': end_sec * 1000})}"
+                f"&_combined=1"
+            )
+            cached = self._cache_load(cache_key_url)
+            if cached is not None:
+                logger.debug("cache hit (combined orderbook): token=%s", token_id[:16])
+                return cached.get("snapshots", [])
+
+        all_snapshots: list[dict] = []
+        pagination_key: str | None = None
+
+        for page_num in range(max_pages):
+            params: dict = {
                 "token_id": token_id,
                 "start_time": start_sec * 1000,
                 "end_time": end_sec * 1000,
-            },
+                "limit": page_size,
+            }
+            if pagination_key:
+                # API requires camelCase 'paginationKey' — snake_case is NOT accepted
+                params["paginationKey"] = pagination_key
+
+            resp = self._get("/v1/polymarket/orderbooks", params)
+            snapshots = resp.get("snapshots", [])
+            all_snapshots.extend(snapshots)
+
+            pag = resp.get("pagination", {})
+            if not pag.get("has_more"):
+                break
+            pagination_key = pag.get("paginationKey") or pag.get("pagination_key")
+            if not pagination_key:
+                break  # safety: no cursor returned despite has_more=True
+
+            logger.debug(
+                "orderbook page %d: %d snaps, fetching next (token=%s...)",
+                page_num + 1, len(all_snapshots), token_id[:16],
+            )
+
+        logger.debug(
+            "orderbook fetch complete: %d total snapshots for token=%s...",
+            len(all_snapshots), token_id[:16],
         )
-        return raw.get("snapshots", [])
+
+        # Cache the merged result so subsequent calls skip pagination entirely
+        if cache_key_url is not None:
+            self._cache_save(cache_key_url, {"snapshots": all_snapshots})
+
+        return all_snapshots
 
     def get_binance_prices(
         self,

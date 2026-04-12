@@ -165,11 +165,12 @@ def fetch_market_snapshot(
     else:
         logger.warning("%s: no condition_id — skipping candles", slug)
 
-    # 3. Orderbook snapshots — UP token
+    # 3. Orderbook snapshots — UP token (auto-paginated to full window coverage)
     if up_token_id:
         snapshots = client.get_orderbook_snapshots(up_token_id, window_start, window_end)
         for s in snapshots:
             lines.append({"type": "orderbook", "side": "UP", "data": s})
+        logger.info("%s: UP orderbook — %d snapshots", slug, len(snapshots))
     else:
         logger.warning("%s: no UP token_id — skipping UP orderbook", slug)
 
@@ -178,6 +179,7 @@ def fetch_market_snapshot(
         dn_snapshots = client.get_orderbook_snapshots(dn_token_id, window_start, window_end)
         for s in dn_snapshots:
             lines.append({"type": "orderbook", "side": "DN", "data": s})
+        logger.info("%s: DN orderbook — %d snapshots", slug, len(dn_snapshots))
     else:
         logger.warning("%s: no DN token_id — skipping DN orderbook", slug)
 

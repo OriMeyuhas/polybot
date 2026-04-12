@@ -247,3 +247,118 @@ class TestContextManager:
         with DomeClient(api_key="k", min_interval_sec=0) as client:
             assert client._api_key == "k"
         # No exception = pass
+
+
+# ---------------------------------------------------------------------------
+# Orderbook pagination
+# ---------------------------------------------------------------------------
+
+class TestOrderbookPagination:
+    """get_orderbook_snapshots must walk paginationKey until has_more=False."""
+
+    def _page_response(self, snaps: list[dict], has_more: bool, key: str | None = None) -> tuple[int, dict]:
+        pag: dict = {"limit": 200, "count": len(snaps), "has_more": has_more}
+        if key:
+            pag["paginationKey"] = key
+        return (200, {"snapshots": snaps, "pagination": pag})
+
+    def test_paginates_until_has_more_false(self):
+        """3 pages of responses → all snapshots combined, paginationKey passed correctly."""
+        snap_p1 = [{"timestamp": 1_000_000, "idx": 1}]
+        snap_p2 = [{"timestamp": 2_000_000, "idx": 2}]
+        snap_p3 = [{"timestamp": 3_000_000, "idx": 3}]
+
+        responses = [
+            self._page_response(snap_p1, has_more=True,  key="key-abc"),
+            self._page_response(snap_p2, has_more=True,  key="key-def"),
+            self._page_response(snap_p3, has_more=False, key=None),
+        ]
+        client, mock = _client_with_mock(responses)
+        result = client.get_orderbook_snapshots("tok", 1000, 4000)
+
+        assert result == snap_p1 + snap_p2 + snap_p3
+        assert mock.call_count == 3
+
+        # First call must NOT include a paginationKey param
+        url1 = mock.call_args_list[0][0][0]
+        assert "paginationKey" not in url1
+
+        # Second call must include paginationKey=key-abc
+        url2 = mock.call_args_list[1][0][0]
+        assert "paginationKey=key-abc" in url2
+
+        # Third call must include paginationKey=key-def
+        url3 = mock.call_args_list[2][0][0]
+        assert "paginationKey=key-def" in url3
+
+    def test_respects_max_pages(self):
+        """If has_more is always True, stops at max_pages."""
+        always_more = (200, {"snapshots": [{"timestamp": 1}], "pagination": {
+            "limit": 200, "count": 1, "has_more": True, "paginationKey": "key-x"
+        }})
+        # Provide more responses than max_pages to confirm we stop early
+        client, mock = _client_with_mock([always_more] * 20)
+        result = client.get_orderbook_snapshots("tok", 1000, 2000, max_pages=5)
+
+        assert mock.call_count == 5
+        assert len(result) == 5  # one snap per page
+
+    def test_stops_if_no_pagination_key(self):
+        """Stops immediately if has_more=True but paginationKey missing (safety)."""
+        p1 = (200, {"snapshots": [{"timestamp": 1}], "pagination": {
+            "limit": 200, "count": 1, "has_more": True
+            # No paginationKey!
+        }})
+        client, mock = _client_with_mock([p1])
+        result = client.get_orderbook_snapshots("tok", 1000, 2000)
+        assert mock.call_count == 1
+        assert len(result) == 1
+
+    def test_caches_full_combined_result(self, tmp_path):
+        """Full paginated set cached by (token_id, start_sec, end_sec) — not per page."""
+        snap_p1 = [{"timestamp": 1_000_000, "idx": 1}]
+        snap_p2 = [{"timestamp": 2_000_000, "idx": 2}]
+        responses = [
+            self._page_response(snap_p1, has_more=True, key="key-abc"),
+            self._page_response(snap_p2, has_more=False, key=None),
+            # Third response — should NOT be called (cache hit)
+            (200, {"snapshots": [{"timestamp": 99}], "pagination": {"has_more": False}}),
+        ]
+        client, mock = _client_with_mock(responses)
+        client._cache_dir = tmp_path
+        client._cache_ttl_sec = 3600
+
+        # First call — 2 pages fetched, full result cached
+        result1 = client.get_orderbook_snapshots("tok", 1000, 4000)
+        assert mock.call_count == 2
+        assert result1 == snap_p1 + snap_p2
+
+        # Second call — should use cache (0 new network calls)
+        result2 = client.get_orderbook_snapshots("tok", 1000, 4000)
+        assert mock.call_count == 2  # no additional calls
+        assert result2 == snap_p1 + snap_p2
+
+    def test_single_page_no_pagination(self):
+        """Single page (has_more=False from start) works without pagination."""
+        snaps = [{"timestamp": 1_000_000}, {"timestamp": 2_000_000}]
+        client, mock = _client_with_mock([
+            self._page_response(snaps, has_more=False)
+        ])
+        result = client.get_orderbook_snapshots("tok", 1000, 2000)
+        assert result == snaps
+        assert mock.call_count == 1
+
+    def test_uses_paginationkey_camelcase(self):
+        """API param must be 'paginationKey' (camelCase), not 'pagination_key'."""
+        responses = [
+            self._page_response([{"timestamp": 1}], has_more=True, key="mykey"),
+            self._page_response([{"timestamp": 2}], has_more=False),
+        ]
+        client, mock = _client_with_mock(responses)
+        client.get_orderbook_snapshots("tok", 1000, 2000)
+
+        url2 = mock.call_args_list[1][0][0]
+        # Must use camelCase
+        assert "paginationKey=mykey" in url2
+        # Must NOT use snake_case
+        assert "pagination_key" not in url2
