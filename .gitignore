@@ -1,6 +1,20 @@
 .env
+.env.bak*
 __pycache__/
 *.pyc
-data/tracker/*.csv
-data/trades/*.csv
 .venv/
+
+# Runtime data — all logs, snapshots, and agent state regenerate locally
+data/
+
+# Backtester outputs (regenerate from tools/backtester.py)
+results/
+tasks/
+
+# Runtime logs in repo root
+polybot.log
+dome_pull.log
+bot_restart.log
+
+# Claude agent scratch: worktrees are ephemeral
+.claude/worktrees/
