@@ -2022,12 +2022,17 @@ def run_backtest_dome(
     output_path: pathlib.Path | None = None,
     verbose: bool = False,
     limit: int | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
 ) -> dict:
     """Run backtest using Dome snapshot files.
 
     Reads all btc-updown-15m-*.jsonl files from dome_dir.
     Skips markets with no orderbook data (e.g. 2026-04-05).
     Skips future markets (no outcome in raw_market.winning_side).
+
+    If start_date / end_date are given (YYYY-MM-DD, inclusive), filter by
+    the window_start epoch encoded in the filename.
     """
     if not dome_dir.exists():
         logger.error("Dome snapshot directory not found: %s", dome_dir)
@@ -2035,6 +2040,42 @@ def run_backtest_dome(
 
     all_files = sorted(dome_dir.glob("btc-updown-15m-*.jsonl"))
     logger.info("Found %d dome snapshot files in %s", len(all_files), dome_dir)
+
+    # Optional date-range filter (by epoch in filename)
+    start_ep: int | None = None
+    end_ep: int | None = None
+    if start_date:
+        sd = datetime.date.fromisoformat(start_date)
+        start_ep = int(datetime.datetime(
+            sd.year, sd.month, sd.day, tzinfo=datetime.timezone.utc
+        ).timestamp())
+    if end_date:
+        ed = datetime.date.fromisoformat(end_date)
+        end_ep = int(datetime.datetime(
+            ed.year, ed.month, ed.day, tzinfo=datetime.timezone.utc
+        ).timestamp()) + 86400  # inclusive end-of-day
+
+    if start_ep is not None or end_ep is not None:
+        filtered: list[pathlib.Path] = []
+        for p in all_files:
+            stem = p.stem  # btc-updown-15m-<epoch>
+            parts = stem.rsplit("-", 1)
+            if len(parts) != 2:
+                continue
+            try:
+                ep = int(parts[1])
+            except ValueError:
+                continue
+            if start_ep is not None and ep < start_ep:
+                continue
+            if end_ep is not None and ep >= end_ep:
+                continue
+            filtered.append(p)
+        logger.info(
+            "Date filter %s..%s: %d files -> %d",
+            start_date or "-", end_date or "-", len(all_files), len(filtered),
+        )
+        all_files = filtered
 
     results: list[MarketResult] = []
     skipped_no_book = 0
@@ -2311,9 +2352,9 @@ def main() -> None:
         help="Path to YAML config file")
     parser.add_argument("--output", default=None, help="Output JSON file path")
     parser.add_argument("--start", default="2026-04-10",
-        help="Start date (YYYY-MM-DD), inclusive [local mode only]")
+        help="Start date (YYYY-MM-DD), inclusive (both local and dome mode)")
     parser.add_argument("--end", default="2026-04-11",
-        help="End date (YYYY-MM-DD), inclusive [local mode only]")
+        help="End date (YYYY-MM-DD), inclusive (both local and dome mode)")
     parser.add_argument("--verbose", "-v", action="store_true")
     parser.add_argument("--cache-dir", default=None,
         help="Directory for index caches (default: data_dir) [local mode only]")
@@ -2354,12 +2395,21 @@ def main() -> None:
 
     if data_source == "dome":
         logger.info("Running DOME backtest: %s -> %s", cfg.name, output_path)
+        # Only pass date filter in dome mode if user explicitly provided
+        # different values than the local-mode defaults (2026-04-10 / 11).
+        # This preserves "dome without --start/--end runs full corpus" behavior.
+        import sys as _sys
+        argv_set = set(_sys.argv)
+        dome_start = args.start if "--start" in argv_set else None
+        dome_end = args.end if "--end" in argv_set else None
         agg = run_backtest_dome(
             dome_dir=dome_dir,
             cfg=cfg,
             output_path=output_path,
             verbose=args.verbose,
             limit=args.limit,
+            start_date=dome_start,
+            end_date=dome_end,
         )
         _print_results(agg, cfg.name, "dome")
 
