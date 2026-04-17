@@ -999,13 +999,28 @@ class LadderManager:
                 _dn_bid = self.executor.get_best_bid(market.dn_token_id)
                 _dn_ask_bmg = self.executor.get_best_ask(market.dn_token_id)
                 _max_spread = self.cfg.book_mid_gate_max_spread
-                if (
+                # Cycle 19 instrumentation: classify non-fires so we can tell
+                # whether the gate is silent because of missing data, wide
+                # spreads, or insufficient certainty. DEBUG-level to avoid
+                # log spam (fires every window).
+                _has_all_data = (
                     _up_mid is not None and _dn_mid is not None
                     and _up_bid is not None and _up_ask_bmg is not None
                     and _dn_bid is not None and _dn_ask_bmg is not None
-                    and (_up_ask_bmg - _up_bid) <= _max_spread
-                    and (_dn_ask_bmg - _dn_bid) <= _max_spread
                     and (_up_mid + _dn_mid) > 0.0
+                )
+                _spread_up = (
+                    (_up_ask_bmg - _up_bid)
+                    if (_up_ask_bmg is not None and _up_bid is not None) else None
+                )
+                _spread_dn = (
+                    (_dn_ask_bmg - _dn_bid)
+                    if (_dn_ask_bmg is not None and _dn_bid is not None) else None
+                )
+                if (
+                    _has_all_data
+                    and _spread_up is not None and _spread_up <= _max_spread
+                    and _spread_dn is not None and _spread_dn <= _max_spread
                 ):
                     _book_mid_up = _up_mid / (_up_mid + _dn_mid)
                     _cert_book = 2.0 * abs(_book_mid_up - 0.5)
@@ -1027,6 +1042,39 @@ class LadderManager:
                             market.market_id, _cert_book * 100, _side_label,
                             _capped_bmg, _dir_cap_bmg, _book_mid_up,
                         )
+                    else:
+                        # Certainty too low — data is good, spreads are tight,
+                        # but mid-based certainty didn't clear threshold.
+                        _spread_up_str = "%.4f" % _spread_up
+                        _spread_dn_str = "%.4f" % _spread_dn
+                        _cert_str = "%.4f" % _cert_book
+                        logger.debug(
+                            "BOOK MID GATE SKIP: %s reason=certainty_too_low "
+                            "spread_up=%s spread_dn=%s cert=%s",
+                            market.market_id, _spread_up_str, _spread_dn_str, _cert_str,
+                        )
+                elif _has_all_data:
+                    # Spread too wide on one or both sides.
+                    _spread_up_str = "%.4f" % _spread_up
+                    _spread_dn_str = "%.4f" % _spread_dn
+                    logger.debug(
+                        "BOOK MID GATE SKIP: %s reason=spread_too_wide "
+                        "spread_up=%s spread_dn=%s cert=None",
+                        market.market_id, _spread_up_str, _spread_dn_str,
+                    )
+                else:
+                    # Missing bid/ask/mid data (or degenerate mids).
+                    _spread_up_str = (
+                        "%.4f" % _spread_up if _spread_up is not None else "None"
+                    )
+                    _spread_dn_str = (
+                        "%.4f" % _spread_dn if _spread_dn is not None else "None"
+                    )
+                    logger.debug(
+                        "BOOK MID GATE SKIP: %s reason=missing_bid_ask "
+                        "spread_up=%s spread_dn=%s cert=None",
+                        market.market_id, _spread_up_str, _spread_dn_str,
+                    )
 
             # FV gate: if certainty > 80% at posting time, skip the losing side entirely.
             # Threshold raised from 0.60 to 0.80 — 60% gate fired too often (76-84% loss

@@ -7,6 +7,7 @@ skips the losing side and caps the winning-side budget at directional_budget_cap
 Orthogonal to fv_gate_enabled (that gate uses Binance-derived fair_up).
 Holdout-validated 2026-04-17 on 212-market out-of-sample Dome dataset.
 """
+import logging
 import time
 from unittest.mock import MagicMock
 
@@ -206,3 +207,54 @@ class TestBookMidGate:
         # are nowhere near the uncapped $200 budget from position_size_fraction=0.40.
         assert up_notional <= 20.0 * 1.05, \
             f"UP notional ${up_notional:.2f} exceeded directional cap $20 (+5% tol)"
+
+
+class TestBookMidGateInstrumentation:
+    """Cycle 19: verify non-fires are categorized into 3 distinguishable tags."""
+
+    LOGGER_NAME = "polybot.strategy.ladder_manager"
+
+    def test_non_fire_missing_bid_ask_logged(self, caplog):
+        """Missing bid on UP -> reason=missing_bid_ask."""
+        lm = _make_manager(up_mid=0.85, dn_mid=0.15,
+                           up_bid=0.84, up_ask=0.86,
+                           dn_bid=0.14, dn_ask=0.16)
+        # Override UP bid to None
+        lm.executor.get_best_bid.side_effect = lambda t: None if t == "tok_up" else 0.14
+
+        with caplog.at_level(logging.DEBUG, logger=self.LOGGER_NAME):
+            lm.post_ladder(_market(), spot_delta=0.0, fair_up=0.50)
+
+        skip_msgs = [r.getMessage() for r in caplog.records if "BOOK MID GATE SKIP" in r.getMessage()]
+        assert any("reason=missing_bid_ask" in m for m in skip_msgs), \
+            f"Expected reason=missing_bid_ask in logs, got: {skip_msgs}"
+
+    def test_non_fire_spread_too_wide_logged(self, caplog):
+        """Wide UP spread + high certainty -> reason=spread_too_wide."""
+        lm = _make_manager(up_mid=0.90, dn_mid=0.10,
+                           up_bid=0.85, up_ask=0.95,  # spread=0.10 > 0.05
+                           dn_bid=0.09, dn_ask=0.11)
+
+        with caplog.at_level(logging.DEBUG, logger=self.LOGGER_NAME):
+            lm.post_ladder(_market(), spot_delta=0.0, fair_up=0.50)
+
+        skip_msgs = [r.getMessage() for r in caplog.records if "BOOK MID GATE SKIP" in r.getMessage()]
+        assert any("reason=spread_too_wide" in m for m in skip_msgs), \
+            f"Expected reason=spread_too_wide in logs, got: {skip_msgs}"
+
+    def test_non_fire_certainty_too_low_logged(self, caplog):
+        """Good data, tight spreads, but cert=0.20 < 0.65 -> reason=certainty_too_low."""
+        # up_mid=0.60, dn_mid=0.40 -> book_mid_up=0.60 -> cert = 2*|0.60-0.50| = 0.20
+        lm = _make_manager(up_mid=0.60, dn_mid=0.40,
+                           up_bid=0.59, up_ask=0.61,
+                           dn_bid=0.39, dn_ask=0.41)
+
+        with caplog.at_level(logging.DEBUG, logger=self.LOGGER_NAME):
+            lm.post_ladder(_market(), spot_delta=0.0, fair_up=0.50)
+
+        skip_msgs = [r.getMessage() for r in caplog.records if "BOOK MID GATE SKIP" in r.getMessage()]
+        assert any("reason=certainty_too_low" in m for m in skip_msgs), \
+            f"Expected reason=certainty_too_low in logs, got: {skip_msgs}"
+        # Ensure cert value is present (not "None")
+        cert_msg = [m for m in skip_msgs if "reason=certainty_too_low" in m][0]
+        assert "cert=0.2000" in cert_msg, f"Expected cert=0.2000 in: {cert_msg}"
