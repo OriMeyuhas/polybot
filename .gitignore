@@ -5,11 +5,11 @@ __pycache__/
 .venv/
 
 # Runtime data — all logs, snapshots, and agent state regenerate locally
-data/
+/data/
 
 # Backtester outputs (regenerate from tools/backtester.py)
-results/
-tasks/
+/results/
+/tasks/
 
 # Runtime logs in repo root
 polybot.log

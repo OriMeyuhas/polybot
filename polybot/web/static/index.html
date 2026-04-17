@@ -4,177 +4,466 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>PolyBot Dashboard</title>
-    <link rel="stylesheet" href="/styles.css" />
-    <script type="module" src="/app.js" defer></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="/static/styles.css?v=19" />
+    <script src="/static/app.js?v=22" defer></script>
   </head>
   <body>
-    <div class="bg-glow"></div>
 
-    <div class="app">
-      <!-- Header -->
-      <header>
+    <div class="aurora"></div>
+
+    <div class="container">
+
+      <!-- HEADER -->
+      <div class="header glass">
         <div class="header-left">
-          <div class="logo">
-            <svg class="logo-icon" viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <rect x="3" y="3" width="7" height="7"/>
-              <rect x="14" y="3" width="7" height="7"/>
-              <rect x="3" y="14" width="7" height="7"/>
-              <rect x="14" y="14" width="7" height="7"/>
-            </svg>
-            <span class="logo-text">PolyBot</span>
-          </div>
-          <span class="live-dot" id="live-dot"></span>
+          <div class="logo">Poly<span>Bot</span></div>
+          <div class="status-dot" id="live-dot"></div>
           <span class="status-text" id="status-text">Offline</span>
-          <span class="mode-badge" id="mode-badge">LADDER MM</span>
+          <span class="mode-pill" id="mode-badge">PAPER</span>
+          <nav class="tabs">
+            <button id="tab-dashboard" class="tab active">Dashboard</button>
+            <button id="tab-config" class="tab">Config</button>
+          </nav>
         </div>
-      </header>
+        <div class="header-right">
+          <label class="mode-toggle" id="mode-toggle">
+            <input type="checkbox" id="mode-switch" checked />
+            <span class="mode-toggle-track">
+              <span class="mode-toggle-label paper">PAPER</span>
+              <span class="mode-toggle-label live">LIVE</span>
+              <span class="mode-toggle-thumb"></span>
+            </span>
+          </label>
+          <span class="usdc-balance" id="usdc-balance">USDC: $0.00</span>
+          <!-- Sound Alert Toggle -->
+          <button class="sound-toggle" id="sound-toggle" title="Sound alerts">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
+              <path class="sound-wave-1" d="M15.54 8.46a5 5 0 0 1 0 7.07"></path>
+              <path class="sound-wave-2" d="M19.07 4.93a10 10 0 0 1 0 14.14"></path>
+            </svg>
+          </button>
+          <button id="btn-test-conn" class="header-btn btn-test-conn" style="display:none">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+            Test Connection
+          </button>
+          <button id="btn-start" class="header-btn btn-start">Start</button>
+          <button id="btn-stop" class="header-btn btn-stop" disabled>Stop</button>
+        </div>
+      </div>
 
-      <main>
-        <!-- ======================== DASHBOARD ======================== -->
-        <section id="panel-dashboard" class="panel active">
+      <div id="price-stale-banner" class="stale-banner" style="display:none">
+        Price feed stale -- new ladders and repricing paused
+      </div>
+      <div id="stale-order-banner" class="stale-banner stale-banner-red" style="display:none"></div>
+      <div id="mode-mismatch-banner" class="stale-banner" style="display:none">
+        <span id="mode-mismatch-text">Restart required — saved config differs from running mode.</span>
+        <button id="btn-restart-inline" class="header-btn" style="margin-left:12px;padding:4px 10px">Restart now</button>
+      </div>
 
-          <!-- Control Bar -->
-          <div class="control-bar">
-            <div class="control-group">
-              <span class="mode-badge-readonly" id="mode-badge-control">LADDER MM</span>
+      <!-- ======================== DASHBOARD ======================== -->
+      <section id="panel-dashboard" class="panel active">
+
+        <!-- PNL HERO -->
+        <div class="pnl-hero glass" id="hero-pnl">
+          <div class="pnl-label">Total PnL</div>
+          <div class="pnl-value" id="total-pnl">$0.00</div>
+          <div class="pnl-sub">
+            <div class="pnl-sub-item"><span class="pnl-sub-label">Realized</span><span id="realized-pnl" class="green">$0.00</span></div>
+            <div class="pnl-sub-item"><span class="pnl-sub-label">Unrealized</span><span id="unrealized-pnl">$0.00</span></div>
+            <div class="pnl-sub-item"><span class="pnl-sub-label">USDC</span><span id="hero-usdc">$0.00</span></div>
+            <div class="pnl-sub-item"><span class="pnl-sub-label">Runtime</span><span id="runtime" class="mono">0s</span></div>
+            <div class="pnl-sub-item"><span class="pnl-sub-label">Pairs/hr</span><span id="pairs-per-hour" class="mono">0.0</span></div>
+          </div>
+          <!-- PnL Equity Curve (replaces sparkline) -->
+          <div class="pnl-equity-curve" id="equity-curve-wrap">
+            <svg id="equity-curve" viewBox="0 0 900 200" preserveAspectRatio="none">
+              <defs>
+                <linearGradient id="curve-fill-green" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stop-color="rgba(52,211,153,0.30)" />
+                  <stop offset="100%" stop-color="rgba(52,211,153,0.02)" />
+                </linearGradient>
+                <linearGradient id="curve-fill-red" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stop-color="rgba(248,113,113,0.02)" />
+                  <stop offset="100%" stop-color="rgba(248,113,113,0.25)" />
+                </linearGradient>
+              </defs>
+              <!-- Content rendered by JS -->
+            </svg>
+          </div>
+          <!-- Capital deployed bar -->
+          <div class="capital-bar-wrap">
+            <div class="capital-bar-header">
+              <span class="capital-bar-label">Capital Deployed</span>
+              <span class="capital-bar-val mono" id="capital-bar-text">$0 / $0 (0%)</span>
             </div>
-            <div class="control-group">
-              <button id="btn-start" class="btn btn-start">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
-                Start
-              </button>
-              <button id="btn-stop" class="btn btn-stop" disabled>
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>
-                Stop
-              </button>
+            <div class="capital-bar-track">
+              <div class="capital-bar-fill" id="capital-bar-fill" style="width:0%"></div>
             </div>
           </div>
+          <!-- Hidden sparkline SVG for backward compat -->
+          <svg id="sparkline" style="display:none" viewBox="0 0 240 48" preserveAspectRatio="none">
+            <defs>
+              <linearGradient id="spark-grad" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" id="spark-grad-stop" stop-color="rgba(52,211,153,0.25)"/>
+                <stop offset="100%" stop-color="transparent"/>
+              </linearGradient>
+            </defs>
+            <path id="spark-fill" d="" fill="url(#spark-grad)"/>
+            <polyline id="spark-line" points="" fill="none" stroke="#34d399" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </div>
 
-          <!-- Hero Metrics -->
-          <div class="hero-row">
-            <div class="hero-card hero-card-pnl" id="hero-pnl" data-glow="neutral">
-              <div class="hero-label">Total PnL</div>
-              <div class="hero-value" id="total-pnl">$0.00</div>
-              <div class="hero-sub">
-                <span>Realized <span id="realized-pnl" class="sub-value">$0.00</span></span>
-                <span class="hero-divider"></span>
-                <span>Unrealized <span id="unrealized-pnl" class="sub-value">$0.00</span></span>
+        <!-- METRICS ROW -->
+        <div class="metrics-grid">
+          <div class="glass metric-card">
+            <div class="metric-value mono" id="avg-pair-cost">--</div>
+            <div class="metric-label">Avg Pair Cost</div>
+          </div>
+          <div class="glass metric-card">
+            <div class="metric-value mono" id="pairs-settled">0</div>
+            <div class="metric-label">Pairs Settled</div>
+          </div>
+          <div class="glass metric-card">
+            <div class="metric-value mono" id="profit-per-pair">--</div>
+            <div class="metric-label">Profit / Pair</div>
+          </div>
+          <div class="glass metric-card">
+            <div class="metric-value mono" id="position-count" style="color:var(--blue)">0</div>
+            <div class="metric-label">Active Positions</div>
+          </div>
+        </div>
+
+        <!-- PER-ASSET PNL ROW -->
+        <div class="asset-pnl-row" id="asset-pnl-row">
+          <div class="asset-pnl-item">
+            <span class="asset-pnl-dot" style="background:var(--orange)"></span>
+            <span class="asset-pnl-name">BTC</span>
+            <span class="asset-pnl-val mono" id="asset-pnl-btc">$0.00</span>
+            <span class="asset-pnl-pairs mono" id="asset-pairs-btc">0 pairs</span>
+          </div>
+          <div class="asset-pnl-item">
+            <span class="asset-pnl-dot" style="background:var(--blue)"></span>
+            <span class="asset-pnl-name">ETH</span>
+            <span class="asset-pnl-val mono" id="asset-pnl-eth">$0.00</span>
+            <span class="asset-pnl-pairs mono" id="asset-pairs-eth">0 pairs</span>
+          </div>
+          <div class="asset-pnl-item">
+            <span class="asset-pnl-dot" style="background:var(--purple)"></span>
+            <span class="asset-pnl-name">SOL</span>
+            <span class="asset-pnl-val mono" id="asset-pnl-sol">$0.00</span>
+            <span class="asset-pnl-pairs mono" id="asset-pairs-sol">0 pairs</span>
+          </div>
+          <div class="asset-pnl-item">
+            <span class="asset-pnl-dot" style="background:var(--cyan)"></span>
+            <span class="asset-pnl-name">XRP</span>
+            <span class="asset-pnl-val mono" id="asset-pnl-xrp">$0.00</span>
+            <span class="asset-pnl-pairs mono" id="asset-pairs-xrp">0 pairs</span>
+          </div>
+        </div>
+
+        <!-- RISK STRIP -->
+        <div class="risk-strip" id="risk-bar">
+          <div class="risk-pill green" id="risk-exposure"><span class="risk-dot green"></span><span>Exposure: 100%</span></div>
+          <div class="risk-pill green" id="risk-daily-pnl"><span class="risk-dot green"></span><span>Daily: $0.00</span></div>
+          <div class="risk-pill green" id="risk-capital"><span class="risk-dot green"></span><span>Capital: 0%</span></div>
+          <div class="risk-pill green" id="risk-status"><span class="risk-dot green"></span><span>NORMAL</span></div>
+        </div>
+
+        <!-- Hidden fields for backward compat -->
+        <span id="trade-count" style="display:none">0</span>
+        <span id="best-pair-cost" style="display:none">--</span>
+        <span id="risk-consec" style="display:none"></span>
+
+        <!-- PRICE BAR -->
+        <div class="price-bar glass" id="price-strip"></div>
+
+        <!-- TWO-COLUMN MAIN -->
+        <div class="main-grid">
+          <!-- LEFT: Position Cards -->
+          <div class="left-col">
+            <div id="position-cards-container"></div>
+          </div>
+
+          <!-- RIGHT: Settlement + Activity + Risk Analytics -->
+          <div class="right-col">
+            <!-- Settlement History -->
+            <div class="settle-card glass" id="settlement-panel">
+              <div class="settle-header">
+                <span class="settle-title">Settlements</span>
+                <span class="settle-total" id="settlement-total-pnl">$0.00</span>
               </div>
-              <div class="sparkline-container">
-                <svg id="sparkline" class="sparkline" viewBox="0 0 240 48" preserveAspectRatio="none">
-                  <defs>
-                    <linearGradient id="spark-grad" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="0%" id="spark-grad-stop" stop-color="rgba(63,185,80,0.3)"/>
-                      <stop offset="100%" stop-color="transparent"/>
-                    </linearGradient>
-                  </defs>
-                  <path id="spark-fill" d="" fill="url(#spark-grad)"/>
-                  <polyline id="spark-line" points="" fill="none" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
-                </svg>
-              </div>
-            </div>
-
-            <div class="hero-card" data-glow="blue">
-              <div class="hero-label">Trades</div>
-              <div class="hero-value" id="trade-count">0</div>
-              <div class="hero-sub">
-                <span>Positions <span id="position-count" class="sub-value">0</span></span>
-                <span class="hero-divider"></span>
-                <span>Runtime <span id="runtime" class="sub-value">0s</span></span>
-              </div>
-            </div>
-
-            <div class="hero-card" data-glow="blue">
-              <div class="hero-label">Pairs Completed</div>
-              <div class="hero-value" id="pairs-completed">0</div>
-              <div class="hero-sub">
-                <span>Avg Pair Cost <span id="avg-pair-cost" class="sub-value">--</span></span>
-                <span class="hero-divider"></span>
-                <span>Imbalance <span id="imbalance-ratio" class="sub-value">--</span></span>
-              </div>
-            </div>
-          </div>
-
-          <!-- Multi-Asset Price Strip -->
-          <div class="price-strip-header" id="price-strip-header">Polymarket Live Prices</div>
-          <div class="price-strip" id="price-strip">
-            <div class="price-strip-item" id="strip-BTC">
-              <span class="strip-sym">BTC</span>
-              <span class="strip-price mono" id="strip-price-BTC">--</span>
-            </div>
-            <div class="price-strip-item" id="strip-ETH">
-              <span class="strip-sym">ETH</span>
-              <span class="strip-price mono" id="strip-price-ETH">--</span>
-            </div>
-            <div class="price-strip-item" id="strip-SOL">
-              <span class="strip-sym">SOL</span>
-              <span class="strip-price mono" id="strip-price-SOL">--</span>
-            </div>
-            <div class="price-strip-item" id="strip-XRP">
-              <span class="strip-sym">XRP</span>
-              <span class="strip-price mono" id="strip-price-XRP">--</span>
-            </div>
-          </div>
-
-          <!-- Binance Price Strip -->
-          <div class="price-strip-header" id="binance-strip-header">Binance Live Prices</div>
-          <div class="price-strip" id="binance-strip">
-            <div class="price-strip-item" id="binance-strip-BTC">
-              <span class="strip-sym">BTC</span>
-              <span class="strip-price mono" id="binance-price-BTC">--</span>
-            </div>
-            <div class="price-strip-item" id="binance-strip-ETH">
-              <span class="strip-sym">ETH</span>
-              <span class="strip-price mono" id="binance-price-ETH">--</span>
-            </div>
-            <div class="price-strip-item" id="binance-strip-SOL">
-              <span class="strip-sym">SOL</span>
-              <span class="strip-price mono" id="binance-price-SOL">--</span>
-            </div>
-            <div class="price-strip-item" id="binance-strip-XRP">
-              <span class="strip-sym">XRP</span>
-              <span class="strip-price mono" id="binance-price-XRP">--</span>
-            </div>
-          </div>
-
-          <!-- Multi-Market Grid -->
-          <div class="market-grid" id="market-grid">
-            <div class="panel-header">Active Markets</div>
-            <div class="market-grid-cards" id="market-grid-cards">
-              <div class="market-grid-empty">Discovering markets...</div>
-            </div>
-          </div>
-
-          <!-- Activity & Trades -->
-          <div class="content-grid whale-full-width">
-            <div class="panel-card trades-panel">
-              <div class="panel-header">Activity Feed</div>
-              <div class="trades-table-wrap" id="activity-feed-wrap">
-                <div id="activity-feed-list" class="activity-feed-list">
-                  <div class="trade-empty-row">No activity yet</div>
+              <div id="settlement-list-wrap">
+                <div id="settlement-list">
+                  <div class="trade-empty-row">No settlements yet</div>
                 </div>
               </div>
-              <div class="trades-table-wrap">
-                <table class="trades-table" id="trades-table">
-                  <thead>
-                    <tr>
-                      <th>Time</th>
-                      <th>Side</th>
-                      <th>Market</th>
-                      <th>Price</th>
-                      <th>Rungs</th>
-                      <th>USD</th>
-                    </tr>
-                  </thead>
-                  <tbody id="trades-tbody">
-                    <tr class="trade-empty-row"><td colspan="6">No trades yet</td></tr>
-                  </tbody>
-                </table>
+            </div>
+
+            <!-- Activity Feed -->
+            <div class="activity-card glass">
+              <div class="activity-title">Activity</div>
+              <div class="activity-feed" id="activity-feed">
+                <div class="trade-empty-row">No activity yet</div>
+              </div>
+            </div>
+
+            <!-- Risk Analytics -->
+            <div class="risk-analytics-card glass" id="risk-analytics">
+              <div class="risk-analytics-title">Risk Analytics</div>
+
+              <!-- Pair Cost Distribution -->
+              <div class="risk-section-title">Pair Cost Distribution</div>
+              <div id="pair-cost-dist">
+                <div class="trade-empty-row">No data yet</div>
+              </div>
+
+              <!-- Per-Timeframe Performance -->
+              <div class="risk-section-title" style="margin-top:18px">Per-Timeframe Performance</div>
+              <table class="tf-table" id="tf-perf-table">
+                <thead>
+                  <tr>
+                    <th>Timeframe</th>
+                    <th>Pairs</th>
+                    <th>Avg PC</th>
+                    <th>PnL</th>
+                  </tr>
+                </thead>
+                <tbody id="tf-perf-body">
+                  <tr><td colspan="4" style="text-align:center;color:var(--text-muted);font-style:italic">No data yet</td></tr>
+                </tbody>
+              </table>
+
+              <!-- Session Stats -->
+              <div class="session-stats" id="session-stats">
+                <div class="session-stat">
+                  <div class="session-stat-val" id="stat-max-drawdown" style="color:var(--text-muted)">--</div>
+                  <div class="session-stat-label">Max Drawdown</div>
+                </div>
+                <div class="session-stat">
+                  <div class="session-stat-val" id="stat-best-settle" style="color:var(--text-muted)">--</div>
+                  <div class="session-stat-label">Best Settlement</div>
+                </div>
+                <div class="session-stat">
+                  <div class="session-stat-val" id="stat-pairs-hour" style="color:var(--text-muted)">--</div>
+                  <div class="session-stat-label">Pairs / Hour</div>
+                </div>
               </div>
             </div>
           </div>
-        </section>
-      </main>
+        </div>
+
+      </section>
+
+      <!-- ======================== CONFIG ======================== -->
+      <section id="panel-config" class="panel">
+        <!-- Config Status Card — mode / balance / wallet / cred status at a glance -->
+        <div class="config-status-card glass" id="config-status-card">
+          <div class="config-status-grid">
+            <div class="config-status-item">
+              <div class="config-status-label">Mode</div>
+              <div class="config-status-value" id="cfg-status-mode">--</div>
+            </div>
+            <div class="config-status-item">
+              <div class="config-status-label">Balance</div>
+              <div class="config-status-value" id="cfg-status-balance">--</div>
+            </div>
+            <div class="config-status-item">
+              <div class="config-status-label">Wallet</div>
+              <div class="config-status-value mono" id="cfg-status-wallet">—</div>
+            </div>
+            <div class="config-status-item">
+              <div class="config-status-label">Credentials</div>
+              <div class="config-status-value" id="cfg-status-creds">—</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Credentials (collapsible) -->
+        <details class="config-details">
+          <summary class="config-summary">Live Trading Credentials</summary>
+          <form id="config-form" class="config-form">
+            <div class="form-section">
+              <div class="field">
+                <label for="private_key">Private Key (0x...)</label>
+                <input type="password" id="private_key" name="private_key" placeholder="0x..." />
+              </div>
+              <div class="field">
+                <label for="api_key">API Key</label>
+                <input type="password" id="api_key" name="api_key" />
+              </div>
+              <div class="field">
+                <label for="api_secret">API Secret</label>
+                <input type="password" id="api_secret" name="api_secret" />
+              </div>
+              <div class="field">
+                <label for="api_passphrase">API Passphrase</label>
+                <input type="password" id="api_passphrase" name="api_passphrase" />
+              </div>
+            </div>
+            <div class="cred-status" id="cred-status"></div>
+            <button type="submit" class="header-btn btn-start">Save Credentials</button>
+          </form>
+        </details>
+
+        <!-- Bot Restart -->
+        <div class="config-details" style="margin-top:12px;padding:12px 14px">
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">
+            <div>
+              <div style="font-weight:600">Restart Bot</div>
+              <div class="field-hint">
+                Applies persisted mode / credential changes. Cancels resting orders gracefully, then re-launches with fresh config.
+              </div>
+            </div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap">
+              <button type="button" id="btn-restart" class="header-btn btn-stop">Restart Bot</button>
+              <button type="button" id="btn-restart-reset" class="header-btn btn-stop" style="display:none">Restart &amp; Reset Paper</button>
+            </div>
+          </div>
+          <div id="restart-reset-hint" class="field-hint" style="margin-top:8px;display:none">
+            Reset Paper archives settlement + activity logs and reseeds the bankroll to DRY_RUN_BANKROLL. Paper mode only — disabled in live.
+          </div>
+        </div>
+
+        <!-- Settings -->
+        <form id="settings-form" class="config-form">
+
+          <!-- Bankroll Tier Recommendation Panel -->
+          <div class="tier-panel glass" id="tier-panel">
+            <div class="tier-header">
+              <span class="tier-title">Your Trading Profile</span>
+              <span class="tier-badge" id="tier-badge">--</span>
+            </div>
+            <div class="tier-bankroll-display" id="tier-bankroll-display">$1,000</div>
+            <div class="profile-grid" id="tier-profile-grid">
+              <!-- Populated by JS -->
+            </div>
+            <div class="recommendation" id="tier-recommendation"></div>
+            <div class="progression-section">
+              <div class="progression-label">Tier Progression</div>
+              <div class="progression-bar-wrap" id="progression-bar-wrap">
+                <div class="progression-track">
+                  <div class="progression-segment micro" style="flex:1"></div>
+                  <div class="progression-segment small" style="flex:1"></div>
+                  <div class="progression-segment medium" style="flex:4"></div>
+                  <div class="progression-segment standard" style="flex:2"></div>
+                </div>
+                <div class="progression-marker" id="progression-marker" style="left:0%">
+                  <div class="marker-label" id="progression-marker-label">You: $0</div>
+                  <div class="marker-arrow"></div>
+                </div>
+              </div>
+              <div class="progression-labels" style="margin-top:16px">
+                <span class="prog-label" style="position:absolute;left:0">$100</span>
+                <span class="prog-label" style="position:absolute;left:12.5%">$200</span>
+                <span class="prog-label" style="position:absolute;left:25%">$400</span>
+                <span class="prog-label" style="position:absolute;right:0">$2,000+</span>
+              </div>
+            </div>
+            <div class="next-tier" id="next-tier-section">
+              <!-- Populated by JS -->
+            </div>
+          </div>
+
+          <!-- Bankroll -->
+          <div class="form-section form-section-demo">
+            <div class="form-section-title">Bankroll</div>
+            <div class="field" id="bankroll-field">
+              <label for="s_bankroll">Bankroll ($)</label>
+              <div class="input-with-unit" style="display:flex;gap:8px;align-items:stretch">
+                <div style="position:relative;flex:1">
+                  <span class="input-prefix">$</span>
+                  <input type="number" id="s_bankroll" name="bankroll" value="1000" min="10" max="1000000" step="10" style="width:100%" />
+                </div>
+                <button type="button" id="btn-refresh-balance" class="header-btn btn-secondary" style="display:none;white-space:nowrap">Refresh balance</button>
+              </div>
+              <span class="field-hint" id="bankroll-hint">Ladder sizing, rungs, and position fractions are auto-calculated from this amount</span>
+            </div>
+            <input type="checkbox" id="s_dry_run" style="display:none" checked />
+          </div>
+
+          <!-- Markets -->
+          <div class="form-section form-section-markets">
+            <div class="form-section-title">Markets</div>
+            <span class="field-hint" style="margin-bottom:8px;display:block">Choose which crypto up/down markets the bot trades</span>
+            <div class="asset-grid" id="asset-grid">
+              <label class="asset-option active" id="asset-opt-btc">
+                <input type="checkbox" id="s_trade_btc" name="trade_btc" checked style="display:none" />
+                <span class="asset-dot" style="background:#f7931a"></span>
+                <span class="asset-name">BTC</span>
+                <span class="asset-sub" id="asset-sub-btc">Available</span>
+              </label>
+              <label class="asset-option active" id="asset-opt-eth">
+                <input type="checkbox" id="s_trade_eth" name="trade_eth" checked style="display:none" />
+                <span class="asset-dot" style="background:var(--blue)"></span>
+                <span class="asset-name">ETH</span>
+                <span class="asset-sub" id="asset-sub-eth">Available</span>
+              </label>
+              <label class="asset-option" id="asset-opt-sol">
+                <input type="checkbox" id="s_trade_sol" name="trade_sol" checked style="display:none" />
+                <span class="asset-dot" style="background:var(--purple)"></span>
+                <span class="asset-name">SOL</span>
+                <span class="asset-sub" id="asset-sub-sol">Available</span>
+              </label>
+              <label class="asset-option" id="asset-opt-xrp">
+                <input type="checkbox" id="s_trade_xrp" name="trade_xrp" checked style="display:none" />
+                <span class="asset-dot" style="background:var(--teal)"></span>
+                <span class="asset-name">XRP</span>
+                <span class="asset-sub" id="asset-sub-xrp">Available</span>
+              </label>
+            </div>
+          </div>
+
+          <!-- Timeframes -->
+          <div class="form-section form-section-timeframes">
+            <div class="form-section-title">Timeframes</div>
+            <div class="tf-grid" id="tf-grid">
+              <!-- 5m -->
+              <label class="tf-option" id="tf-opt-5m">
+                <input type="checkbox" id="s_trade_5m" name="trade_5m" checked style="display:none" />
+                <span class="tf-tag lock" id="tf-tag-5m" style="display:none">$2K+</span>
+                <span class="tf-badge blue">5m</span>
+                <span class="tf-name">Five Minutes</span>
+                <div class="tf-check">
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="var(--green)" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg>
+                </div>
+                <div class="tf-stats" id="tf-stats-5m">
+                  High frequency
+                </div>
+              </label>
+              <!-- 15m -->
+              <label class="tf-option active" id="tf-opt-15m">
+                <input type="checkbox" id="s_trade_15m" name="trade_15m" checked style="display:none" />
+                <span class="tf-badge purple">15m</span>
+                <span class="tf-name">Fifteen Minutes</span>
+                <div class="tf-check">
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="var(--green)" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg>
+                </div>
+                <div class="tf-stats" id="tf-stats-15m">
+                  Good volume
+                </div>
+              </label>
+              <!-- 1h -->
+              <label class="tf-option recommended" id="tf-opt-1h">
+                <input type="checkbox" id="s_trade_1h" name="trade_1h" checked style="display:none" />
+                <span class="tf-tag rec">Best</span>
+                <span class="tf-badge yellow">1h</span>
+                <span class="tf-name">One Hour</span>
+                <div class="tf-check">
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="var(--green)" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg>
+                </div>
+                <div class="tf-stats" id="tf-stats-1h">
+                  Best fills
+                </div>
+              </label>
+            </div>
+          </div>
+
+          <button type="submit" class="header-btn btn-start" style="margin-top:12px">Save Settings</button>
+        </form>
+      </section>
+
     </div>
 
     <!-- Toast Container -->
@@ -185,56 +474,11 @@
       <div class="modal-card">
         <div class="modal-body" id="modal-body"></div>
         <div class="modal-actions">
-          <button class="btn btn-secondary" id="modal-cancel">Cancel</button>
-          <button class="btn btn-danger" id="modal-confirm">Confirm</button>
+          <button class="header-btn btn-secondary" id="modal-cancel">Cancel</button>
+          <button class="header-btn btn-danger" id="modal-confirm">Confirm</button>
         </div>
       </div>
     </div>
 
-    <!-- Market Detail Modal -->
-    <div class="market-detail-overlay" id="market-detail-overlay" style="display:none">
-      <div class="market-detail-card">
-        <div class="market-detail-header">
-          <span class="market-detail-title" id="md-title">--</span>
-          <button class="market-detail-close" id="md-close">&times;</button>
-        </div>
-        <a class="market-detail-link" id="md-link" href="#" target="_blank">Open on Polymarket</a>
-        <div class="market-detail-question" id="md-question"></div>
-        <div class="market-detail-stats">
-          <div class="md-stat">
-            <span class="md-stat-label">Current Price</span>
-            <span class="md-stat-value" id="md-current-price">--</span>
-          </div>
-          <div class="md-stat">
-            <span class="md-stat-label">Spread Width</span>
-            <span class="md-stat-value" id="md-spread-width">--</span>
-          </div>
-          <div class="md-stat">
-            <span class="md-stat-label">Rungs Filled</span>
-            <span class="md-stat-value" id="md-rungs-filled">--</span>
-          </div>
-          <div class="md-stat">
-            <span class="md-stat-label">Imbalance</span>
-            <span class="md-stat-value" id="md-imbalance">--</span>
-          </div>
-          <div class="md-stat">
-            <span class="md-stat-label">Up Price</span>
-            <span class="md-stat-value" id="md-up-ask">--</span>
-          </div>
-          <div class="md-stat">
-            <span class="md-stat-label">Down Price</span>
-            <span class="md-stat-value" id="md-down-ask">--</span>
-          </div>
-        </div>
-        <div class="md-section-label">Position</div>
-        <div class="md-position" id="md-position">
-          <span class="trade-empty-row">No position</span>
-        </div>
-        <div class="md-section-label">Trades in this market</div>
-        <div class="md-trades" id="md-trades">
-          <div class="trade-empty-row">No trades in this market</div>
-        </div>
-      </div>
-    </div>
   </body>
 </html>
