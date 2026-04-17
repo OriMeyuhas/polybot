@@ -158,6 +158,9 @@ class BotConfig:
     max_capital_at_risk_pct: float = 0.40
     coingecko_ids: tuple = ("bitcoin", "ethereum", "solana", "ripple")
     bankroll: float = 1000.0  # Default paper bankroll; overridable via env
+    # Paper-mode reset seed — used by /api/restart-reset to reseed the bankroll when
+    # the user wants a clean paper slate. Live mode ignores this (on-chain balance wins).
+    dry_run_bankroll: float = 10000.0
 
     # Pair recovery parameters
     boost_elapsed_pct: float = 0.20       # Phase D: min fraction of window elapsed before boost
@@ -204,8 +207,11 @@ class BotConfig:
     # one-sided ladders. When FV gate or spot skip forces 100% of budget onto one
     # side, cap that budget at this absolute dollar amount regardless of bankroll.
     # Sized from 2026-04-11 outlier analysis: $20 optimum on 49-stl session.
-    # Proposal #53.
-    directional_budget_cap: float = 20.0
+    # Tightened to $18 on 2026-04-17 to add headroom under fees/slippage — observed
+    # max loss -$22.62 in recent paper run (root cause: paired ladder adverse selection,
+    # not intentional directional — this cap still only binds on FV/book-mid/spot gates,
+    # the $18 value reduces tail for those intentional one-sided posts). Proposal #53.
+    directional_budget_cap: float = 18.0
 
     # FV directional gate — when enabled, skips the losing side at cert >= 80%.
     # Disabled 2026-04-11: 500ms-delay removal killed info-arb edge, FV calibration
@@ -215,6 +221,17 @@ class BotConfig:
     # NOTE: fv_gate_certainty_threshold (hardcoded 0.80 in ladder_manager.py) is
     # inert when fv_gate_enabled=False — the threshold check is never reached.
     fv_gate_enabled: bool = False
+
+    # Book-mid entry gate (Proposal #1, holdout-validated 2026-04-17).
+    # Independent of fv_gate_enabled. Reads CLOB book midpoint at window open;
+    # when both sides have a tight book AND normalized mid-based certainty
+    # (2 * |book_mid_up - 0.5|) >= book_mid_gate_certainty_threshold, skips
+    # the losing side entirely and caps directional budget at
+    # directional_budget_cap. The winning backtest used 0.65 threshold.
+    # Gate suppressed if either side spread > book_mid_gate_max_spread.
+    book_mid_gate_enabled: bool = False
+    book_mid_gate_certainty_threshold: float = 0.65
+    book_mid_gate_max_spread: float = 0.05
 
     def get_ladder_params(self, timeframe_sec: int, current_bankroll: float | None = None) -> LadderParams:
         """Return ladder parameters tuned for the given timeframe.
@@ -259,6 +276,14 @@ class BotConfig:
 def validate_live_config(cfg: BotConfig) -> list[str]:
     """Validate config bounds for live trading. Returns list of error messages."""
     errors = []
+    # Live-only guard: MAX_PAIR_COST > 1.00 is a guaranteed loss per pair in live mode
+    # (you pay more for the pair than settlement ever pays out). Allowed in paper for
+    # backtest comparison / exploration, but must never ship live.
+    if cfg.max_pair_cost > 1.00:
+        errors.append(
+            f"refusing to start live with MAX_PAIR_COST > 1.00 — guaranteed loss "
+            f"(max_pair_cost={cfg.max_pair_cost})"
+        )
     if cfg.position_size_fraction > 0.30:
         errors.append(f"position_size_fraction={cfg.position_size_fraction} exceeds 0.30 safety limit")
     if cfg.max_daily_drawdown_pct > 0.20:
@@ -445,6 +470,7 @@ def load_bot_config() -> BotConfig:
         market_ws_ping_sec=float(os.getenv("MARKET_WS_PING_SEC", "10.0")),
         book_stale_sec=float(os.getenv("BOOK_STALE_SEC", "30.0")),
         bankroll=float(os.getenv("BANKROLL", "1000.0")),
+        dry_run_bankroll=float(os.getenv("DRY_RUN_BANKROLL", "10000.0")),
         trade_5m=os.getenv("TRADE_5M", "true").lower() in ("true", "1", "yes"),
         trade_15m=os.getenv("TRADE_15M", "true").lower() in ("true", "1", "yes"),
         trade_1h=os.getenv("TRADE_1H", "true").lower() in ("true", "1", "yes"),
@@ -477,8 +503,11 @@ def load_bot_config() -> BotConfig:
         spot_delta_skip_threshold=float(os.getenv("SPOT_DELTA_SKIP_THRESHOLD", "0.005")),
         spot_gate_force_buy_threshold=float(os.getenv("SPOT_GATE_FORCE_BUY_THRESHOLD", "0.003")),
         spot_loss_cap_multiplier=float(os.getenv("SPOT_LOSS_CAP_MULTIPLIER", "0.50")),
-        directional_budget_cap=float(os.getenv("DIRECTIONAL_BUDGET_CAP", "20.0")),
+        directional_budget_cap=float(os.getenv("DIRECTIONAL_BUDGET_CAP", "18.0")),
         fv_gate_enabled=os.getenv("FV_GATE_ENABLED", "false").lower() in ("true", "1", "yes"),
+        book_mid_gate_enabled=os.getenv("BOOK_MID_GATE_ENABLED", "false").lower() in ("true", "1", "yes"),
+        book_mid_gate_certainty_threshold=float(os.getenv("BOOK_MID_GATE_CERTAINTY_THRESHOLD", "0.65")),
+        book_mid_gate_max_spread=float(os.getenv("BOOK_MID_GATE_MAX_SPREAD", "0.05")),
     )
 
 

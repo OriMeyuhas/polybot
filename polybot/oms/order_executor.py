@@ -385,6 +385,18 @@ class OrderExecutor:
             return float(book.asks[0].price)
         return None
 
+    def get_best_bid(self, token_id: str) -> float | None:
+        """Return best bid price, or None if no bids.  ClobApiError propagates."""
+        try:
+            book = self.client.get_order_book(token_id)
+        except ClobApiError:
+            raise
+        except Exception as e:
+            raise _make_clob_error(e) from e
+        if book is not None and book.bids:
+            return float(book.bids[0].price)
+        return None
+
     def get_midpoint(self, token_id: str) -> float | None:
         """Return CLOB midpoint for a token, or None."""
         try:

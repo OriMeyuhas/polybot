@@ -36,6 +36,25 @@ from polybot.types import MarketWindow, Side, ActivityEvent
 from polybot.web.state import GuiStateHolder
 from polybot import market_logger
 
+
+def _ui_price_to_beat(mkt, chainlink_price, binance_snapshot) -> float:
+    """Resolve the value displayed in the UI as "Target" / Price to Beat.
+
+    Must match Polymarket's displayed "Price to Beat" exactly. That value is the
+    Gamma API's `priceToBeat` field (stored on MarketWindow.price_to_beat), so use
+    it whenever present. Chainlink/Binance are fallbacks only — they drift by a few
+    dollars from the strike that Polymarket publishes and resolves against.
+    """
+    gamma = getattr(mkt, "price_to_beat", None)
+    if gamma:
+        try:
+            val = float(gamma)
+            if val > 0:
+                return val
+        except (ValueError, TypeError):
+            pass
+    return float(chainlink_price or binance_snapshot or 0)
+
 logger = logging.getLogger(__name__)
 
 # How often to print a status summary (seconds)
@@ -179,26 +198,40 @@ class Bot:
         self._start_time = time.time()
         self.gui_state.update(running=True, mode=self.mode)
 
-        # Initial balance fetch so first ladder is sized correctly
+        # Initial balance fetch so first ladder is sized correctly.
+        # In live mode the on-chain USDC balance is AUTHORITATIVE — .env BANKROLL is
+        # informational only (stale from last paper run) and must be overridden. If the
+        # balance query fails or returns 0 we refuse to proceed rather than silently
+        # trading with a mis-sized paper bankroll against real money.
         if not self.cfg.dry_run:
+            env_bankroll = self.cfg.bankroll  # snapshot what .env said, for logging
             try:
                 result = await asyncio.to_thread(self._fetch_live_balance)
-                raw = result.get("balance")
-                if raw is not None:
-                    balance = float(raw) / 1e6
-                    if balance > 0:
-                        self._wallet_balance = balance
-                        self.position_manager.update_bankroll(balance)
-                        self._balance_poll_failures = 0
-                        logger.info("Initial wallet balance: $%.2f", balance)
-                    else:
-                        self._balance_poll_failures += 1
-                        logger.warning("Initial balance returned $0 — using configured bankroll $%.2f", self._wallet_balance)
-                else:
-                    self._balance_poll_failures += 1
-                    logger.warning("Initial balance malformed — using configured bankroll $%.2f", self._wallet_balance)
             except Exception as e:
-                logger.warning("Initial balance fetch failed: %s", e)
+                raise RuntimeError(
+                    f"[LIVE] Initial on-chain balance fetch failed: {e}. "
+                    f"Refusing to start live with stale .env BANKROLL=${env_bankroll:.2f}."
+                ) from e
+            raw = result.get("balance") if isinstance(result, dict) else None
+            if raw is None:
+                raise RuntimeError(
+                    f"[LIVE] On-chain balance response malformed (no 'balance' field): {result!r}. "
+                    f"Refusing to start live with stale .env BANKROLL=${env_bankroll:.2f}."
+                )
+            balance = float(raw) / 1e6
+            if balance <= 0:
+                raise RuntimeError(
+                    f"[LIVE] On-chain USDC balance is ${balance:.2f} — wallet not funded. "
+                    f"Refusing to start live with stale .env BANKROLL=${env_bankroll:.2f}."
+                )
+            self._wallet_balance = balance
+            self.position_manager.update_bankroll(balance)
+            self.risk.starting_bankroll = balance
+            self._balance_poll_failures = 0
+            logger.warning(
+                "[LIVE] Bankroll from on-chain: $%.2f (ignoring .env BANKROLL=$%.2f)",
+                balance, env_bankroll,
+            )
 
             # Cancel stale orders from previous session (gate on failure)
             try:
@@ -1916,9 +1949,10 @@ class Bot:
                 "window_status": window_status,
                 "opens_in_sec": opens_in_sec,
                 "spot_delta": spot_delta,
-                "price_to_beat": float(
-                    self.rtds_feed.price_at_timestamp(mkt.asset, mkt.open_epoch)
-                    or self.window_open_prices.get(mkt.market_id, 0)
+                "price_to_beat": _ui_price_to_beat(
+                    mkt,
+                    self.rtds_feed.price_at_timestamp(mkt.asset, mkt.open_epoch),
+                    self.window_open_prices.get(mkt.market_id, 0),
                 ),
             }
 

@@ -72,7 +72,10 @@ class Heartbeat:
         self._running = True
         while self._running:
             try:
-                client.post_heartbeat()
+                # Run sync HTTP call in thread to avoid blocking the event loop
+                await asyncio.get_event_loop().run_in_executor(
+                    None, client.post_heartbeat
+                )
                 self._record_success()
             except Exception as e:
                 self._record_failure()

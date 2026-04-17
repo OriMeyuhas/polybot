@@ -38,8 +38,21 @@ class MarketWSClient:
     def _backoff_delay(self) -> float:
         return min(2 ** self._reconnect_count, 60.0)
 
+    async def _send_subscribe(self, token_ids: list[str]) -> None:
+        """Send subscribe message to the connected WebSocket."""
+        if self._ws and self._is_connected and token_ids:
+            try:
+                msg = self._build_subscribe_msg(token_ids)
+                await self._ws.send(json.dumps(msg))
+                logger.info("Market WS subscribed to %d tokens", len(token_ids))
+            except Exception as e:
+                logger.warning("Market WS subscribe failed: %s", e)
+
     def update_subscriptions(self, token_ids: list[str]) -> None:
         self._token_ids = list(token_ids)
+        # Send live re-subscribe if already connected
+        if self._ws and self._is_connected:
+            asyncio.ensure_future(self._send_subscribe(token_ids))
 
     async def run(self, token_ids: list[str]) -> None:
         import websockets
@@ -65,11 +78,15 @@ class MarketWSClient:
                         async for raw in ws:
                             if not self._running:
                                 break
+                            if not raw:
+                                continue  # empty frame (heartbeat/ack)
                             try:
                                 msg = json.loads(raw)
                                 self._on_message(msg)
-                            except (json.JSONDecodeError, Exception) as e:
-                                logger.warning("Market WS parse error: %s", e)
+                            except json.JSONDecodeError:
+                                logger.debug("Market WS empty/malformed message: %r", raw[:80] if raw else "")
+                            except Exception as e:
+                                logger.warning("Market WS message handler error: %s", e)
                     finally:
                         ping_task.cancel()
                         self._tasks.remove(ping_task)

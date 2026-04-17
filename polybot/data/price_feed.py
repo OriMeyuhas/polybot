@@ -48,6 +48,56 @@ class MultiAssetPriceFeed:
     def get_price(self, asset: str) -> Decimal | None:
         return self._prices.get(asset)
 
+    def get_price_age(self, asset: str) -> float | None:
+        """Age in seconds of the cached price, or None if never received."""
+        ts = self._last_ts.get(asset)
+        if ts is None:
+            return None
+        return time.time() - ts
+
+    def get_price_if_fresh(self, asset: str, max_age_sec: float) -> Decimal | None:
+        """Return cached price only if updated within *max_age_sec*; else None."""
+        age = self.get_price_age(asset)
+        if age is None or age > max_age_sec:
+            return None
+        return self._prices.get(asset)
+
+    @staticmethod
+    async def fetch_binance_candle_open(asset: str, interval: str, open_epoch: int) -> float | None:
+        """Fetch the Binance candle open price for a specific timestamp.
+
+        Args:
+            asset: "BTC", "ETH", etc.
+            interval: Binance kline interval ("1h", "15m", "5m")
+            open_epoch: Unix epoch of the candle start
+
+        Returns open price as float, or None if unavailable.
+        """
+        pair = _ASSET_TO_PAIR.get(asset)
+        if not pair:
+            return None
+        url = f"https://api.binance.com/api/v3/klines?symbol={pair.upper()}&interval={interval}&startTime={open_epoch * 1000}&limit=1"
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                resp = await client.get(url)
+                resp.raise_for_status()
+                data = resp.json()
+                if data and len(data) > 0:
+                    # Kline format: [open_time, open, high, low, close, ...]
+                    return float(data[0][1])
+        except Exception as e:
+            logger.warning("Failed to fetch Binance candle open for %s %s: %s", asset, interval, e)
+        return None
+
+    def is_fresh(self, max_age_sec: float) -> bool:
+        """True if ALL configured assets have prices younger than *max_age_sec*."""
+        now = time.time()
+        for asset in self._assets:
+            ts = self._last_ts.get(asset)
+            if ts is None or (now - ts) > max_age_sec:
+                return False
+        return True
+
     def _update_price(self, asset: str, price: Decimal) -> None:
         self._prices[asset] = price
         self._last_ts[asset] = time.time()
@@ -60,7 +110,11 @@ class MultiAssetPriceFeed:
             for a in self._assets
             if a in _ASSET_TO_PAIR
         )
-        return f"{self._ws_base_url}/stream?streams={streams}"
+        # Strip trailing /ws — combined stream uses /stream?streams=
+        base = self._ws_base_url.rstrip("/")
+        if base.endswith("/ws"):
+            base = base[:-3]
+        return f"{base}/stream?streams={streams}"
 
     def _coingecko_id(self, asset: str) -> str | None:
         idx = list(self._assets).index(asset) if asset in self._assets else -1

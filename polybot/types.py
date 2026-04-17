@@ -39,11 +39,10 @@ class Position:
     dn_cost: float = 0.0
 
     def pair_cost(self) -> float:
-        """Cost per balanced pair: (total_up_cost + total_dn_cost) / min(up_qty, dn_qty)."""
-        mq = self.min_qty()
-        if mq <= 0:
+        """Cost per balanced pair: up_vwap + dn_vwap."""
+        if self.up_qty <= 0 or self.dn_qty <= 0:
             return 0.0
-        return (self.up_cost + self.dn_cost) / mq
+        return (self.up_cost / self.up_qty) + (self.dn_cost / self.dn_qty)
 
     def min_qty(self) -> float:
         return min(self.up_qty, self.dn_qty)
@@ -73,6 +72,7 @@ class MarketWindow:
     dn_token_id: str
     open_epoch: int
     close_epoch: int
+    price_to_beat: str = ""
 
     def elapsed(self, now_epoch: int) -> int:
         return max(0, now_epoch - self.open_epoch)
@@ -82,6 +82,10 @@ class MarketWindow:
 
     def is_active(self, now_epoch: int) -> bool:
         return self.open_epoch <= now_epoch < self.close_epoch
+
+    def is_pre_open(self, now_epoch: int, pre_open_sec: int = 30) -> bool:
+        """True if window opens within pre_open_sec seconds."""
+        return self.open_epoch - pre_open_sec <= now_epoch < self.open_epoch
 
 
 @dataclass
@@ -103,3 +107,4 @@ class ActivityEvent:
     asset: str
     detail: str
     pnl: float | None = None
+    meta: dict | None = None  # structured data for rich UI rendering

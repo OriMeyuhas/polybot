@@ -984,6 +984,50 @@ class LadderManager:
                 width_factor = max(0.6, min(1.5, vol_ratio))
                 effective_width = lp.width * width_factor
 
+            # Book-mid entry gate (Proposal #1, holdout-validated 2026-04-17).
+            # Independent signal from the Binance-FV gate below. Reads CLOB book mid
+            # at window open; when both sides have a tight/liquid book AND normalized
+            # mid-based certainty (2*|book_mid_up - 0.5|) >= threshold, skips the
+            # losing side and caps directional budget at directional_budget_cap.
+            # Falls through silently (gate not fired) on any None / wide-spread / degenerate case.
+            book_mid_gate_fired = False
+            if self.cfg.book_mid_gate_enabled:
+                _up_mid = self.executor.get_midpoint(market.up_token_id)
+                _dn_mid = self.executor.get_midpoint(market.dn_token_id)
+                _up_bid = self.executor.get_best_bid(market.up_token_id)
+                _up_ask_bmg = self.executor.get_best_ask(market.up_token_id)
+                _dn_bid = self.executor.get_best_bid(market.dn_token_id)
+                _dn_ask_bmg = self.executor.get_best_ask(market.dn_token_id)
+                _max_spread = self.cfg.book_mid_gate_max_spread
+                if (
+                    _up_mid is not None and _dn_mid is not None
+                    and _up_bid is not None and _up_ask_bmg is not None
+                    and _dn_bid is not None and _dn_ask_bmg is not None
+                    and (_up_ask_bmg - _up_bid) <= _max_spread
+                    and (_dn_ask_bmg - _dn_bid) <= _max_spread
+                    and (_up_mid + _dn_mid) > 0.0
+                ):
+                    _book_mid_up = _up_mid / (_up_mid + _dn_mid)
+                    _cert_book = 2.0 * abs(_book_mid_up - 0.5)
+                    if _cert_book >= self.cfg.book_mid_gate_certainty_threshold:
+                        _dir_cap_bmg = self.cfg.directional_budget_cap
+                        _capped_bmg = min(budget, _dir_cap_bmg)
+                        if _book_mid_up > 0.5:
+                            budget_up = _capped_bmg
+                            budget_dn = 0.0
+                            _side_label = "UP"
+                        else:
+                            budget_up = 0.0
+                            budget_dn = _capped_bmg
+                            _side_label = "DN"
+                        book_mid_gate_fired = True
+                        logger.info(
+                            "BOOK MID GATE: %s cert=%.0f%% %s — skipping loser, "
+                            "budget=$%.2f (cap=$%.2f) book_mid_up=%.3f",
+                            market.market_id, _cert_book * 100, _side_label,
+                            _capped_bmg, _dir_cap_bmg, _book_mid_up,
+                        )
+
             # FV gate: if certainty > 80% at posting time, skip the losing side entirely.
             # Threshold raised from 0.60 to 0.80 — 60% gate fired too often (76-84% loss
             # rate on 452 zero-fill one-sided windows). Only block posting when very confident.
@@ -994,7 +1038,11 @@ class LadderManager:
             # worst-case adverse selection loss per window to ≤$20 (from -$27/-$30 outliers).
             # Orthogonal to is_directional flag — cap operates unconditionally on one-sided posts.
             dir_cap = self.cfg.directional_budget_cap
-            if self.cfg.fv_gate_enabled and cert >= 0.80:
+            if book_mid_gate_fired:
+                # Book-mid gate already decided budget_up / budget_dn. Skip Binance-FV and
+                # spot-delta branches — they would overwrite the gate's decision.
+                pass
+            elif self.cfg.fv_gate_enabled and cert >= 0.80:
                 capped_budget = min(budget, dir_cap)
                 if fair_up > 0.5:
                     # UP is winning — don't post DN
@@ -1472,8 +1520,17 @@ class LadderManager:
             return 0
 
         cert = fv_certainty(fair_up)
-        if cert < 0.75:
-            return 0  # not certain enough to act
+        if cert < 0.90:
+            return 0  # only cancel at very high certainty (calibration: 96.7% at cert>=0.90)
+
+        # Only cancel in the last 150s of the window — FV is unreliable before that.
+        # Researcher analysis: losing-side sweep starts at t=295s median, but FV accuracy
+        # is only 56% mid-window. At t>=750s with cert>=0.90, accuracy is 96.7%.
+        now_ts = time.time()
+        elapsed = now_ts - market.open_epoch
+        window_dur = market.close_epoch - market.open_epoch
+        if window_dur > 0 and elapsed / window_dur < 0.83:
+            return 0  # too early — FV not reliable yet
 
         # Determine losing side
         if fair_up > 0.5:
@@ -1672,6 +1729,15 @@ class LadderManager:
         dn_qty = self.tracker.filled_qty(market_id, Side.DOWN)
         if up_qty + dn_qty < 1.0:
             return False
+
+        # Grace period: bilateral ladders need time for both sides to fill.
+        # Don't abort in the first 30 seconds — give the other side a chance.
+        # After 30s, if still 100% one-sided, then it's a real adverse burst.
+        now = time.time()
+        if state is not None and state.posted_at > 0:
+            elapsed_since_post = now - state.posted_at
+            if elapsed_since_post < 30.0:
+                return False
 
         # Skip check for intentionally directional ladders (FV gate / spot skip posted
         # a one-sided budget). These are EXPECTED to be single-side and the guard would

@@ -11,7 +11,7 @@ class RiskStub:
     def is_halted(self) -> bool:
         return False
 
-    def can_open_position(self, current_count: int) -> bool:
+    def can_open_position(self, current_count: int, max_positions: int | None = None) -> bool:
         return True
 
     def can_trade_in_window(self, market, now_epoch: int) -> bool:

@@ -29,6 +29,24 @@ class PositionManager:
             pos.dn_qty += qty
             pos.dn_cost += cost
 
+    def reduce_position(self, market_id: str, side: Side, qty: float, proceeds: float):
+        """Reduce a position by selling shares. Returns capital recovered."""
+        pos = self.positions.get(market_id)
+        if pos is None:
+            return
+        if side == Side.UP:
+            sold = min(qty, pos.up_qty)
+            if sold > 0 and pos.up_qty > 0:
+                cost_frac = sold / pos.up_qty
+                pos.up_cost -= pos.up_cost * cost_frac
+                pos.up_qty -= sold
+        else:
+            sold = min(qty, pos.dn_qty)
+            if sold > 0 and pos.dn_qty > 0:
+                cost_frac = sold / pos.dn_qty
+                pos.dn_cost -= pos.dn_cost * cost_frac
+                pos.dn_qty -= sold
+
     def remove_position(self, market_id: str):
         self.positions.pop(market_id, None)
 
@@ -61,9 +79,27 @@ class PositionManager:
     def get_failed_settlements(self) -> list[str]:
         return list(self._failed_settlement)
 
+    def equity(self) -> float:
+        """Total portfolio value: free bankroll + capital locked in positions.
+
+        In live mode, bankroll is free USDC and this returns true equity.
+        In paper mode, bankroll already represents full equity, so callers
+        should use bankroll directly instead of this method.
+        """
+        return self.bankroll + self.total_position_cost()
+
     def total_position_cost(self) -> float:
         """Total capital locked in filled positions (up_cost + dn_cost across all)."""
         return sum(p.up_cost + p.dn_cost for p in self.positions.values())
+
+    def failed_settlement_cost(self) -> float:
+        """Total capital locked in positions with failed settlement."""
+        total = 0.0
+        for mid in self._failed_settlement:
+            pos = self.positions.get(mid)
+            if pos:
+                total += pos.up_cost + pos.dn_cost
+        return total
 
     def complete_settlement(self, market_id: str) -> None:
         self._pending_settlement.discard(market_id)

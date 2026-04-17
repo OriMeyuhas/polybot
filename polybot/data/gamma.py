@@ -14,24 +14,38 @@ logger = logging.getLogger(__name__)
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 
-# Slug patterns for crypto up/down markets (match polytrader format)
+# Slug patterns for crypto up/down markets
+# Format 1 (intraday): btc-updown-5m-1773942300
+# Format 2 (hourly):   bitcoin-up-or-down-march-20-2026-11am-et
 CRYPTO_SLUG_PATTERNS = [
     "btc-updown-5m-",
     "btc-updown-15m-",
+    "btc-updown-1h-",
     "eth-updown-5m-",
     "eth-updown-15m-",
+    "eth-updown-1h-",
     "sol-updown-5m-",
     "sol-updown-15m-",
+    "sol-updown-1h-",
     "xrp-updown-5m-",
     "xrp-updown-15m-",
+    "xrp-updown-1h-",
+    # Event-style slugs for 1h markets
+    "bitcoin-up-or-down-",
+    "ethereum-up-or-down-",
+    "solana-up-or-down-",
+    "xrp-up-or-down-",
 ]
 
-# Maps slug prefix to canonical asset name
+# Maps slug prefix to canonical asset name (both compact and event-style)
 ASSET_FROM_SLUG = {
     "btc": "BTC",
     "eth": "ETH",
     "sol": "SOL",
     "xrp": "XRP",
+    "bitcoin": "BTC",
+    "ethereum": "ETH",
+    "solana": "SOL",
 }
 
 
@@ -59,55 +73,111 @@ def _parse_iso(iso_str: str) -> int:
 
 
 def _detect_asset(slug: str) -> str | None:
-    """Detect crypto asset from slug prefix (e.g. 'btc-updown-5m-...' -> 'BTC')."""
+    """Detect crypto asset from slug prefix.
+
+    Handles both compact ('btc-updown-5m-...') and event-style
+    ('bitcoin-up-or-down-march-20-2026-11am-et') slug formats.
+    """
     slug_lower = slug.lower()
-    for prefix, asset in ASSET_FROM_SLUG.items():
+    # Compact format: btc-, eth-, sol-, xrp-
+    for prefix in ("btc", "eth", "sol", "xrp"):
         if slug_lower.startswith(prefix + "-"):
-            return asset
+            return ASSET_FROM_SLUG[prefix]
+    # Event-style: bitcoin-up-or-down-, ethereum-up-or-down-, etc.
+    for long_name in ("bitcoin", "ethereum", "solana"):
+        if slug_lower.startswith(long_name + "-up-or-down-"):
+            return ASSET_FROM_SLUG[long_name]
     return None
 
 
 # Timeframe string -> seconds
 _TIMEFRAME_MAP = {"5m": 300, "15m": 900, "1h": 3600}
 
+_MONTH_NAMES = {
+    "january": 1, "february": 2, "march": 3, "april": 4,
+    "may": 5, "june": 6, "july": 7, "august": 8,
+    "september": 9, "october": 10, "november": 11, "december": 12,
+}
+
+
+def _et_to_utc_epoch(year: int, month: int, day: int, hour: int) -> int:
+    """Convert Eastern Time hour to UTC epoch (handles DST)."""
+    march1 = datetime(year, 3, 1)
+    first_sun_march = march1 + timedelta(days=(6 - march1.weekday()) % 7)
+    dst_start = first_sun_march + timedelta(days=7)
+    nov1 = datetime(year, 11, 1)
+    dst_end = nov1 + timedelta(days=(6 - nov1.weekday()) % 7)
+    dt_naive = datetime(year, month, day, hour, 0, 0)
+    et_offset = timedelta(hours=-4) if dst_start <= dt_naive < dst_end else timedelta(hours=-5)
+    dt_utc = dt_naive - et_offset
+    return int(dt_utc.replace(tzinfo=timezone.utc).timestamp())
+
+
 def parse_slug_timing(slug: str) -> tuple[str, int, int, int] | None:
     """Parse crypto up/down slug to extract (asset, timeframe_sec, open_epoch, close_epoch).
 
-    Handles two slug formats:
-      - btc-updown-5m-1773942300  (epoch suffix)
-      - btc-updown-15m-2026-03-19 (date suffix)
+    Handles three slug formats:
+      - btc-updown-5m-1773942300           (epoch suffix)
+      - btc-updown-15m-2026-03-19          (date suffix)
+      - bitcoin-up-or-down-march-20-2026-11am-et  (event-style 1h)
 
-    Returns None if slug doesn't match the crypto up/down pattern.
+    Returns None if slug doesn't match.
     """
+    # Format 1: compact — {asset}-updown-{Nm|Nh}-{suffix}
     m = re.match(
         r"^([a-z]+)-updown-(\d+[mh])-(.+)$", slug.lower()
     )
-    if not m:
-        return None
+    if m:
+        asset_lower, tf_str, suffix = m.groups()
+        asset = ASSET_FROM_SLUG.get(asset_lower)
+        if not asset:
+            return None
+        timeframe_sec = _TIMEFRAME_MAP.get(tf_str)
+        if not timeframe_sec:
+            return None
+        try:
+            open_epoch = int(suffix)
+            return (asset, timeframe_sec, open_epoch, open_epoch + timeframe_sec)
+        except ValueError:
+            pass
+        try:
+            dt = datetime.strptime(suffix, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            open_epoch = int(dt.timestamp())
+            return (asset, timeframe_sec, open_epoch, open_epoch + timeframe_sec)
+        except ValueError:
+            return None
 
-    asset_lower, tf_str, suffix = m.groups()
-    asset = ASSET_FROM_SLUG.get(asset_lower)
-    if not asset:
-        return None
+    # Format 2: event-style — {asset}-up-or-down-{month}-{day}-{year}-{hour}am/pm-et
+    m2 = re.match(
+        r"^([a-z]+)-up-or-down-([a-z]+)-(\d+)-(\d+)-(\d+)(am|pm)-et$",
+        slug.lower(),
+    )
+    if m2:
+        asset_lower = m2.group(1)
+        month_name = m2.group(2)
+        day = int(m2.group(3))
+        year = int(m2.group(4))
+        hour_raw = int(m2.group(5))
+        ampm = m2.group(6)
 
-    timeframe_sec = _TIMEFRAME_MAP.get(tf_str)
-    if not timeframe_sec:
-        return None
+        asset = ASSET_FROM_SLUG.get(asset_lower)
+        if not asset:
+            return None
 
-    # Try epoch first
-    try:
-        open_epoch = int(suffix)
-        return (asset, timeframe_sec, open_epoch, open_epoch + timeframe_sec)
-    except ValueError:
-        pass
+        month = _MONTH_NAMES.get(month_name, 0)
+        if not month:
+            return None
 
-    # Try date format (YYYY-MM-DD)
-    try:
-        dt = datetime.strptime(suffix, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        open_epoch = int(dt.timestamp())
-        return (asset, timeframe_sec, open_epoch, open_epoch + timeframe_sec)
-    except ValueError:
-        return None
+        hour = hour_raw
+        if ampm == "pm" and hour != 12:
+            hour += 12
+        elif ampm == "am" and hour == 12:
+            hour = 0
+
+        open_epoch = _et_to_utc_epoch(year, month, day, hour)
+        return (asset, 3600, open_epoch, open_epoch + 3600)
+
+    return None
 
 
 def _parse_json_field(raw, default=None):
@@ -154,6 +224,7 @@ def to_market_window(info: MarketInfo, asset: str) -> MarketWindow:
         dn_token_id=dn_token,
         open_epoch=open_epoch,
         close_epoch=close_epoch,
+        price_to_beat=info.price_to_beat,
     )
 
 
@@ -281,9 +352,8 @@ async def discover_crypto_updown_markets(
     now = datetime.now(timezone.utc)
     now_epoch = int(now.timestamp())
 
-    # Build date window params (harmlessly ignored if API doesn't support them)
-    window_start = now.isoformat()
-    window_end = (now + timedelta(hours=max_hours_to_resolution)).isoformat()
+    # Note: end_date_window params are broken on the Gamma API (returns stale data).
+    # We filter by time locally in _filter_market_from_event instead.
 
     try:
         async with httpx.AsyncClient(timeout=15) as client:
@@ -294,8 +364,6 @@ async def discover_crypto_updown_markets(
                     "closed": "false",
                     "active": "true",
                     "limit": "500",
-                    "end_date_window_start": window_start,
-                    "end_date_window_end": window_end,
                 },
             )
             if resp.status_code != 200:
@@ -303,6 +371,7 @@ async def discover_crypto_updown_markets(
                 return results
 
             events = resp.json()
+            logger.debug("Gamma returned %d events", len(events))
             seen_slugs: set[str] = set()
 
             for event in events:
@@ -324,6 +393,50 @@ async def discover_crypto_updown_markets(
                         asset = _detect_asset(info.slug)
                         if asset:
                             results.append((info, asset))
+
+            # Hourly (1h) markets have hide-from-new tag, so tag_slug search misses them.
+            # Fetch them by constructing slugs for the current + next few hours.
+            hourly_assets = {
+                "bitcoin": "BTC", "ethereum": "ETH", "solana": "SOL", "xrp": "XRP",
+            }
+            for asset_long, asset_short in hourly_assets.items():
+                if not any(asset_long.startswith(p.split("-")[0]) for p in patterns):
+                    continue
+                for hour_offset in range(0, int(max_hours_to_resolution) + 1):
+                    dt = now + timedelta(hours=hour_offset)
+                    # Polymarket uses ET (UTC-4), and slug format: {asset}-up-or-down-{month}-{day}-{hour}am/pm-et
+                    et = dt - timedelta(hours=4)
+                    month_name = et.strftime("%B").lower()
+                    day = et.day
+                    hour_12 = et.hour % 12 or 12
+                    ampm = "am" if et.hour < 12 else "pm"
+                    slug = f"{asset_long}-up-or-down-{month_name}-{day}-{hour_12}{ampm}-et"
+                    if slug in seen_slugs:
+                        continue
+                    try:
+                        h_resp = await client.get(
+                            f"{gamma_host}/events", params={"slug": slug},
+                        )
+                        if h_resp.status_code == 200:
+                            h_events = h_resp.json()
+                            for event in h_events:
+                                for market in event.get("markets", []):
+                                    m_slug = market.get("slug", "")
+                                    if m_slug in seen_slugs:
+                                        continue
+                                    seen_slugs.add(m_slug)
+                                    info = _filter_market_from_event(
+                                        market, event=event, patterns=patterns,
+                                        now_epoch=now_epoch, max_hours=max_hours_to_resolution,
+                                        min_liquidity=min_liquidity,
+                                    )
+                                    if info is not None:
+                                        a = _detect_asset(info.slug)
+                                        if a:
+                                            results.append((info, a))
+                                            logger.info("Hourly discovery: found %s (%s)", m_slug, a)
+                    except Exception:
+                        pass
 
             # CLOB API fallback when Gamma returns 0 matching results
             if not results:

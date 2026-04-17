@@ -127,19 +127,25 @@ async def try_resolve_once(
             log.info("Fetched condition_id from gamma for %s: %s", slug, fetched)
             condition_id = fetched
 
-    try:
-        # --- primary: CLOB API (only if we have a real condition_id) ---
-        if condition_id and condition_id.startswith("0x"):
+    # --- primary: CLOB API (only if we have a real condition_id) ---
+    if condition_id and condition_id.startswith("0x"):
+        try:
             result = await resolve_via_clob(client, clob_host, condition_id)
             if result is not None:
+                if condition_id:
+                    result["condition_id"] = condition_id
                 return result
+        except Exception as exc:
+            log.warning("CLOB resolution failed for %s, falling back to Gamma: %s", slug, exc)
 
-        # --- fallback: gamma API ---
+    # --- fallback: Gamma API ---
+    try:
         result = await resolve_via_gamma(client, slug)
         if result is not None:
+            if condition_id:
+                result["condition_id"] = condition_id
             return result
-
     except Exception as exc:
-        log.debug("Settlement resolve attempt for %s failed: %s", slug, exc)
+        log.warning("Gamma resolution also failed for %s: %s", slug, exc)
 
     return None
