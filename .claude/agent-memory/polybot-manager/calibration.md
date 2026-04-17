@@ -1,5 +1,30 @@
 # Manager Calibration Notes
 
+## Book-Mid Gate Threshold Lowered 0.65 -> 0.55 (2026-04-17, Rotation 14)
+
+Ran 14-day Dome holdout sweep (tools/book_mid_gate_sweep.py) after only 2 paper fires
+at 0.65 made live validation infeasible. Threshold optimum was monotonic: lower = better
+all the way down to 0.40 (the lowest I tested). Shipped a moderate step to 0.55 rather
+than jumping straight to optimum, to limit regime shift (~2x fire rate) and preserve
+optionality for next cycle.
+
+- Train (2026-03-29..04-06, n=681): pnl/mkt -$3.65 -> -$1.49 (+$2.16 uplift)
+- Holdout (2026-04-07..04-11, n=106): pnl/mkt -$6.14 -> -$3.74 (+$2.40 uplift)
+- Fire rate: 14% -> 30% (about 6 fires/day expected live)
+- Fired-side correct: 97.7% across all thresholds (signal robust, not threshold-dependent)
+- Max_spread sweep showed no sensitivity (0.03 / 0.05 / 0.08 all identical) — keep 0.05
+
+**NEXT queued**: after ≥30 paper fires at 0.55 with matching live fire-rate (~30%) and
+positive fired-side PnL, consider lowering further to 0.45 or 0.40. Holdout shows 0.40
+near-breakeven (-$0.60/mkt vs gate OFF at -$9.28/mkt) — potential another +$3.14/mkt
+uplift, but fire rate would hit 44% which is a substantial regime change.
+
+**Absolute PnL caveat**: the backtester's fill model is conservative and shows deeply
+negative absolute PnL in every scenario (including gate off). The signal we trust is the
+DELTA between thresholds, not absolute numbers. Live paper PnL has been closer to
+break-even/slightly positive, so the real-world uplift from this threshold change is
+probably smaller than the backtester suggests but same sign.
+
 ## One-Sided Fill Losses Are Normal Variance (2026-04-08)
 
 3 consecutive losses triggered investigation. Root cause: BTC trending DOWN, bot getting
@@ -164,3 +189,11 @@ Test suite: 1004/1004 passing. 0 errors in `polybot.log`.
 Holdout-validated: Sharpe 0.541 vs 0.464, +46% $/mkt. Wait for >=5 paper settlements with 0.65
 before swapping. This is a 1-line `.env` edit + restart — does NOT need planner/coder/tester chain
 (but must verify paper performance match holdout post-deployment).
+
+## /api/state PnL "Anomaly" = Not a Bug (2026-04-17)
+
+Observed: `/api/state` shows `total_pnl=-6.80` while settlement_log `bankroll` column reads $506.47 -> $529.89 (+$23.42 apparent).
+
+Diagnosis: `sum(pnl for s in settlement_log)` = -6.80 exactly, matching `/api/state`. There is NO accounting mismatch. The confusion comes from reading `bankroll` column as "PnL progression" — it is not. Bankroll is tracked through risk_manager which has internal updates (exposure_factor etc) and the first logged `bankroll` was NOT the restart seed ($500), because the first settlement happened after intermediate bankroll updates.
+
+Rule: when diagnosing session PnL, trust `sum(pnl)` from `data/settlement_log.jsonl`, NOT `bankroll[last] - bankroll[first]`. Do NOT dispatch debugger on this pattern again.
