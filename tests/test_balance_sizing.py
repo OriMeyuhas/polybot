@@ -1,6 +1,6 @@
 import logging
 from unittest.mock import MagicMock
-from polybot.config import BotConfig
+from polybot.config import BotConfig, effective_assets
 from polybot.strategy.position_manager import PositionManager
 from polybot.strategy.ladder_manager import LadderManager, MIN_ORDER_SIZE
 from polybot.types import MarketWindow
@@ -41,6 +41,8 @@ def _make_ladder_manager(bankroll=1000.0):
     risk = MagicMock()
     risk.is_halted = MagicMock(return_value=False)
     risk.can_open_position = MagicMock(return_value=True)
+    risk.check_capital_at_risk = MagicMock(return_value=True)
+    risk.exposure_factor = MagicMock(return_value=1.0)
 
     return LadderManager(cfg, executor, tracker, pm, risk)
 
@@ -105,3 +107,24 @@ def test_overleverage_flag():
         and bot._wallet_balance < committed
     )
     assert overleveraged is True
+
+
+def test_effective_assets_scales_with_bankroll():
+    """Integration: as bankroll grows, more assets become tradeable."""
+    all_assets = ("BTC", "ETH", "SOL", "XRP")
+
+    # Low bankroll -> 1 asset
+    low = effective_assets(all_assets, 300.0)
+    assert len(low) == 1
+
+    # Medium bankroll -> 2 assets
+    med = effective_assets(all_assets, 1000.0)
+    assert len(med) == 2
+    # Medium is a superset of low
+    assert all(a in med for a in low)
+
+    # High bankroll -> all assets
+    high = effective_assets(all_assets, 5000.0)
+    assert len(high) == 4
+    # High is a superset of medium
+    assert all(a in high for a in med)

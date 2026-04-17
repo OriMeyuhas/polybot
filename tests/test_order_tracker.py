@@ -147,13 +147,13 @@ class TestReconcile:
         result = tracker.reconcile([{"id": "o1"}, {"id": "o_orphan"}])
         assert "o_orphan" in result["orphaned"]
 
-    def test_unknown_order_not_on_exchange_filled(self, tracker):
-        """Unknown order not on exchange -> filled."""
+    def test_unknown_order_not_on_exchange_stays_unknown(self, tracker):
+        """Unknown order not on exchange -> stays unknown (no phantom fill)."""
         tracker.add(_make_order("o1", size=10.0))
         tracker.mark_all_unknown()
         result = tracker.reconcile([])
-        assert len(result["filled"]) == 1
-        assert tracker.orders["o1"].status == "filled"
+        assert len(result["filled"]) == 0
+        assert tracker.orders["o1"].status == "unknown"
 
     def test_unknown_order_on_exchange_reverted(self, tracker):
         """Unknown order still on exchange -> reverted to resting."""
@@ -162,6 +162,32 @@ class TestReconcile:
         result = tracker.reconcile([{"id": "o1"}])
         assert "o1" in result["reverted"]
         assert tracker.orders["o1"].status == "resting"
+
+
+class TestReconcilePartial:
+    def test_reconcile_returns_partial_key(self, tracker):
+        """Reconcile with size_matched that doesn't fill completely returns order in partial."""
+        tracker.add(_make_order("o1", size=10.0))
+        open_orders = [{"id": "o1", "size_matched": "4.0"}]
+        result = tracker.reconcile(open_orders)
+        assert len(result["partial"]) == 1
+        assert result["partial"][0].order_id == "o1"
+        assert len(result["filled"]) == 0
+        assert tracker.orders["o1"].filled == pytest.approx(4.0)
+        assert tracker.orders["o1"].status == "partial"
+
+    def test_reconcile_partial_then_full(self, tracker):
+        """First reconcile returns partial, second reconcile (order gone) returns filled."""
+        tracker.add(_make_order("o1", size=10.0))
+        # First reconcile: partial fill
+        result1 = tracker.reconcile([{"id": "o1", "size_matched": "4.0"}])
+        assert len(result1["partial"]) == 1
+        assert len(result1["filled"]) == 0
+        # Second reconcile: order disappeared (fully filled on exchange)
+        result2 = tracker.reconcile([])
+        assert len(result2["filled"]) == 1
+        assert result2["filled"][0].order_id == "o1"
+        assert tracker.orders["o1"].filled == pytest.approx(10.0)
 
 
 class TestFillThreshold:
@@ -213,6 +239,47 @@ class TestFilledCount:
         tracker.update_fill("o2", 10.0)
         assert tracker.filled_count("m1", Side.UP) == 1
         assert tracker.filled_count("m1", Side.DOWN) == 1
+
+
+class TestCreditedToPm:
+    def test_credited_to_pm_default_zero(self, tracker):
+        order = _make_order("o1")
+        tracker.add(order)
+        assert order.credited_to_pm == 0.0
+
+    def test_get_uncredited_fills_returns_delta(self, tracker):
+        order = _make_order("o1", size=10.0)
+        tracker.add(order)
+        tracker.update_fill("o1", 4.0)
+        uncredited = tracker.get_uncredited_fills("m1")
+        assert len(uncredited) == 1
+        assert uncredited[0][0] is order
+        assert uncredited[0][1] == pytest.approx(4.0)
+
+    def test_get_uncredited_fills_after_partial_credit(self, tracker):
+        order = _make_order("o1", size=10.0)
+        tracker.add(order)
+        tracker.update_fill("o1", 5.0)
+        order.credited_to_pm = 2.0
+        uncredited = tracker.get_uncredited_fills("m1")
+        assert len(uncredited) == 1
+        assert uncredited[0][1] == pytest.approx(3.0)
+
+    def test_flush_uncredited_marks_credited(self, tracker):
+        order = _make_order("o1", size=10.0)
+        tracker.add(order)
+        tracker.update_fill("o1", 4.0)
+        flushed = tracker.flush_uncredited("m1")
+        assert len(flushed) == 1
+        assert order.credited_to_pm == pytest.approx(4.0)
+
+    def test_flush_uncredited_idempotent(self, tracker):
+        order = _make_order("o1", size=10.0)
+        tracker.add(order)
+        tracker.update_fill("o1", 4.0)
+        tracker.flush_uncredited("m1")
+        second = tracker.flush_uncredited("m1")
+        assert len(second) == 0
 
 
 class TestTotalCount:

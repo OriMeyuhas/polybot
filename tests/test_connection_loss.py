@@ -99,23 +99,15 @@ def test_connection_lost_marks_unknown():
         assert order.status == "unknown"
 
 
-def test_connection_lost_attempts_cancel_all():
-    """_on_connection_lost calls order_executor.cancel_all."""
+def test_connection_lost_schedules_cancel_or_sets_pending():
+    """_on_connection_lost enters cancel-only and schedules cancel (or sets pending if no loop)."""
     bot = _make_bot()
     bot.order_executor.cancel_all = MagicMock()
 
     bot._on_connection_lost()
 
-    bot.order_executor.cancel_all.assert_called_once()
-
-
-def test_connection_lost_sets_pending_on_cancel_failure():
-    """If cancel_all raises, _pending_cancel_all is set to True."""
-    bot = _make_bot()
-    bot.order_executor.cancel_all = MagicMock(side_effect=Exception("network error"))
-
-    bot._on_connection_lost()
-
+    # Without a running event loop, cancel is deferred via _pending_cancel_all
+    assert bot._cancel_only_mode is True
     assert bot._pending_cancel_all is True
 
 

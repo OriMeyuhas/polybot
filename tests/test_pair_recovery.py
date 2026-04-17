@@ -116,8 +116,8 @@ class TestConfigDefaults:
         cfg = BotConfig()
         assert cfg.boost_elapsed_pct == 0.20
         assert cfg.force_buy_elapsed_pct == 0.70
-        assert cfg.force_buy_max_pair_cost == 0.93
-        assert cfg.imbalance_min_heavy_fills == 3
+        assert cfg.force_buy_max_pair_cost == 0.83
+        assert cfg.imbalance_min_heavy_fills == 1
 
     def test_config_env_var_loading(self, monkeypatch):
         monkeypatch.setenv("BOOST_ELAPSED_PCT", "0.25")

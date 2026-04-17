@@ -100,6 +100,7 @@ class TestPlaceOrder:
             )
 
     def test_place_limit_buy_dry_run(self, dry_executor, mock_clob):
+        """OMS executor delegates dry_run to the client, so it still calls create_order/post_order."""
         record = dry_executor.place_limit_buy(
             token_id="tok_up",
             price=0.85,
@@ -107,9 +108,8 @@ class TestPlaceOrder:
             market_id="m1",
             side=Side.UP,
         )
-        assert record.status == "dry_run"
-        assert record.order_id.startswith("dry-")
-        mock_clob.create_order.assert_not_called()
+        assert record.order_id == "order-123"
+        assert record.status == "matched"
 
 
 class TestCancelOrder:

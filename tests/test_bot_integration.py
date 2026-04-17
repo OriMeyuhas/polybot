@@ -1,5 +1,6 @@
 import asyncio
 import time
+from decimal import Decimal
 
 import pytest
 from unittest.mock import MagicMock
@@ -16,7 +17,7 @@ def cfg():
         ladder_rungs=4,
         ladder_spacing=0.02,
         ladder_width=0.06,
-        ladder_size_skew=1.5,
+        ladder_size_skew=0.7,
         start_paused=False,
         bankroll=10_000.0,
     )
@@ -86,30 +87,38 @@ class TestWindowOpenPriceSnapshot:
         )
 
     def test_snapshot_captures_spot_price(self, cfg, mock_clob):
+        import asyncio
         active = self._active_market()
         bot = _make_bot(cfg, mock_clob)
         bot._active_markets = {active.market_id: active}
+        bot.price_feed._update_price("BTC", Decimal("84500"))
         bot.spot_prices["BTC"] = 84500.0
 
-        bot._snapshot_window_open_prices()
+        asyncio.run(bot._snapshot_window_open_prices())
 
-        assert bot.window_open_prices["BTC"] == 84500.0
+        # Candle open or spot fallback should be captured
+        assert active.market_id in bot.window_open_prices
         assert active.market_id in bot._snapped_windows
 
     def test_snapshot_not_overwritten_on_second_call(self, cfg, mock_clob):
+        import asyncio
         active = self._active_market()
         bot = _make_bot(cfg, mock_clob)
         bot._active_markets = {active.market_id: active}
+        bot.price_feed._update_price("BTC", Decimal("84500"))
         bot.spot_prices["BTC"] = 84500.0
 
-        bot._snapshot_window_open_prices()
+        asyncio.run(bot._snapshot_window_open_prices())
+        first_price = bot.window_open_prices[active.market_id]
+        bot.price_feed._update_price("BTC", Decimal("85000"))
         bot.spot_prices["BTC"] = 85000.0
-        bot._snapshot_window_open_prices()
+        asyncio.run(bot._snapshot_window_open_prices())
 
-        assert bot.window_open_prices["BTC"] == 84500.0
+        assert bot.window_open_prices[active.market_id] == first_price
 
     def test_snapshot_skips_pre_open_window(self, cfg, mock_clob):
         """Pre-open windows should NOT get their open price snapped early."""
+        import asyncio
         now = int(time.time())
         pre_open = MarketWindow(
             market_id="btc-5m-preopen",
@@ -125,9 +134,9 @@ class TestWindowOpenPriceSnapshot:
         bot._active_markets = {pre_open.market_id: pre_open}
         bot.spot_prices["BTC"] = 84500.0
 
-        bot._snapshot_window_open_prices()
+        asyncio.run(bot._snapshot_window_open_prices())
 
-        assert "BTC" not in bot.window_open_prices
+        assert pre_open.market_id not in bot.window_open_prices
         assert pre_open.market_id not in bot._snapped_windows
 
 
@@ -244,7 +253,7 @@ class TestSettlementPollerTimeout:
             ladder_rungs=4,
             ladder_spacing=0.02,
             ladder_width=0.06,
-            ladder_size_skew=1.5,
+            ladder_size_skew=0.7,
             bot_settlement_give_up_sec=0.0,  # instant timeout
         )
         bot.cfg = cfg2
@@ -324,3 +333,82 @@ class TestSettlementDetail:
         detail = bot._activity_log[0].detail
         assert "UP won" in detail
         assert "\u2193" not in detail  # no down arrow when no losing side
+
+
+class TestConcurrentWindowOpenPrices:
+    def test_concurrent_windows_independent_open_prices(self, cfg, mock_clob):
+        """Two concurrent BTC windows must each keep their own open price."""
+        import asyncio
+        now = int(time.time())
+        window_1h = MarketWindow(
+            market_id="btc-1h-100",
+            condition_id="0xaaa",
+            asset="BTC",
+            timeframe_sec=3600,
+            up_token_id="tok_up_1h",
+            dn_token_id="tok_dn_1h",
+            open_epoch=now - 3000,
+            close_epoch=now + 600,
+        )
+        window_5m = MarketWindow(
+            market_id="btc-5m-200",
+            condition_id="0xbbb",
+            asset="BTC",
+            timeframe_sec=300,
+            up_token_id="tok_up_5m",
+            dn_token_id="tok_dn_5m",
+            open_epoch=now - 60,
+            close_epoch=now + 240,
+        )
+        bot = _make_bot(cfg, mock_clob)
+
+        # 1h window opens first at $87,000
+        bot._active_markets = {window_1h.market_id: window_1h}
+        bot.price_feed._update_price("BTC", Decimal("87000"))
+        bot.spot_prices["BTC"] = 87000.0
+        asyncio.run(bot._snapshot_window_open_prices())
+        assert window_1h.market_id in bot.window_open_prices
+        first_price = bot.window_open_prices[window_1h.market_id]
+
+        # 5m window opens later — must NOT overwrite 1h
+        bot._active_markets[window_5m.market_id] = window_5m
+        bot.price_feed._update_price("BTC", Decimal("87500"))
+        bot.spot_prices["BTC"] = 87500.0
+        asyncio.run(bot._snapshot_window_open_prices())
+        assert window_5m.market_id in bot.window_open_prices
+        assert bot.window_open_prices[window_1h.market_id] == first_price  # PRESERVED
+
+        # Deltas are independent — different open prices for each window
+        delta_1h = bot.compute_spot_delta("BTC", window_1h.market_id)
+        delta_5m = bot.compute_spot_delta("BTC", window_5m.market_id)
+        assert delta_1h is not None
+        assert delta_5m is not None
+
+
+class TestDryRunResolve:
+    def test_dry_run_resolve_uses_per_window_open_price(self, cfg, mock_clob):
+        """_dry_run_resolve must use the window's own open price, not another window's."""
+        now = int(time.time())
+        window_1h = MarketWindow(
+            market_id="btc-1h-100", condition_id="0xaaa", asset="BTC",
+            timeframe_sec=3600, up_token_id="t1", dn_token_id="t2",
+            open_epoch=now - 3600, close_epoch=now,
+        )
+        bot = _make_bot(cfg, mock_clob)
+        bot.price_feed._update_price("BTC", Decimal("87500"))
+        bot.window_open_prices[window_1h.market_id] = 87000.0
+        bot.spot_prices["BTC"] = 87500.0  # price went UP from 87000
+
+        outcome = bot._dry_run_resolve(window_1h)
+        assert outcome == "UP"
+
+        # Now if a different window had snapped at 88000, resolve should be DOWN
+        window_5m = MarketWindow(
+            market_id="btc-5m-200", condition_id="0xbbb", asset="BTC",
+            timeframe_sec=300, up_token_id="t3", dn_token_id="t4",
+            open_epoch=now - 300, close_epoch=now,
+        )
+        bot.window_open_prices[window_5m.market_id] = 88000.0
+        # spot is 87500, open was 88000 => DOWN
+        outcome_5m = bot._dry_run_resolve(window_5m)
+        assert outcome_5m == "DOWN"

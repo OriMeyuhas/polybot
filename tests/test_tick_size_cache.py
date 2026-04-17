@@ -114,3 +114,48 @@ class TestTickSizeCache:
         client = self._make_client()
         cache = TickSizeCache(client, ttl_sec=60)
         cache.invalidate("does_not_exist")  # should not raise
+
+    def test_evict_stale_removes_old_entries(self, monkeypatch):
+        """Entries older than max_age_factor * TTL are evicted."""
+        client = self._make_client(0.01)
+        cache = TickSizeCache(client, ttl_sec=60)
+
+        fake_time = 1000.0
+
+        def mock_monotonic():
+            return fake_time
+
+        monkeypatch.setattr(time, "monotonic", mock_monotonic)
+
+        cache.get_tick_size("cond_a")
+        cache.get_tick_size("cond_b")
+        assert len(cache._cache) == 2
+
+        # Advance past 10x TTL (600s)
+        fake_time = 1700.0
+        evicted = cache.evict_stale()
+
+        assert evicted == 2
+        assert len(cache._cache) == 0
+
+    def test_evict_stale_keeps_recent(self, monkeypatch):
+        """Entries within max_age_factor * TTL are kept."""
+        client = self._make_client(0.01)
+        cache = TickSizeCache(client, ttl_sec=60)
+
+        fake_time = 1000.0
+
+        def mock_monotonic():
+            return fake_time
+
+        monkeypatch.setattr(time, "monotonic", mock_monotonic)
+
+        cache.get_tick_size("cond_a")
+        cache.get_tick_size("cond_b")
+
+        # Advance within 10x TTL (100s < 600s)
+        fake_time = 1100.0
+        evicted = cache.evict_stale()
+
+        assert evicted == 0
+        assert len(cache._cache) == 2

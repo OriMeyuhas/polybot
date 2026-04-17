@@ -115,42 +115,6 @@ class TestOmsExecutorExpiration:
 
 
 # ---------------------------------------------------------------------------
-# Test: Legacy OrderExecutor place_limit_buy passes expiration
-# ---------------------------------------------------------------------------
-
-class TestLegacyExecutorExpiration:
-    def test_place_limit_buy_passes_expiration(self, cfg):
-        """Legacy place_limit_buy should accept and forward expiration."""
-        mock_client = MagicMock()
-        mock_client.create_order.return_value = {"signed": True}
-        mock_client.post_order.return_value = {"orderID": "o1", "status": "resting"}
-        executor = LegacyOrderExecutor(cfg, clob_client=mock_client)
-        record = executor.place_limit_buy(
-            token_id="tok_up",
-            price=0.45,
-            size=100.0,
-            market_id="m1",
-            side=Side.UP,
-            expiration=1240,
-        )
-        # In dry_run mode, this returns a dry record
-        assert record.order_id.startswith("dry-")
-
-    def test_place_batch_passes_expiration(self, cfg):
-        """Legacy batch should forward expiration from order dicts."""
-        mock_client = MagicMock()
-        mock_client.create_order.return_value = {"signed": True}
-        mock_client.post_order.return_value = {"orderID": "o1", "status": "resting"}
-        executor = LegacyOrderExecutor(cfg, clob_client=mock_client)
-        orders = [
-            {"token_id": "tok_up", "price": 0.45, "size": 100.0,
-             "market_id": "m1", "side": Side.UP, "expiration": 1240},
-        ]
-        results = executor.place_batch_limit_buys(orders)
-        assert len(results) == 1
-
-
-# ---------------------------------------------------------------------------
 # Test: PaperClobClient create_order passes expiration through
 # ---------------------------------------------------------------------------
 

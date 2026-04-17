@@ -1,5 +1,5 @@
 import pytest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 from polybot.ladder_manager import LadderManager, build_ladder_rungs
 from polybot.order_tracker import OrderTracker
 from polybot.position_manager import PositionManager
@@ -482,10 +482,11 @@ class TestFvCancelCircuitBreaker:
         mgr = _make_manager(cfg, mock_clob)
         mid = market_id = "btc-15m-100"
         now = int(_time.time())
+        # Place market at 85% elapsed (past the 83% min-elapsed guard for FV cancel)
         mw = MarketWindow(
             market_id=mid, condition_id="0xabc", asset="BTC",
             timeframe_sec=900, up_token_id="tok_up", dn_token_id="tok_dn",
-            open_epoch=now - 100, close_epoch=now + 800,
+            open_epoch=now - 765, close_epoch=now + 135,
         )
         state = LadderState(
             market_id=mid, asset="BTC",
@@ -515,7 +516,7 @@ class TestFvCancelCircuitBreaker:
         import time as _time
 
         mgr, mw, mid, state = self._make_mgr_with_ladder(cfg, mock_clob)
-        # Use fair_up=0.12 -> certainty=0.88 > 0.75 threshold, UP is losing side
+        # Use fair_up=0.05 -> certainty=0.95 > 0.90 threshold, UP is losing side
 
         def _replenish_and_reset(batch_name):
             from polybot.order_tracker import TrackedOrder
@@ -528,25 +529,25 @@ class TestFvCancelCircuitBreaker:
             state.heavy_side_locked = None  # reset lock to allow next cancel
 
         # Call 1 → history has 0 before, breaker skips, cancel succeeds, history=[t1]
-        mgr.cancel_losing_side_orders(mw, fair_up=0.12)
+        mgr.cancel_losing_side_orders(mw, fair_up=0.05)
         assert mid not in mgr._killed_ladders
         assert len(state.fv_cancel_history) == 1
 
         _replenish_and_reset("b2")
         # Call 2 → history has 1 before, breaker skips, cancel succeeds, history=[t1,t2]
-        mgr.cancel_losing_side_orders(mw, fair_up=0.12)
+        mgr.cancel_losing_side_orders(mw, fair_up=0.05)
         assert mid not in mgr._killed_ladders
         assert len(state.fv_cancel_history) == 2
 
         _replenish_and_reset("b3")
         # Call 3 → history has 2 before, breaker skips, cancel succeeds, history=[t1,t2,t3]
-        mgr.cancel_losing_side_orders(mw, fair_up=0.12)
+        mgr.cancel_losing_side_orders(mw, fair_up=0.05)
         assert mid not in mgr._killed_ladders
         assert len(state.fv_cancel_history) == 3
 
         _replenish_and_reset("b4")
         # Call 4 → history has 3 before → circuit breaker fires → kills ladder
-        result = mgr.cancel_losing_side_orders(mw, fair_up=0.12)
+        result = mgr.cancel_losing_side_orders(mw, fair_up=0.05)
         assert mid in mgr._killed_ladders, (
             "Ladder should be killed when fv_cancel_history reaches 3 entries within 60s"
         )
@@ -562,16 +563,16 @@ class TestFvCancelCircuitBreaker:
         state.fv_cancel_history = [_time.time() - 120.0, _time.time() - 90.0]
 
         # One fresh cancel: after pruning, only 1 recent entry total
-        mgr.cancel_losing_side_orders(mw, fair_up=0.12)
+        mgr.cancel_losing_side_orders(mw, fair_up=0.05)
 
         # Should NOT be killed — only 1 recent cancel
         assert mid not in mgr._killed_ladders, "Should not kill after 1 recent cancel (2 old pruned)"
 
-    def test_threshold_is_75pct(self, mock_clob):
-        """cancel_losing_side_orders must NOT fire at cert < 0.75 (Proposal #48).
+    def test_threshold_is_90pct(self, mock_clob):
+        """cancel_losing_side_orders must NOT fire at cert < 0.90 (researcher calibration).
 
-        Note: _make_mgr_with_ladder seeds UP orders.  fair_up=0.20 -> UP is losing
-        side, so cancel_side(Side.UP) returns the seeded orders.
+        Note: _make_mgr_with_ladder seeds UP orders.  fair_up=0.05 -> UP is losing
+        side (cert=95%), so cancel_side(Side.UP) returns the seeded orders.
         """
         fv_cfg = BotConfig(
             private_key="0xfake", api_key="key", api_secret="secret", api_passphrase="pass",
@@ -580,16 +581,16 @@ class TestFvCancelCircuitBreaker:
             fair_value_enabled=True,
         )
 
-        # Test: fair_up=0.20 -> certainty=80% >= 0.75 -> UP is losing -> should cancel UP orders
+        # Test: fair_up=0.05 -> certainty=95% >= 0.90 -> UP is losing -> should cancel
         mgr, mw, mid, state = self._make_mgr_with_ladder(fv_cfg, mock_clob)
-        result = mgr.cancel_losing_side_orders(mw, fair_up=0.20)
-        assert result > 0, "Should cancel at 80% certainty (above 0.75 threshold)"
+        result = mgr.cancel_losing_side_orders(mw, fair_up=0.05)
+        assert result > 0, "Should cancel at 95% certainty (above 0.90 threshold)"
 
-        # Test: fair_up=0.26 -> certainty=74% -> below 0.75 threshold -> should NOT cancel
+        # Test: fair_up=0.15 -> certainty=85% -> below 0.90 threshold -> should NOT cancel
         mgr2, mw2, mid2, state2 = self._make_mgr_with_ladder(fv_cfg, mock_clob)
-        result2 = mgr2.cancel_losing_side_orders(mw2, fair_up=0.26)
+        result2 = mgr2.cancel_losing_side_orders(mw2, fair_up=0.15)
         assert result2 == 0, (
-            f"Should NOT cancel at 74% certainty (threshold is 0.75), got result={result2}"
+            f"Should NOT cancel at 85% certainty (threshold is 0.90), got result={result2}"
         )
 
     def test_circuit_breaker_prunes_old_history(self, cfg, mock_clob):
@@ -603,7 +604,7 @@ class TestFvCancelCircuitBreaker:
         state.fv_cancel_history = [old_ts] * 5
 
         # Call once — should prune old entries, then add 1 fresh
-        mgr.cancel_losing_side_orders(mw, fair_up=0.12)
+        mgr.cancel_losing_side_orders(mw, fair_up=0.05)
 
         # After the call, history has only the 1 fresh entry (old 5 were pruned)
         assert len(state.fv_cancel_history) == 1, (
@@ -913,13 +914,13 @@ class TestDirectionalBudgetCap:
     """Proposal #53: directional_budget_cap clips one-sided FV gate / spot skip posts."""
 
     def test_directional_budget_capped_at_20_fv_gate_dn(self):
-        """FV gate fires cert=88% DN (fair_up=0.12) with large bankroll budget.
+        """FV gate fires cert=88% DN (fair_up=0.05) with large bankroll budget.
         DN budget should be clamped to directional_budget_cap=20, not full budget."""
         # At bankroll=540, position_size_fraction=0.10, budget=54. Cap at 20.
         lm = _make_dir_cap_manager(directional_budget_cap=20.0, bankroll=540.0)
         market = _dir_cap_market()
-        # fair_up=0.12 -> cert=0.88 >= 0.80 -> FV gate fires, DN side only
-        lm.post_ladder(market, spot_delta=0.0, fair_up=0.12)
+        # fair_up=0.05 -> cert=0.88 >= 0.80 -> FV gate fires, DN side only
+        lm.post_ladder(market, spot_delta=0.0, fair_up=0.05)
         dn_budget = _budget_by_token(lm, "tok_dn")
         up_budget = _budget_by_token(lm, "tok_up")
         # UP side must not be posted (FV gate skips UP when DN is winning)
@@ -979,7 +980,7 @@ class TestDirectionalBudgetCap:
         lm = _make_dir_cap_manager(directional_budget_cap=20.0, bankroll=150.0)
         market = _dir_cap_market()
         # FV gate fires with cert=88% DN
-        lm.post_ladder(market, spot_delta=0.0, fair_up=0.12)
+        lm.post_ladder(market, spot_delta=0.0, fair_up=0.05)
         dn_budget = _budget_by_token(lm, "tok_dn")
         up_budget = _budget_by_token(lm, "tok_up")
         assert up_budget == pytest.approx(0.0, abs=0.01)
@@ -1017,6 +1018,35 @@ class TestDirectionalBudgetCap:
             )
         finally:
             del os.environ["DIRECTIONAL_BUDGET_CAP"]
+
+    def test_default_directional_budget_cap_tightened_to_18(self):
+        """Default cap tightened from $20 → $18 on 2026-04-17 for V1 live shakedown.
+
+        Reason: observed paper loss -$22.62 exceeded the old $20 cap because the cap
+        only binds on INTENTIONAL one-sided posts (FV/book-mid/spot gates) — not on
+        paired ladders whose one side fails to fill. $18 adds headroom on the paths
+        where the cap does bind, reducing tail risk during the shakedown.
+
+        This pins the BotConfig dataclass default AND the load_bot_config env-loader
+        default (both sources — make sure they agree)."""
+        # Dataclass default — no env, no .env file in play
+        cfg_default = BotConfig()
+        assert cfg_default.directional_budget_cap == pytest.approx(18.0), (
+            f"Expected BotConfig dataclass default 18.0, got {cfg_default.directional_budget_cap}"
+        )
+        # Env loader default — patch both the env var AND bypass .env so load_dotenv
+        # cannot inject a stale value from the committed .env file.
+        from polybot import config as config_mod
+        prev = os.environ.pop("DIRECTIONAL_BUDGET_CAP", None)
+        try:
+            with patch.object(config_mod, "load_dotenv", lambda: None):
+                cfg_loaded = config_mod.load_bot_config()
+            assert cfg_loaded.directional_budget_cap == pytest.approx(18.0), (
+                f"Expected env-loader default 18.0, got {cfg_loaded.directional_budget_cap}"
+            )
+        finally:
+            if prev is not None:
+                os.environ["DIRECTIONAL_BUDGET_CAP"] = prev
 
 
 # ── Proposal #54: Guard telemetry — drain list tests ─────────────────────────
@@ -1163,8 +1193,8 @@ class TestGuardTelemetryDrainLists:
             timeframe_sec=900,
             up_token_id="tok_up_cb",
             dn_token_id="tok_dn_cb",
-            open_epoch=now - 60,
-            close_epoch=now + 840,
+            open_epoch=now - 765,
+            close_epoch=now + 135,
         )
         mid = mw.market_id
         lm.ladders[mid] = LadderState(
@@ -1173,8 +1203,8 @@ class TestGuardTelemetryDrainLists:
             # Seed 3 recent FV cancel timestamps — triggers circuit breaker on next call
             fv_cancel_history=[_t.time() - 10, _t.time() - 20, _t.time() - 30],
         )
-        # fair_up=0.12 -> cert=88% > 0.75 threshold -> will try to cancel, but breaker fires first
-        result = lm.cancel_losing_side_orders(mw, fair_up=0.12)
+        # fair_up=0.05 -> cert=95% > 0.90 threshold, elapsed 85% > 83% -> will try to cancel, but breaker fires first
+        result = lm.cancel_losing_side_orders(mw, fair_up=0.05)
 
         assert result == 0, "Circuit breaker should return 0 (killed, no cancels counted)"
         assert mid in lm._killed_ladders
