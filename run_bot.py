@@ -162,6 +162,11 @@ def main():
     )
     log = logging.getLogger("polybot")
 
+    # Cycle 19: force DEBUG on the ladder_manager logger so the book_mid_gate
+    # non-fire instrumentation lines reach polybot.log regardless of LOG_LEVEL.
+    # Remove once the gate fires/non-fire distribution is understood.
+    logging.getLogger("polybot.strategy.ladder_manager").setLevel(logging.DEBUG)
+
     log.info("Starting PolyBot in %s mode (bankroll=$%.2f)", mode, cfg.bankroll)
 
     degraded_reason = ""
