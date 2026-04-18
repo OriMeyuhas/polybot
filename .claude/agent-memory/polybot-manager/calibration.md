@@ -1,5 +1,55 @@
 # Manager Calibration Notes
 
+## Cycle 41 — Rolling-10 new high, hardened exit test FAILS 2/3 (2026-04-18)
+
+54 settlements total. Post-0.05 n=4 (anchor `...83900`): `-3.62`, `+1.34`, `+33.21`, `+0.78` → sum **+31.72**, mean **+$7.93/mkt**. Mean is entirely driven by `...86600` (+$33.21, DN-only 50.3 shares, outcome DOWN). Mean ex-top-2 = **-$1.42/mkt** on n=2 — unchanged bearish signal beneath the outlier.
+
+Gate-fired W/L on post-0.05: **3W/1L**. All 4 markets had paired-gate SKIP firing (crossed_book or certainty_too_low), so fills were one-sided via FV-directional or single-side ladder reprice post-gate-miss. The single L (`...83900`) was FV-directional buying UP while outcome was DOWN (mis-predicted direction + size-0.05 amplification = -$3.62). The 3 wins all had winning-side-only fills align with outcome. Gate mechanism itself is working (100% of markets gate-skipped paired entry); P&L depends on whether FV-directional picks correct side.
+
+Hardened exit test (cycle 39 spec):
+- (1) rolling-20 > +$20 → +$41.46 → **PASS**
+- (2) rolling-20 ex-single-biggest-win > +$10 → +$41.46 − $58.00 = **−$16.55 → FAIL**
+- (3) post-0.05 mean ex-top-two-wins ≥ 0 → **−$1.42 → FAIL**
+
+**TENTATIVE EXIT = NO.** Rolling-20 strength is still carried by the pre-ship +$58.00 directional on `...79400` AND the new post-0.05 +$33.21 on `...86600`. Remove both top wins and rolling-18 is −$49.76. Rolling-10 7W/3L looks strong but 5 of 7 wins are ≤+$2.48 small-margin one-sided fills (consistent with 0.05 sizing scraping cheap late-window ladder); +$86.91 sum is carried by two fat directional hits.
+
+Projection: need ≥6 more post-0.05 markets without a new top-2 outlier to measure true underlying mean. At 15m cadence that's ~90min (cycle 47-48) for robust ex-outlier readout. Continue 4-cycle no-ship streak (now 5).
+
+Concerns:
+- FV-directional at 0.05 size is the variance driver — one wrong directional call = -$3.62 to -$21 (ref cycle 28). Three correct calls this window masked one wrong one. Structurally, directional arm is binary and can't be stat-validated yet (n=4).
+- Paired-gate SKIP fired 100% of post-0.05 markets — gate is *always* missing on this regime (tight crossed-book or cert<0.30). If this persists, **no paired fills are happening at all** post-ship; all P&L is FV-directional alone. That's a significantly different strategy than pre-0.05.
+
+## Cycle 37 — Post-0.05 n=3, observability shipped (2026-04-18, 07:37)
+
+52 settlements total. Post-cycle-35-ship observations:
+- Post-0.05 n=3 (cycle 36 baseline `...83900` onward): `...83900 -$3.62`, `...84800 +$1.34`. Cycle 36 counted only ...83900, so strict post-ship = n=2, sum **-$2.28**.
+  (Inclusive reading n=3 with `...83000 +$2.48` predating strict ship = +$0.20.)
+- No single-market loss > $50. Bankroll $618.73. No rollback guard fired.
+- Rolling-10 +$29.09 (was +$29.87 cycle 36). Rolling-20 +$17.98 (oscillating: cycle 35 +$38.78 → cycle 36 +$26.78 → now +$17.98 — regression as old +$58 directional wins roll off).
+
+Rolling-10 composition: dominated by the pre-ship +$58.00 directional on `...79400` (DN gate-fire, DOWN outcome, dn_qty=89.5). Remove that one row and rolling-10 is -$28.91 across 9 tickets. Post-0.05 is NOT driving rolling-10 strength — that number is pre-fix variance tail.
+
+Gate path audit on post-0.05 losses:
+- `...83900` lost -$3.62. Book-mid gate SKIP_ON_GATE_MISS fired correctly (certainty=0.01 for whole window, PAIRED SKIP logged ~800x). Losses came from FV_DIRECTIONAL buys + mis-predicted UP on a DOWN market (DIRECTIONAL BUY DOWN 1035 @ $0.030 at 06:55 did not offset earlier UP fills). This is a FV-directional loss path, not a gate-path leak.
+- `...84800` gate fired UP (correct), settled up_qty=11.2/dn_qty=0 +$1.34. Gate-persist reprice log active throughout. Clean win.
+
+Observability shipped this cycle: commit **ae238d1** — `feat(bot): log expired-unfilled windows for observability`. One INFO log at bot.py:1070 + one test (`test_expired_unfilled_logged`). Suite 1016/1016 (was 1015, +1). Bot NOT restarted — log-only change takes effect on next restart, no urgency.
+
+Projection for rolling-20 ≥ +$20 exit declaration: currently +$17.98 with post-0.05 n=3 producing mean -$0.76/mkt (or +$0.07/mkt inclusive). To reach +$20 sustained over rolling-20, need post-0.05 to average ≥+$1/mkt for next ~17 markets. At 15m cadence that's ~4.25 hrs of paper run. Earliest clean exit declaration: cycle 42-45 (≥ n=20 post-0.05 with positive rolling-20 AND consistent, not oscillating).
+
+**Concern**: the FV-directional path (seen in ...83900) can dump $10+ into a losing side late in a gate-correctly-skipped window. If this pattern recurs at 0.05 size across 3+ post-0.05 markets, consider gating FV_DIRECTIONAL purchases by the same book-mid-gate decision (queued for cycle 38+ if evidence emerges).
+
+## Cycle 36 — Post-0.05 Re-promotion Monitoring (2026-04-18, 07:00)
+
+Ship at 06:47 (POSITION_SIZE_FRACTION 0.01 → 0.05). 1 complete post-ship settlement:
+- 07:00:23 mid ...83900 pnl=**-$3.62** up_qty=54.7 dn_qty=0.0 outcome=DOWN (UP-only fill, losing side). Magnitude modest (<$50 guard), but at 5x size a clean UP-only fill on a DOWN market should be larger — suggests only partial ladder filled before settlement.
+- Session PnL $0.00, bankroll $617.12 (well above $200 floor).
+- Rolling 10: 5W/5L +$29.87; rolling 20: 8W/11L +$26.78.
+- Rollback guards: post-0.05 n=1 sum=-$3.62 (need n=20 before -$20 guard applies); no single-market loss >$50; bankroll fine.
+- Projection: if rolling-10 sustains +$29.87 and next 10 match, rolling-20 reaches ~$59 (>$20 exit threshold) in ~10 more settlements ≈ 2.5 hrs at 15m cadence. Gate: need post-0.05 n≥20 first (~5 hrs).
+- Concern: post-0.05 sample is n=1, unfilled-expire observability still missing (cycle 33 debugger finding) — hard to distinguish "gate worked" from "ladder never filled."
+- Queued for next cycle: tiny logger.info at continue-on-no-position branch (observability for unfilled-expired markets).
+
 ## Cycle 28 — Rollback Guard Fired: POSITION_SIZE_FRACTION 0.05 → 0.01 (2026-04-18)
 
 **Trigger**: rolling-10 = -$48.45 (cycle-14 guard at -$30 fired). 45 settlements total, post-H0-ship
@@ -650,3 +700,28 @@ Tests: 1015/1015 passed (unchanged, no code diff).
 2. Revert if any single-market loss > $50.
 3. Bankroll hard floor $200 unchanged.
 
+
+## Cycle 39 — Tentative exit signal pending outlier stress (2026-04-18)
+
+53 settlements. Post-0.05 n=15 (size revert at 2026-04-18; last 15 settlements).
+
+**+$33 delta driver (last 16 min, 6 trades at 0.05)**: settlement `...86600` at 13:45:25 pnl **+$33.21** (DOWN outcome, dn_qty=50.3, one-sided directional win). Secondary +$1.34 (...84800) + $2.48 (...83000). Same pattern as cycle 31 +$58 row — book-mid gate fired winner-side correctly and the loser side stayed clean (up_qty=0).
+
+**Post-0.05 n=15 accounting**:
+- Sum +$33.38, mean **+$2.23/mkt**
+- Still below Dome projection +$4.36/mkt (~51% of projection), but now POSITIVE for the first time since size promotion.
+
+**Stress test — remove biggest contributor**:
+- Rolling-20 +$53.57 → **-$4.43** after removing +$58.00 (`...79400`). Below the +$20 exit threshold.
+- Post-0.05 mean ex-biggest: +$33.38 − $33.21 = **+$0.17** → mean −$1.76/mkt across 14 markets.
+- Two single-market wins (+$58, +$33) carry the entire positive signal. Remove both → post-0.05 −$57.83/n=13 = −$4.45/mkt.
+
+**Rollback guards (fresh snapshot)**:
+- Post-0.05 sum PnL +$33.38 (far from −$20 floor) ✓
+- No single-market loss > $50 (worst: −$21.39 at `...71300`) ✓
+- Bankroll $651.95, well above $200 floor ✓
+- 0 errors, bot PIDs 35392/34192 healthy ✓
+
+**Tentative exit verdict**: **FAIL stress test**. Rolling-20 ex-outlier is −$4.43 (not >+$20), and post-0.05 ex-outliers is −$4.45/mkt (not Dome-matching). The +$33.21 win replicates the cycle 31 +$58 pattern but is the SECOND such single-market win carrying the mean. Two outliers is better than one (per cycle 37 concern), but the middle of the distribution (n=13 non-outlier post-0.05 markets) is still net negative at 0.05. NOT a genuine exit.
+
+**Cycle-40 plan**: continue observation. Need post-0.05 sample where the *median* market is positive, not the mean. Required evidence for next tentative exit call: rolling-20 >+$20 AND rolling-20 ex-single-biggest >+$10 AND post-0.05 mean ex-two-biggest-wins ≥ 0. At current rate (~2 meaningful settlements per cycle), earliest signal ~cycle 43-45. Hold at 0.05, no ship.

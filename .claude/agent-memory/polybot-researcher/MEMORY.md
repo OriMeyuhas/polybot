@@ -14,3 +14,5 @@
 - [Cycle 12 Auto-Lock Excess 2026-04-08](analysis_cycle12_autolock_excess_2026-04-08.md) -- 25-set: paired +$53 destroyed by -$80 excess. AUTO-LOCK creates asymmetric accumulation. FV cancel 50% accuracy.
 - [Cycle 15 Pair Cost Guard 2026-04-09](analysis_cycle15_2026-04-09.md) -- 621 stl: MAX_PAIR_COST 0.98→0.95 destroyed paired rate (64%→29%). Fix: raise back to 0.98.
 - [Cycle 16 1h Bankroll Crisis 2026-04-09](analysis_cycle16_1h_bankroll_2026-04-09.md) -- 1h losses are bankroll-driven. 2x sizing at <$550 is the root cause. Disable 1h below $450, 1x sizing $450-600.
+- [Cycle 23 New Hypotheses 2026-04-18](analysis_cycle23_hypotheses_2026-04-18.md) -- Post-threshold-exhaustion pivot: delayed entry, book-depth imbalance, prior-outcome prior. Binance-FV tests DEFER (Dome 100s gap).
+- [Cycle 23 Gate-Miss Audit 2026-04-18](analysis_cycle23_gate_miss_2026-04-18.md) -- Dome audit: gate-miss paired fallback is -$4.04/mkt (-$2354 on 583 mkts) vs gate-fires +$4.36/mkt. Overall Dome -$1452 @ t=0.55. New H0 = skip_on_gate_miss.

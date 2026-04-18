@@ -1,0 +1,28 @@
+# cycle15_narrow_width.yaml
+# Single-knob: LADDER_WIDTH 0.10 -> 0.05 + RUNGS 10 -> 6.
+# Hypothesis: tighter ladder = higher fill rate at less-adverse prices closer to mid.
+fv_gate_enabled: true
+fv_gate_certainty_threshold: 0.55
+directional_budget_cap: 18.0
+fv_cancel_enabled: true
+fv_cancel_certainty_threshold: 0.75
+one_sided_abort_enabled: false
+one_sided_abort_cost_pct: 0.01
+one_sided_abort_ratio: 3.0
+
+rungs: 6
+spacing: 0.01
+width: 0.05
+size_skew: 2.0
+position_size_fraction: 0.05
+max_pair_cost: 0.98
+
+trend_filter_enabled: false
+trend_filter_window_sec: 300
+trend_filter_threshold_pct: 0.004
+
+bankroll: 540.0
+maker_fee_rate: 0.0
+vol_window_sec: 300
+vol_fallback_annual: 0.50
+vol_min_samples: 30
