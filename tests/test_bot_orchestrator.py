@@ -57,7 +57,7 @@ def test_state_snapshot_has_all_24_fields():
         "avg_pair_cost", "best_pair_cost", "imbalance_ratio", "runtime_sec",
         "markets_active", "win_rate", "settled_wins", "settled_losses",
         "consecutive_losses", "exposure_factor", "daily_pnl", "is_halted", "capital_at_risk_pct",
-        "prices", "binance_prices", "spots",
+        "prices", "binance_prices", "spots", "binance_spot_values",
         "active_markets", "activity_feed", "trades",
         "pending_settlements", "wallet",
         "usdc_balance", "price_feed_stale",

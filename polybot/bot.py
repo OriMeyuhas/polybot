@@ -55,6 +55,20 @@ def _ui_price_to_beat(mkt, chainlink_price, binance_snapshot) -> float:
             pass
     return float(chainlink_price or binance_snapshot or 0)
 
+
+def _ui_binance_spot_values(binance_prices: dict, spots: dict) -> dict:
+    """Resolve the values displayed in the UI's "BINANCE SPOT" price strip.
+
+    The arbitrage edge is the *lag* between live Binance spot and Polymarket's
+    Chainlink-derived reference. Displaying a Chainlink-leaning number under a
+    "BINANCE SPOT" label defeats the purpose — it shows the very thing we're
+    racing against. Always prefer the direct Binance WS feed (`binance_prices`)
+    and fall back to the blended `spots` dict only when Binance WS is offline.
+
+    Returns a dict of {symbol: price}.
+    """
+    return dict(binance_prices) if binance_prices else dict(spots or {})
+
 logger = logging.getLogger(__name__)
 
 # How often to print a status summary (seconds)
@@ -2047,6 +2061,7 @@ class Bot:
             "prices": polymarket_prices,
             "binance_prices": binance_prices,
             "spots": spots,
+            "binance_spot_values": _ui_binance_spot_values(binance_prices, spots),
             "active_markets": active_markets_info,
             "activity_feed": [
                 {

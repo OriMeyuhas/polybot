@@ -1101,8 +1101,11 @@ function applyStatus(data) {
     }
   }
 
-  // Price strip
-  renderPriceStrip(data.spots || data.binance_prices, null);
+  // Price strip — read precomputed binance_spot_values (see _ui_binance_spot_values
+  // in bot.py and feedback_ui_binance_spot_recurring_bug.md).
+  // Must be direct Binance WS, NOT the RTDS/Chainlink-blended spots dict — that
+  // defeats the whole arb edge.
+  renderPriceStrip(data.binance_spot_values || data.binance_prices || data.spots, null);
 
   // Position cards
   renderPositionCards(data.active_markets);
