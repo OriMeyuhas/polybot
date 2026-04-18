@@ -707,7 +707,7 @@ class LadderManager:
         # Budget: use remaining available capital
         lp = self.cfg.get_ladder_params(market.timeframe_sec, current_bankroll=self.positions.bankroll)
         available = self.positions.bankroll - self.total_committed()
-        budget = min(lp.position_size_fraction * self.positions.bankroll * 0.5, available)
+        budget = min(lp.position_size_fraction * self.positions.bankroll * 0.5, available, self.cfg.directional_budget_cap)
         if budget < MIN_ORDER_SIZE * best_ask:
             return None
 

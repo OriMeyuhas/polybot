@@ -398,6 +398,47 @@ class TestDirectionalBuy:
         result2 = lm.directional_buy(market, 1750, fair_up=0.90)
         assert result2 is None
 
+    def test_directional_buy_budget_capped_by_directional_budget_cap(self):
+        """directional_buy budget must never exceed cfg.directional_budget_cap.
+
+        Use a large bankroll ($10 000) and a tiny cap ($10) so that the
+        fraction-based formula (bankroll * position_size_fraction * 0.5)
+        would produce ~$500 without the cap. The cap must bind and the
+        placed order qty must equal cap / ask.
+        """
+        cap = 10.0
+        bankroll = 10_000.0
+        ask = 0.50  # well below directional_max_ask=0.80
+
+        cfg = _cfg(
+            bankroll=bankroll,
+            position_size_fraction=0.10,
+            directional_budget_cap=cap,
+            directional_max_ask=0.80,
+            certainty_directional_threshold=0.85,
+        )
+        lm = _make_manager(cfg=cfg, bankroll=bankroll)
+        lm.executor.get_best_ask.return_value = ask
+
+        market = _market()
+        lm.ladders["btc-15m-100"] = LadderState(
+            market_id="btc-15m-100", asset="BTC",
+            anchor_up=0.45, anchor_dn=0.45, posted_at=1000,
+        )
+
+        # 80% elapsed, P(UP)=0.95 -> well above certainty threshold
+        result = lm.directional_buy(market, 1720, fair_up=0.95)
+        assert result is not None, "directional_buy should fire at high certainty"
+
+        # Inspect the qty passed to place_limit_buy — must be <= cap / ask
+        call_args = lm.executor.place_limit_buy.call_args
+        placed_qty = call_args[0][2]  # positional arg index 2 = qty
+        max_allowed_qty = cap / ask
+        assert placed_qty <= max_allowed_qty + 1e-9, (
+            f"qty {placed_qty:.4f} exceeds directional_budget_cap={cap} / ask={ask} "
+            f"= {max_allowed_qty:.4f}"
+        )
+
 
 # ── Chase with fair value guard ─────────────────────────────────────────────
 
