@@ -203,15 +203,13 @@ class BotConfig:
     spot_gate_force_buy_threshold: float = 0.003 # 0.30% — block force-buy when spot against
     spot_loss_cap_multiplier: float = 0.50       # tighten loss cap when spot confirms loss
 
-    # Directional post hard cap — prevents runaway adverse selection on FV-gated
-    # one-sided ladders. When FV gate or spot skip forces 100% of budget onto one
-    # side, cap that budget at this absolute dollar amount regardless of bankroll.
-    # Sized from 2026-04-11 outlier analysis: $20 optimum on 49-stl session.
-    # Tightened to $18 on 2026-04-17 to add headroom under fees/slippage — observed
-    # max loss -$22.62 in recent paper run (root cause: paired ladder adverse selection,
-    # not intentional directional — this cap still only binds on FV/book-mid/spot gates,
-    # the $18 value reduces tail for those intentional one-sided posts). Proposal #53.
-    directional_budget_cap: float = 18.0
+    # Directional post hard cap — retained in config for emergency use but no longer
+    # the active ceiling for one-sided posts. One-sided sizing rule is now:
+    #   budget = min(0.10 * bankroll, available)   (user directive 2026-04-18)
+    # This field is still loaded from env and kept in BotConfig so existing code
+    # paths that reference it (book-mid gate) continue to compile. Set high (500)
+    # so it never binds under the new 10%-of-bankroll rule.
+    directional_budget_cap: float = 500.0
 
     # FV directional gate — when enabled, skips the losing side at cert >= 80%.
     # Disabled 2026-04-11: 500ms-delay removal killed info-arb edge, FV calibration
@@ -513,7 +511,7 @@ def load_bot_config() -> BotConfig:
         spot_delta_skip_threshold=float(os.getenv("SPOT_DELTA_SKIP_THRESHOLD", "0.005")),
         spot_gate_force_buy_threshold=float(os.getenv("SPOT_GATE_FORCE_BUY_THRESHOLD", "0.003")),
         spot_loss_cap_multiplier=float(os.getenv("SPOT_LOSS_CAP_MULTIPLIER", "0.50")),
-        directional_budget_cap=float(os.getenv("DIRECTIONAL_BUDGET_CAP", "18.0")),
+        directional_budget_cap=float(os.getenv("DIRECTIONAL_BUDGET_CAP", "500.0")),
         fv_gate_enabled=os.getenv("FV_GATE_ENABLED", "false").lower() in ("true", "1", "yes"),
         book_mid_gate_enabled=os.getenv("BOOK_MID_GATE_ENABLED", "false").lower() in ("true", "1", "yes"),
         book_mid_gate_certainty_threshold=float(os.getenv("BOOK_MID_GATE_CERTAINTY_THRESHOLD", "0.65")),

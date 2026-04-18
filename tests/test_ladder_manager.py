@@ -911,12 +911,16 @@ def _budget_by_token(lm, token_id):
 
 
 class TestDirectionalBudgetCap:
-    """Proposal #53: directional_budget_cap clips one-sided FV gate / spot skip posts."""
+    """User directive 2026-04-18: one-sided posts (FV gate / spot skip / directional_buy)
+    size to 10% of bankroll, NOT directional_budget_cap.
+    directional_budget_cap is retained in config (emergency use) but no longer binds.
+    """
 
     def test_directional_budget_capped_at_20_fv_gate_dn(self):
-        """FV gate fires cert=88% DN (fair_up=0.05) with large bankroll budget.
-        DN budget should be clamped to directional_budget_cap=20, not full budget."""
-        # At bankroll=540, position_size_fraction=0.10, budget=54. Cap at 20.
+        """FV gate fires cert=88% DN (fair_up=0.05). DN budget = 10% of bankroll.
+        User directive 2026-04-18: one-sided = 10% of bankroll, not directional_budget_cap."""
+        # bankroll=540, 10% = $54. Old rule: min(54, cap=20) = $20.
+        # New rule: min(0.10 * 540, available) = $54.
         lm = _make_dir_cap_manager(directional_budget_cap=20.0, bankroll=540.0)
         market = _dir_cap_market()
         # fair_up=0.05 -> cert=0.88 >= 0.80 -> FV gate fires, DN side only
@@ -927,17 +931,15 @@ class TestDirectionalBudgetCap:
         assert up_budget == pytest.approx(0.0, abs=0.01), (
             f"FV gate DN should post 0 UP budget, got UP={up_budget:.2f}"
         )
-        # DN budget must not exceed cap
-        assert dn_budget <= 20.0 + 0.05, (  # 0.05 tolerance for rounding
-            f"DN budget {dn_budget:.2f} should be capped at 20.0"
-        )
-        # And it should be close to the cap (not much lower — all budget should be used up to cap)
-        assert dn_budget >= 15.0, (
-            f"DN budget {dn_budget:.2f} should be near the $20 cap (was $54 without cap)"
+        # DN budget should be 10% of bankroll = $54 (NOT capped at directional_budget_cap=20)
+        expected = 0.10 * 540.0
+        assert dn_budget == pytest.approx(expected, rel=0.05), (
+            f"DN budget ${dn_budget:.2f} should be 10% of bankroll = ${expected:.2f}. "
+            f"directional_budget_cap no longer binds on one-sided posts."
         )
 
     def test_directional_budget_capped_at_20_fv_gate_up(self):
-        """FV gate fires cert=88% UP (fair_up=0.88). UP budget capped at 20."""
+        """FV gate fires cert=88% UP (fair_up=0.88). UP budget = 10% of bankroll."""
         lm = _make_dir_cap_manager(directional_budget_cap=20.0, bankroll=540.0)
         market = _dir_cap_market()
         # fair_up=0.88 -> cert=0.88 >= 0.80 -> FV gate fires, UP side only
@@ -947,16 +949,13 @@ class TestDirectionalBudgetCap:
         assert dn_budget == pytest.approx(0.0, abs=0.01), (
             f"FV gate UP should post 0 DN budget, got DN={dn_budget:.2f}"
         )
-        assert up_budget <= 20.0 + 0.05, (
-            f"UP budget {up_budget:.2f} should be capped at 20.0"
-        )
-        assert up_budget >= 15.0, (
-            f"UP budget {up_budget:.2f} should be near the $20 cap"
+        expected = 0.10 * 540.0
+        assert up_budget == pytest.approx(expected, rel=0.05), (
+            f"UP budget ${up_budget:.2f} should be 10% of bankroll = ${expected:.2f}."
         )
 
     def test_directional_budget_capped_at_20_spot_skip(self):
-        """Spot skip fires (delta > 0.5%) with large bankroll budget.
-        The active side budget should be clamped to directional_budget_cap=20."""
+        """Spot skip fires (delta > 0.5%). Active side budget = 10% of bankroll."""
         lm = _make_dir_cap_manager(directional_budget_cap=20.0, bankroll=540.0,
                                    fair_value_enabled=False)
         market = _dir_cap_market()
@@ -967,11 +966,9 @@ class TestDirectionalBudgetCap:
         assert dn_budget == pytest.approx(0.0, abs=0.01), (
             f"Spot skip UP should post 0 DN budget, got DN={dn_budget:.2f}"
         )
-        assert up_budget <= 20.0 + 0.05, (
-            f"UP budget {up_budget:.2f} should be capped at 20.0 after spot skip"
-        )
-        assert up_budget >= 15.0, (
-            f"UP budget {up_budget:.2f} should be near the $20 cap"
+        expected = 0.10 * 540.0
+        assert up_budget == pytest.approx(expected, rel=0.05), (
+            f"UP budget ${up_budget:.2f} should be 10% of bankroll = ${expected:.2f} after spot skip."
         )
 
     def test_directional_budget_below_cap_unchanged(self):
@@ -1019,20 +1016,20 @@ class TestDirectionalBudgetCap:
         finally:
             del os.environ["DIRECTIONAL_BUDGET_CAP"]
 
-    def test_default_directional_budget_cap_tightened_to_18(self):
-        """Default cap tightened from $20 → $18 on 2026-04-17 for V1 live shakedown.
+    def test_default_directional_budget_cap_raised_to_500(self):
+        """Default cap raised to 500 on 2026-04-18 (user directive: one-sided = 10% bankroll).
 
-        Reason: observed paper loss -$22.62 exceeded the old $20 cap because the cap
-        only binds on INTENTIONAL one-sided posts (FV/book-mid/spot gates) — not on
-        paired ladders whose one side fails to fill. $18 adds headroom on the paths
-        where the cap does bind, reducing tail risk during the shakedown.
+        directional_budget_cap is retained in BotConfig as an emergency override but is
+        no longer the active ceiling for one-sided posts. The new rule is:
+            budget = min(0.10 * bankroll, available)
+        The default is set high (500) so it never accidentally binds at current bankrolls.
 
         This pins the BotConfig dataclass default AND the load_bot_config env-loader
         default (both sources — make sure they agree)."""
         # Dataclass default — no env, no .env file in play
         cfg_default = BotConfig()
-        assert cfg_default.directional_budget_cap == pytest.approx(18.0), (
-            f"Expected BotConfig dataclass default 18.0, got {cfg_default.directional_budget_cap}"
+        assert cfg_default.directional_budget_cap == pytest.approx(500.0), (
+            f"Expected BotConfig dataclass default 500.0, got {cfg_default.directional_budget_cap}"
         )
         # Env loader default — patch both the env var AND bypass .env so load_dotenv
         # cannot inject a stale value from the committed .env file.
@@ -1041,8 +1038,8 @@ class TestDirectionalBudgetCap:
         try:
             with patch.object(config_mod, "load_dotenv", lambda: None):
                 cfg_loaded = config_mod.load_bot_config()
-            assert cfg_loaded.directional_budget_cap == pytest.approx(18.0), (
-                f"Expected env-loader default 18.0, got {cfg_loaded.directional_budget_cap}"
+            assert cfg_loaded.directional_budget_cap == pytest.approx(500.0), (
+                f"Expected env-loader default 500.0, got {cfg_loaded.directional_budget_cap}"
             )
         finally:
             if prev is not None:

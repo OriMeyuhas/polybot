@@ -706,10 +706,11 @@ class LadderManager:
         if ev_per_share <= 0:
             return None
 
-        # Budget: use remaining available capital
-        lp = self.cfg.get_ladder_params(market.timeframe_sec, current_bankroll=self.positions.bankroll)
+        # Budget: one-sided high-conviction buy = 10% of bankroll (user directive 2026-04-18).
+        # Paired ladders use position_size_fraction (5%); directional buys have higher
+        # certainty (>=92%) so they lean in with double the per-side allocation.
         available = self.positions.bankroll - self.total_committed()
-        budget = min(lp.position_size_fraction * self.positions.bankroll * 0.5, available, self.cfg.directional_budget_cap)
+        budget = min(0.10 * self.positions.bankroll, available)
         if budget < MIN_ORDER_SIZE * best_ask:
             return None
 
@@ -1201,22 +1202,25 @@ class LadderManager:
                 # spot-delta branches — they would overwrite the gate's decision.
                 pass
             elif self.cfg.fv_gate_enabled and cert >= 0.80:
-                capped_budget = min(budget, dir_cap)
+                # One-sided post = 10% of bankroll (user directive 2026-04-18).
+                # Higher conviction than paired, so lean in with the full 10%-of-bankroll
+                # allocation rather than the paired per-side fraction.
+                one_sided_budget = min(0.10 * self.positions.bankroll, available)
                 if fair_up > 0.5:
                     # UP is winning — don't post DN
-                    budget_up = capped_budget
+                    budget_up = one_sided_budget
                     budget_dn = 0.0
                     logger.info(
-                        "FV GATE: %s certainty %.0f%% UP — DN skipped, UP budget=$%.2f (cap=$%.2f)",
-                        market.market_id, cert * 100, capped_budget, dir_cap,
+                        "FV GATE: %s certainty %.0f%% UP — DN skipped, UP budget=$%.2f",
+                        market.market_id, cert * 100, one_sided_budget,
                     )
                 else:
                     # DN is winning — don't post UP
                     budget_up = 0.0
-                    budget_dn = capped_budget
+                    budget_dn = one_sided_budget
                     logger.info(
-                        "FV GATE: %s certainty %.0f%% DN — UP skipped, DN budget=$%.2f (cap=$%.2f)",
-                        market.market_id, cert * 100, capped_budget, dir_cap,
+                        "FV GATE: %s certainty %.0f%% DN — UP skipped, DN budget=$%.2f",
+                        market.market_id, cert * 100, one_sided_budget,
                     )
             else:
                 if not self.cfg.fv_gate_enabled and cert >= 0.80:
@@ -1232,16 +1236,17 @@ class LadderManager:
                 abs_delta = abs(spot_delta)
 
                 if abs_delta >= skip_thresh:
-                    capped_budget = min(budget, dir_cap)
+                    # One-sided post = 10% of bankroll (user directive 2026-04-18).
+                    one_sided_budget = min(0.10 * self.positions.bankroll, available)
                     if spot_delta > 0:
-                        budget_up = capped_budget
+                        budget_up = one_sided_budget
                         budget_dn = 0.0
                     else:
                         budget_up = 0.0
-                        budget_dn = capped_budget
+                        budget_dn = one_sided_budget
                     logger.info(
-                        "SPOT SKIP: %s delta=%.3f%% — one-side budget=$%.2f (cap=$%.2f)",
-                        market.market_id, spot_delta * 100, capped_budget, dir_cap,
+                        "SPOT SKIP: %s delta=%.3f%% — one-side budget=$%.2f",
+                        market.market_id, spot_delta * 100, one_sided_budget,
                     )
                 elif abs_delta >= reduce_thresh:
                     losing_frac = 0.5 * (1.0 - (abs_delta - reduce_thresh) / (skip_thresh - reduce_thresh))

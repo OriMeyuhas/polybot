@@ -398,22 +398,21 @@ class TestDirectionalBuy:
         result2 = lm.directional_buy(market, 1750, fair_up=0.90)
         assert result2 is None
 
-    def test_directional_buy_budget_capped_by_directional_budget_cap(self):
-        """directional_buy budget must never exceed cfg.directional_budget_cap.
+    def test_directional_buy_budget_is_10pct_of_bankroll_large(self):
+        """directional_buy budget = 10% of bankroll (user directive 2026-04-18).
 
-        Use a large bankroll ($10 000) and a tiny cap ($10) so that the
-        fraction-based formula (bankroll * position_size_fraction * 0.5)
-        would produce ~$500 without the cap. The cap must bind and the
-        placed order qty must equal cap / ask.
+        Use a large bankroll ($10 000) so that 10% = $1 000.
+        Old formula: bankroll * position_size_fraction * 0.5 = 10000 * 0.10 * 0.5 = $500.
+        New formula: 0.10 * bankroll = $1 000.
+        directional_budget_cap is no longer the ceiling — it is ignored in the budget clamp.
         """
-        cap = 10.0
         bankroll = 10_000.0
         ask = 0.50  # well below directional_max_ask=0.80
 
         cfg = _cfg(
             bankroll=bankroll,
             position_size_fraction=0.10,
-            directional_budget_cap=cap,
+            directional_budget_cap=500.0,   # high default — should not bind
             directional_max_ask=0.80,
             certainty_directional_threshold=0.85,
         )
@@ -430,13 +429,14 @@ class TestDirectionalBuy:
         result = lm.directional_buy(market, 1720, fair_up=0.95)
         assert result is not None, "directional_buy should fire at high certainty"
 
-        # Inspect the qty passed to place_limit_buy — must be <= cap / ask
+        # Inspect the qty passed to place_limit_buy — must be == 10% bankroll / ask
         call_args = lm.executor.place_limit_buy.call_args
         placed_qty = call_args[0][2]  # positional arg index 2 = qty
-        max_allowed_qty = cap / ask
-        assert placed_qty <= max_allowed_qty + 1e-9, (
-            f"qty {placed_qty:.4f} exceeds directional_budget_cap={cap} / ask={ask} "
-            f"= {max_allowed_qty:.4f}"
+        expected_budget = 0.10 * bankroll   # $1000
+        expected_qty = expected_budget / ask  # 2000 shares
+        assert placed_qty == pytest.approx(expected_qty, rel=0.02), (
+            f"qty {placed_qty:.2f} should equal 10% bankroll / ask = "
+            f"{expected_budget:.0f} / {ask} = {expected_qty:.2f}"
         )
 
 
