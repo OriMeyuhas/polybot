@@ -779,8 +779,12 @@ class Bot:
                 if not market:
                     continue
                 side_label = "UP" if order.side == Side.UP else "DN"
+                # Distinguish BUY fills from FV-exit SELL fills so downstream
+                # analyzers can correctly attribute direction without mis-reading.
+                fill_dir = getattr(order, 'fill_direction', 'BUY')
+                fill_event = "sell_fill" if fill_dir == "SELL" else "buy_fill"
                 self.data_recorder.log_order(
-                    time.time(), "fill", market.market_id,
+                    time.time(), fill_event, market.market_id,
                     side_label, order.price, order.size,
                     order.order_id, "detected",
                 )
@@ -1158,16 +1162,25 @@ class Bot:
 
         pos = self.position_manager.positions.get(mid)
         if pos:
+            # Pop any realized PnL from FV-exit SELLs that fired mid-window.
+            # SELL proceeds already credited bankroll at fill time; this tracks the PnL
+            # component (proceeds - cost_basis) so settlement records are accurate.
+            realized_prior = self.ladder_manager._realized_in_window.pop(mid, 0.0)
+
             if normalized == "UP":
-                pnl = pos.profit_if_up()
+                settle_pnl = pos.profit_if_up()
                 winning = pos.up_qty - pos.up_cost if pos.up_qty > 0 else 0.0
                 losing = pos.dn_cost
             else:
-                pnl = pos.profit_if_down()
+                settle_pnl = pos.profit_if_down()
                 winning = pos.dn_qty - pos.dn_cost if pos.dn_qty > 0 else 0.0
                 losing = pos.up_cost
 
-            logger.info("Settled %s: %s, PnL=$%.2f", mid, normalized, pnl)
+            # Total reported PnL = end-of-window delta + prior SELL realized PnL
+            pnl = settle_pnl + realized_prior
+
+            logger.info("Settled %s: %s, PnL=$%.2f (settle=$%.2f + prior_realized=$%.2f)",
+                        mid, normalized, pnl, settle_pnl, realized_prior)
             self.risk.update_pnl(pnl)
             self._realized_pnl += pnl
             if not hasattr(self, '_per_asset_pnl'):
@@ -1187,10 +1200,12 @@ class Bot:
             if is_balanced:
                 self._settled_pair_costs.append(pos.pair_cost())
 
-            # Only update bankroll from PnL in paper mode.
+            # Only update bankroll from end-of-window settle_pnl in paper mode.
+            # SELL proceeds were already credited to bankroll at fill time;
+            # adding settle_pnl here accounts only for the remaining position value.
             # In live mode, on-chain balance is the source of truth.
             if self.cfg.dry_run:
-                self.position_manager.bankroll += pnl
+                self.position_manager.bankroll += settle_pnl
 
             if losing > 0:
                 detail = f"{normalized} won \u2192 \u2191 +${winning:.2f} \u2193 -${losing:.2f} = net ${pnl:+.2f}"

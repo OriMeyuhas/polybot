@@ -169,6 +169,10 @@ def _make_bot_with_position(mid="m1", outcome=None):
     bot.redeemer = MagicMock()
     bot.redeemer.queue_redemption = MagicMock()
 
+    # Ladder manager mock: _realized_in_window must be a real dict so pop() works
+    bot.ladder_manager = MagicMock()
+    bot.ladder_manager._realized_in_window = {}
+
     # Position manager with a real position
     bot.position_manager = MagicMock()
     pos = Position(market_id=mid, up_qty=10, up_cost=4.0, dn_qty=10, dn_cost=5.0)

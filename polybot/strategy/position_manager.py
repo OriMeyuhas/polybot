@@ -29,23 +29,28 @@ class PositionManager:
             pos.dn_qty += qty
             pos.dn_cost += cost
 
-    def reduce_position(self, market_id: str, side: Side, qty: float, proceeds: float):
-        """Reduce a position by selling shares. Returns capital recovered."""
+    def reduce_position(self, market_id: str, side: Side, qty: float, proceeds: float) -> float:
+        """Reduce a position by selling shares. Returns realized PnL (proceeds - cost_basis)."""
         pos = self.positions.get(market_id)
         if pos is None:
-            return
+            return 0.0
         if side == Side.UP:
             sold = min(qty, pos.up_qty)
             if sold > 0 and pos.up_qty > 0:
                 cost_frac = sold / pos.up_qty
-                pos.up_cost -= pos.up_cost * cost_frac
+                cost_basis = pos.up_cost * cost_frac
+                pos.up_cost -= cost_basis
                 pos.up_qty -= sold
+                return proceeds - cost_basis
         else:
             sold = min(qty, pos.dn_qty)
             if sold > 0 and pos.dn_qty > 0:
                 cost_frac = sold / pos.dn_qty
-                pos.dn_cost -= pos.dn_cost * cost_frac
+                cost_basis = pos.dn_cost * cost_frac
+                pos.dn_cost -= cost_basis
                 pos.dn_qty -= sold
+                return proceeds - cost_basis
+        return 0.0
 
     def remove_position(self, market_id: str):
         self.positions.pop(market_id, None)

@@ -164,6 +164,8 @@ class LadderManager:
         # Proposal #54: pending guard-fire events for bot loop to drain and record to activity log
         self._recent_aborts: list[dict] = []           # ONE-SIDED ABORT fires
         self._recent_circuit_breaker_fires: list[dict] = []  # FV CANCEL CIRCUIT BREAKER fires
+        # Settlement attribution: realized PnL from FV-exit SELLs, popped at window expiry
+        self._realized_in_window: dict[str, float] = {}
 
     def _fill_cost(self, price: float, qty: float) -> float:
         """Fee-inclusive cost for qty shares at price."""
@@ -1495,14 +1497,17 @@ class LadderManager:
             if fill_side_raw == "SELL":
                 # SELL fill: reduce position and recover capital
                 proceeds = order.price * fill_qty
-                self.positions.reduce_position(
+                realized = self.positions.reduce_position(
                     order.market_id, order.side, fill_qty, proceeds,
                 )
-                # Credit recovered capital to bankroll
+                # Accumulate realized PnL for settlement attribution (popped by bot._settle_position)
+                mid = order.market_id
+                self._realized_in_window[mid] = self._realized_in_window.get(mid, 0.0) + realized
+                # Credit recovered capital to bankroll (backward-compatible; bankroll invariant is a separate fix)
                 self.positions.bankroll += proceeds
-                logger.info("SELL FILL: %s %s %.1f @ $%.2f on %s (recovered $%.2f)",
+                logger.info("SELL FILL: %s %s %.1f @ $%.2f on %s (recovered $%.2f, realized $%.2f)",
                              order.side.value, order.token_id[:16],
-                             fill_qty, order.price, order.market_id, proceeds)
+                             fill_qty, order.price, order.market_id, proceeds, realized)
             else:
                 # BUY fill: add to position
                 self.positions.update_position(
@@ -1515,6 +1520,7 @@ class LadderManager:
             order.status = "filled"
             order.filled = fill_qty
             order.credited_to_pm = fill_qty
+            order.fill_direction = fill_side_raw  # "BUY" or "SELL" for downstream logging
             filled.append(order)
 
             # Synchronous one-sided abort: check immediately after crediting each fill

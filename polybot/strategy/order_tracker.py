@@ -19,6 +19,7 @@ class TrackedOrder:
     status: str = "resting"  # resting, partial, filled, cancelled, cancelling
     placed_at: float = 0.0
     credited_to_pm: float = 0.0
+    fill_direction: str = ""  # "BUY" or "SELL" — set when fill is processed
 
 
 class OrderTracker:
