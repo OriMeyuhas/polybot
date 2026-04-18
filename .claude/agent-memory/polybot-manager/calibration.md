@@ -519,3 +519,134 @@ gives the plan an overnight review window.
 - Late-window FV cancel elapsed% threshold (currently 83%; untested)
 - Rungs count at non-default values combined with wider width (not swept jointly)
 - Binance-FV dispatch mode (requires Binance-aware harness, not built yet)
+
+---
+
+## Cycle 29 ship — 2026-04-18 (8d200ba)
+
+**Fix**: persist book-mid gate decision across reprice. Root cause of cycle 28
+losses identified in `project_cycle28_reprice_path_bug.md`: reprice_if_needed()
+rebuilt bilateral ladders ~10s after initial post, nullifying the gate's one-
+sided budget decision. Market btc-updown-15m-1776474900 gated "post DN only $18"
+but settled up_qty=198.3 / dn_qty=8.9 — completely inverted.
+
+**Change**: three additive fields on LadderState (gate_fired, gate_winner_side,
+gate_budget_cap); post_ladder persists them on gate fire; reprice_if_needed
+checks them before computing budgets. Inventory-skew logic retained for the
+gate-miss / bilateral case.
+
+**Tests**: 5 new in TestRepriceGatePersistence (book_mid_gate.py). Suite
+1015 passed (was 1010). Commit `8d200ba`.
+
+**Deploy state**:
+- Old PIDs 35808/38420 killed. New PIDs 29088 / 7340.
+- BANKROLL=548.86 (last settlement value).
+- POSITION_SIZE_FRACTION stayed at 0.01 — did NOT bump to 0.05 this ship.
+  Rationale: cycle 28 rolling 20 is −$5.16 and the bot has been in small-size
+  measurement mode for hours. Want a clean gate-fix baseline before scaling.
+  Plan: if next 20 settlements are flat-to-positive at 0.01 AND up_qty/dn_qty
+  pattern confirms loser-side is 0 on gate-fired markets, bump to 0.05 in
+  cycle 30.
+- SKIP_ON_GATE_MISS=true unchanged.
+
+**Watch post-ship**:
+- `grep "REPRICE gate-persist" polybot.log` should appear on gate-fired markets
+- Settlement row: on a gate-fired UP market, `dn_qty` must be ≈ 0 (was ~198
+  pre-fix). If dn_qty > 5 on such a market → fix not working → revert.
+- Rolling-20 rollback trigger: < −$10 at size 0.01 over next 20 settlements.
+
+**Plan**: `docs/plans/2026-04-18-reprice-gate-persistence.md`.
+
+## Cycle 30 — Early post-fix monitoring (2026-04-18)
+
+Snapshot at cycle start: 47 settlements total, rolling-20 = 7W/12L / −$18.05,
+session PnL +$0.99, 3 trades since restart (bot up since 05:27:06 on commit 8d200ba).
+
+**Post-fix settlements analysed (ts > 1776478026, restart time)**: 1.
+- Market 1776478500, outcome UP, gate fired UP at 05:27:47 (cert=91%, book_mid_up=0.955).
+  Settlement: up_qty=9.0, **dn_qty=0.0**, pnl +$0.99, no pair_cost.
+  Exactly the post-fix expected pattern: loser side is silent.
+
+Contrast: pre-fix market 1776477600 (same day, 05:11:18 settlement) gate-fired UP but
+settled up_qty=0 / dn_qty=73.5 — loser side fully populated by reprice leak. The n=1
+post-fix qty profile is a direct inversion of that.
+
+**REPRICE gate-persist log confirmed emitting**: 36 occurrences in polybot.log; the
+currently-running market (btc-updown-15m-1776479400, gate fired DN at 05:34:31) has
+the line at 10s cadence with `winner=DOWN cap=$18.00`. Path is active.
+
+**Verdict**: still too early (n=1 settled, n=2 gate-fired windows). Fix *appears*
+working but statistical confidence is zero. Need ≥5 post-fix gate-fired settlements
+to call it, and ≥20 for proper rolling-20 comparison.
+
+**Size-bump promotion rule** (confirming cycle 29 plan):
+- Required: ≥10 post-fix settlements AND ≥3 gate-fired markets with loser-side qty ≤ 5
+  each AND rolling-10 sum ≥ −$3 at 0.01 size (roughly flat).
+- If met: cycle 31 ships POSITION_SIZE_FRACTION 0.01 → 0.05 (1-line .env edit + restart,
+  no code chain needed per prior policy).
+- If rolling-10 < −$5 at 0.01 at any point → re-assess before any size bump.
+
+## Cycle 31 — Post-fix n=2 observation, HOLD at 0.01 (2026-04-18)
+
+Snapshot: 48 settlements, rolling-20 = 8W/11L / **+$42.22** (jumped +$60.27 from
+cycle 30's −$18.05), rolling-10 = 3W/7L / −$0.94, session PnL +$58.99, 10 trades.
+
+**Post-fix gate-fired settlements (n=2)**:
+- Market ...78500 (cycle 30): up_qty=9.0, dn_qty=0.0, pnl +$0.99, outcome UP ✓
+- Market ...79400 (this cycle): up_qty=0.0, dn_qty=89.5, pnl +$58.00, outcome DOWN ✓
+- Sum +$58.99 / n=2 = **+$29.49/mkt** (Dome projected +$4.36/mkt)
+
+Pre-fix comparison: market ...77600 gate-fired UP but settled up_qty=0 / dn_qty=73.5
+and lost −$2.27 (loser side populated by reprice leak). The two post-fix markets
+are perfect inversions — loser side is silent, exactly the target behavior.
+
+**REPRICE gate-persist**: 65 occurrences in polybot.log, still emitting on active
+markets. 0 ERROR/CRITICAL/Traceback lines since restart. Path is healthy.
+
+**Promotion gate (POSITION_SIZE_FRACTION 0.01 → 0.05) — status**:
+| condition | threshold | current | pass? |
+|-----------|----------:|--------:|------:|
+| post-fix settlements | ≥ 10 | 2 | NO |
+| gate-fired markets, loser-qty ≤ 5 | ≥ 3 | 2 | NO |
+| rolling-10 at 0.01 | ≥ −$3 | −$0.94 | YES |
+
+**Decision**: HOLD at 0.01. Do not ship promotion. Cycle 16's t-stat lesson: n=2
+with one +$58 outlier is small-sample luck until proven otherwise. Dome +$4.36/mkt
+is the reference mean; the observed +$29.49/mkt is almost certainly regression-
+bound downward as n grows.
+
+**Strong-temptation check**: exit criterion "rolling PnL > +$20 over 20" is
+currently +$42.22, but the spirit requires post-fix n ≥ 20 validation AT
+PROMOTED SIZE (0.05), not accumulated variance from pre-fix + mixed settlements.
+Do NOT declare exit. The +$58 row is a single directional win.
+
+**Earliest cycle to evaluate promotion**: when n_post-fix ≥ 10, roughly
+~2 hours more of paper run from current timestamp. Expect cycle 32-33 window.
+
+**No ship, no dispatch, no config change this cycle.** Pure observation.
+
+## Cycle 35 — Promote POSITION_SIZE_FRACTION 0.01 → 0.05 (2026-04-18)
+
+**chore(calibration): promote POSITION_SIZE_FRACTION 0.01→0.05 (cycle 35, post reprice-fix validation)**
+
+Cycle 34 data (45 post-fix settlements):
+- 24 strict one-sided (loser_qty=0) + 14 paired + 7 small-loser-fill
+- Rolling-10 +$21.36 (≥ −$3 ✓), rolling-20 +$38.78
+- Post-fix total PnL +$17.40
+
+Promotion gate (inclusive reading — loser_qty=0 satisfies ≤5):
+| condition | threshold | observed | pass |
+|-----------|----------:|---------:|-----:|
+| post-fix settlements | ≥ 10 | 45 | YES |
+| gate-fired markets, loser-qty ≤ 5 | ≥ 3 | 24 strict + 7 small | YES |
+| rolling-10 at 0.01 | ≥ −$3 | +$21.36 | YES |
+
+**Action**: `.env` edit only — `POSITION_SIZE_FRACTION 0.01 → 0.05`, `BANKROLL 548.86 → 617.12` (latest settlement). No code change, no commit (`.env` gitignored). Observability log line at bot.py:1069 NOT bundled — line 1069 is existing code, not an added log; supervisor description mismatch. Kept pure env flip for minimal surface.
+
+Tests: 1015/1015 passed (unchanged, no code diff).
+
+**Rollback guards (cycle 35)**:
+1. Revert POSITION_SIZE_FRACTION to 0.01 if next 20 settlements sum PnL < −$20 (5x scale from cycle 24's −$10 floor).
+2. Revert if any single-market loss > $50.
+3. Bankroll hard floor $200 unchanged.
+
