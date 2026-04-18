@@ -302,6 +302,13 @@ class LadderManager:
         try:
             record = self.executor.place_limit_buy(
                 light_token, best_ask, deficit, mid, light_side,
+                gate_fired=False,
+                gate_reason="no_eval",
+                book_mid=None,
+                fv_price=None,
+                fv_certainty=None,
+                spread=None,
+                origin="initial_post",
             )
         except ClobApiError:
             return None
@@ -443,6 +450,13 @@ class LadderManager:
             record = self.executor.place_limit_sell(
                 sell_token, sell_price, sell_qty, mid, sell_side,
                 expiration=expiration,
+                gate_fired=False,
+                gate_reason="no_eval",
+                book_mid=None,
+                fv_price=None,
+                fv_certainty=None,
+                spread=None,
+                origin="initial_post",
             )
         except ClobApiError:
             return None
@@ -588,10 +602,20 @@ class LadderManager:
 
         # Place chase orders with GTD expiration
         expiration = int(market.close_epoch - self.cfg.no_trade_final_sec)
+        _chase_gate_ctx = {
+            "gate_fired": False,
+            "gate_reason": "no_eval",
+            "book_mid": None,
+            "fv_price": None,
+            "fv_certainty": None,
+            "spread": None,
+            "origin": "initial_post",
+        }
         order_dicts = [
             {"token_id": chase_token, "price": price, "size": size,
              "market_id": mid, "side": chase_side,
-             "expiration": expiration}
+             "expiration": expiration,
+             **_chase_gate_ctx}
             for price, size in chase_rungs
         ]
         count = 0
@@ -697,6 +721,13 @@ class LadderManager:
             record = self.executor.place_limit_buy(
                 buy_token, best_ask, qty, mid, buy_side,
                 expiration=expiration,
+                gate_fired=False,
+                gate_reason="no_eval",
+                book_mid=None,
+                fv_price=fair_up,
+                fv_certainty=cert,
+                spread=None,
+                origin="initial_post",
             )
         except ClobApiError:
             return None
@@ -872,10 +903,20 @@ class LadderManager:
 
         # Place orders with GTD expiration
         expiration = int(market.close_epoch - self.cfg.no_trade_final_sec)
+        _boost_gate_ctx = {
+            "gate_fired": False,
+            "gate_reason": "no_eval",
+            "book_mid": None,
+            "fv_price": None,
+            "fv_certainty": None,
+            "spread": None,
+            "origin": "initial_post",
+        }
         order_dicts = [
             {"token_id": light_token, "price": price, "size": size,
              "market_id": mid, "side": light_side,
-             "expiration": expiration}
+             "expiration": expiration,
+             **_boost_gate_ctx}
             for price, size in new_rungs
         ]
         count = 0
@@ -997,6 +1038,11 @@ class LadderManager:
             # losing side and caps directional budget at directional_budget_cap.
             # Falls through silently (gate not fired) on any None / wide-spread / degenerate case.
             book_mid_gate_fired = False
+            # Defaults for log instrumentation — overwritten inside the gate block when enabled
+            _log_gate_reason = "no_eval"
+            _log_book_mid: float | None = None
+            _log_fv_certainty_gate: float | None = None
+            _log_spread: float | None = None
             if self.cfg.book_mid_gate_enabled:
                 _up_mid = self.executor.get_midpoint(market.up_token_id)
                 _dn_mid = self.executor.get_midpoint(market.dn_token_id)
@@ -1043,6 +1089,10 @@ class LadderManager:
                         "spread_up=%s spread_dn=%s cert=None",
                         market.market_id, _spread_up_str, _spread_dn_str,
                     )
+                    _log_gate_reason = "crossed_book"
+                    _log_book_mid = None
+                    _log_fv_certainty_gate = None
+                    _log_spread = _spread_up
                 elif (
                     _has_all_data
                     and _spread_up is not None and _spread_up <= _max_spread
@@ -1068,6 +1118,10 @@ class LadderManager:
                             market.market_id, _cert_book * 100, _side_label,
                             _capped_bmg, _dir_cap_bmg, _book_mid_up,
                         )
+                        _log_gate_reason = "fired"
+                        _log_book_mid = _book_mid_up
+                        _log_fv_certainty_gate = _cert_book
+                        _log_spread = _spread_up
                     else:
                         # Certainty too low — data is good, spreads are tight,
                         # but mid-based certainty didn't clear threshold.
@@ -1079,6 +1133,10 @@ class LadderManager:
                             "spread_up=%s spread_dn=%s cert=%s",
                             market.market_id, _spread_up_str, _spread_dn_str, _cert_str,
                         )
+                        _log_gate_reason = "fv_certainty_below_thresh"
+                        _log_book_mid = _book_mid_up
+                        _log_fv_certainty_gate = _cert_book
+                        _log_spread = _spread_up
                 elif _has_all_data:
                     # Spread too wide on one or both sides.
                     _spread_up_str = "%.4f" % _spread_up
@@ -1088,6 +1146,10 @@ class LadderManager:
                         "spread_up=%s spread_dn=%s cert=None",
                         market.market_id, _spread_up_str, _spread_dn_str,
                     )
+                    _log_gate_reason = "no_eval"
+                    _log_book_mid = None
+                    _log_fv_certainty_gate = None
+                    _log_spread = _spread_up
                 else:
                     # Missing bid/ask/mid data (or degenerate mids).
                     _spread_up_str = (
@@ -1101,6 +1163,10 @@ class LadderManager:
                         "spread_up=%s spread_dn=%s cert=None",
                         market.market_id, _spread_up_str, _spread_dn_str,
                     )
+                    _log_gate_reason = "no_eval"
+                    _log_book_mid = None
+                    _log_fv_certainty_gate = None
+                    _log_spread = None
 
                 # Cycle 24 H0: when the book-mid gate is enabled AND did not fire,
                 # skip the paired-ladder fallback entirely. Dome evidence (n=583,
@@ -1261,18 +1327,31 @@ class LadderManager:
             # GTD expiration: orders auto-cancel at window close minus safety buffer
             expiration = int(market.close_epoch - self.cfg.no_trade_final_sec)
 
+            # Gate instrumentation context for order log (pure observability, no behavior change)
+            _gate_ctx = {
+                "gate_fired": book_mid_gate_fired,
+                "gate_reason": _log_gate_reason,
+                "book_mid": _log_book_mid,
+                "fv_price": fair_up,
+                "fv_certainty": cert,
+                "spread": _log_spread,
+                "origin": "initial_post",
+            }
+
             # Build batch order list for UP side
             up_order_dicts = [
                 {"token_id": market.up_token_id, "price": price, "size": size,
                  "market_id": market.market_id, "side": Side.UP,
-                 "expiration": expiration}
+                 "expiration": expiration,
+                 **_gate_ctx}
                 for price, size in up_rungs
             ]
             # Build batch order list for DN side
             dn_order_dicts = [
                 {"token_id": market.dn_token_id, "price": price, "size": size,
                  "market_id": market.market_id, "side": Side.DOWN,
-                 "expiration": expiration}
+                 "expiration": expiration,
+                 **_gate_ctx}
                 for price, size in dn_rungs
             ]
 
@@ -1529,6 +1608,18 @@ class LadderManager:
                     budget_up_side = half_budget
                     budget_dn_side = half_budget
 
+                # Gate instrumentation for reprice: emit persisted state, not re-evaluated gate.
+                # (gate was evaluated once at post_ladder time; reprice logs what was decided then)
+                _reprice_gate_ctx = {
+                    "gate_fired": state.gate_fired,
+                    "gate_reason": "fired" if state.gate_fired else "no_eval",
+                    "book_mid": None,      # gate was evaluated at initial-post; no re-eval at reprice
+                    "fv_price": None,
+                    "fv_certainty": None,
+                    "spread": None,
+                    "origin": "reprice",
+                }
+
                 if up_moved:
                     # Flush uncredited partial fills before cancelling the side
                     for order, delta in self.tracker.flush_uncredited(mid):
@@ -1555,7 +1646,8 @@ class LadderManager:
                         up_order_dicts = [
                             {"token_id": market.up_token_id, "price": price, "size": size,
                              "market_id": mid, "side": Side.UP,
-                             "expiration": reprice_expiration}
+                             "expiration": reprice_expiration,
+                             **_reprice_gate_ctx}
                             for price, size in up_rungs
                         ]
                         for record in self.executor.place_batch_limit_buys(up_order_dicts):
@@ -1592,7 +1684,8 @@ class LadderManager:
                         dn_order_dicts = [
                             {"token_id": market.dn_token_id, "price": price, "size": size,
                              "market_id": mid, "side": Side.DOWN,
-                             "expiration": reprice_expiration}
+                             "expiration": reprice_expiration,
+                             **_reprice_gate_ctx}
                             for price, size in dn_rungs
                         ]
                         for record in self.executor.place_batch_limit_buys(dn_order_dicts):

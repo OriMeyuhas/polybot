@@ -99,9 +99,23 @@ class DataRecorder:
     # --- Stream 3: Our order lifecycle ---
 
     def log_order(self, ts: float, event: str, market_id: str, side: str,
-                  price: float, size: float, order_id: str = "", reason: str = ""):
-        """Log an order lifecycle event (post, reprice, cancel, fill)."""
-        self._append("order_log", {
+                  price: float, size: float, order_id: str = "", reason: str = "",
+                  # Gate-decision context — only included on POST events
+                  gate_fired: bool | None = None,
+                  gate_reason: str | None = None,
+                  book_mid: float | None = None,
+                  fv_price: float | None = None,
+                  fv_certainty: float | None = None,
+                  spread: float | None = None,
+                  origin: str | None = None):
+        """Log an order lifecycle event (post, reprice, cancel, fill).
+
+        Gate context fields (gate_fired, gate_reason, book_mid, fv_price,
+        fv_certainty, spread, origin) are written only when event == 'post'
+        and gate_fired is not None.  Older log entries without these fields
+        will not break analyzers that use .get() with defaults.
+        """
+        record: dict = {
             "ts": round(ts, 3),
             "event": event,
             "market_id": market_id,
@@ -110,7 +124,16 @@ class DataRecorder:
             "size": size,
             "order_id": order_id[:16] if order_id else "",
             "reason": reason,
-        }, ts)
+        }
+        if event == "post" and gate_fired is not None:
+            record["gate_fired"] = gate_fired
+            record["gate_reason"] = gate_reason if gate_reason is not None else "no_eval"
+            record["book_mid"] = book_mid
+            record["fv_price"] = fv_price
+            record["fv_certainty"] = fv_certainty
+            record["spread"] = spread
+            record["origin"] = origin if origin is not None else "initial_post"
+        self._append("order_log", record, ts)
 
     # --- Stream 4: Polymarket trades ---
 

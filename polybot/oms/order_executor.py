@@ -115,6 +115,14 @@ class OrderExecutor:
         market_id: str,
         side: Side,
         expiration: int = 0,
+        # Gate-decision context forwarded to log_order
+        gate_fired: bool | None = None,
+        gate_reason: str | None = None,
+        book_mid: float | None = None,
+        fv_price: float | None = None,
+        fv_certainty: float | None = None,
+        spread: float | None = None,
+        origin: str | None = None,
     ) -> OrderRecord:
         """Place a single limit buy and return an OrderRecord.
 
@@ -173,6 +181,13 @@ class OrderExecutor:
             self._data_recorder.log_order(
                 time.time(), "post", market_id, side.value,
                 validated_price, size, record.order_id, "ladder",
+                gate_fired=gate_fired,
+                gate_reason=gate_reason,
+                book_mid=book_mid,
+                fv_price=fv_price,
+                fv_certainty=fv_certainty,
+                spread=spread,
+                origin=origin,
             )
         return record
 
@@ -184,6 +199,14 @@ class OrderExecutor:
         market_id: str,
         side: Side,
         expiration: int = 0,
+        # Gate-decision context forwarded to log_order
+        gate_fired: bool | None = None,
+        gate_reason: str | None = None,
+        book_mid: float | None = None,
+        fv_price: float | None = None,
+        fv_certainty: float | None = None,
+        spread: float | None = None,
+        origin: str | None = None,
     ) -> OrderRecord:
         """Place a single limit sell and return an OrderRecord.
 
@@ -239,6 +262,13 @@ class OrderExecutor:
             self._data_recorder.log_order(
                 time.time(), "post", market_id, side.value,
                 validated_price, size, record.order_id, "sell",
+                gate_fired=gate_fired,
+                gate_reason=gate_reason,
+                book_mid=book_mid,
+                fv_price=fv_price,
+                fv_certainty=fv_certainty,
+                spread=spread,
+                origin=origin,
             )
         return record
 
@@ -422,6 +452,10 @@ class OrderExecutor:
         placed sequentially.  ClobApiError from any individual order is logged
         as a warning and that order is skipped; a ClobApiError from the batch
         post propagates to the caller.
+
+        Each order dict may optionally include gate-context keys:
+        gate_fired, gate_reason, book_mid, fv_price, fv_certainty, spread, origin.
+        These are forwarded to place_limit_buy unchanged.
         """
         if not orders:
             return []
@@ -440,6 +474,13 @@ class OrderExecutor:
                         market_id=order["market_id"],
                         side=order["side"],
                         expiration=order.get("expiration", 0),
+                        gate_fired=order.get("gate_fired"),
+                        gate_reason=order.get("gate_reason"),
+                        book_mid=order.get("book_mid"),
+                        fv_price=order.get("fv_price"),
+                        fv_certainty=order.get("fv_certainty"),
+                        spread=order.get("spread"),
+                        origin=order.get("origin"),
                     )
                     results.append(record)
                 except ClobApiError as exc:
