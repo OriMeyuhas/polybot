@@ -259,6 +259,46 @@ class TestBookMidGateInstrumentation:
         cert_msg = [m for m in skip_msgs if "reason=certainty_too_low" in m][0]
         assert "cert=0.2000" in cert_msg, f"Expected cert=0.2000 in: {cert_msg}"
 
+    def test_skip_on_gate_miss_blocks_paired_fallback(self, caplog):
+        """Cycle 24 H0: when SKIP_ON_GATE_MISS=true and the gate misses,
+        post_ladder must return 0 and place no orders on either side."""
+        cfg = _cfg(skip_on_gate_miss=True)
+        # cert=0.20 < 0.65 -> gate misses (certainty_too_low branch).
+        lm = _make_manager(cfg, up_mid=0.60, dn_mid=0.40,
+                           up_bid=0.59, up_ask=0.61,
+                           dn_bid=0.39, dn_ask=0.41)
+
+        with caplog.at_level(logging.INFO, logger=self.LOGGER_NAME):
+            result = lm.post_ladder(_market(), spot_delta=0.0, fair_up=0.50)
+
+        assert result == 0, "post_ladder must return 0 when gate-miss skip fires"
+        assert not _posted_tokens(lm), \
+            "No orders should be placed on either side when gate-miss skip fires"
+        paired_skip_msgs = [
+            r.getMessage() for r in caplog.records
+            if "PAIRED SKIP: gate_missed + skip_on_gate_miss=true" in r.getMessage()
+        ]
+        assert paired_skip_msgs, \
+            f"Expected PAIRED SKIP log line, got: {[r.getMessage() for r in caplog.records]}"
+
+    def test_skip_on_gate_miss_false_preserves_paired_fallback(self):
+        """Cycle 24 H0 safety: when SKIP_ON_GATE_MISS=false (default), gate-miss
+        markets must still post both sides (no behavioural change when flag off)."""
+        cfg = _cfg(skip_on_gate_miss=False)
+        # Same gate-miss scenario as above.
+        lm = _make_manager(cfg, up_mid=0.60, dn_mid=0.40,
+                           up_bid=0.59, up_ask=0.61,
+                           dn_bid=0.39, dn_ask=0.41)
+
+        lm.post_ladder(_market(), spot_delta=0.0, fair_up=0.50)
+
+        tokens = _posted_tokens(lm)
+        assert "tok_up" in tokens and "tok_dn" in tokens, \
+            "With skip_on_gate_miss=false, gate-miss must fall through to paired ladder"
+        # place_batch_limit_buys was called with both UP and DN orders — that
+        # proves the fallback ran. We don't assert on the return value of
+        # post_ladder because the mocked executor returns [] on placement.
+
     def test_non_fire_crossed_book_logged(self, caplog):
         """Cycle 20/21: crossed book (bid > ask) -> reason=crossed_book, gate does not fire.
 

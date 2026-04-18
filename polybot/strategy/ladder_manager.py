@@ -1096,6 +1096,22 @@ class LadderManager:
                         market.market_id, _spread_up_str, _spread_dn_str,
                     )
 
+                # Cycle 24 H0: when the book-mid gate is enabled AND did not fire,
+                # skip the paired-ladder fallback entirely. Dome evidence (n=583,
+                # t=0.55) shows gate-miss subset at -$4.04/mkt with 95% CI
+                # [-5.42, -2.67]; live corroborates at -$12.23/mkt. The symmetric
+                # paired ladder on gate-miss markets is negative-EV; refusing to
+                # post captures the gate-fire subset's profitability (+$4.36/mkt,
+                # 97.6% WR) while cutting the bleed. Flag-gated so optionality
+                # is preserved — set SKIP_ON_GATE_MISS=false to restore pre-H0
+                # behavior without a code change.
+                if self.cfg.skip_on_gate_miss and not book_mid_gate_fired:
+                    logger.info(
+                        "PAIRED SKIP: gate_missed + skip_on_gate_miss=true %s",
+                        market.market_id,
+                    )
+                    return 0
+
             # FV gate: if certainty > 80% at posting time, skip the losing side entirely.
             # Threshold raised from 0.60 to 0.80 — 60% gate fired too often (76-84% loss
             # rate on 452 zero-fill one-sided windows). Only block posting when very confident.

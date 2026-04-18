@@ -233,6 +233,16 @@ class BotConfig:
     book_mid_gate_certainty_threshold: float = 0.65
     book_mid_gate_max_spread: float = 0.05
 
+    # Cycle 24 H0 (2026-04-18): when the book-mid gate does not fire, refuse
+    # to fall through to the symmetric paired-ladder. Dome (n=583, t=0.55)
+    # shows gate-miss subset at -$4.04/mkt (95% bootstrap CI [-5.42, -2.67],
+    # p(mean>=0)=0.0). Live (n=4 in current session window) corroborates at
+    # -$12.23/mkt. Shipping behind this flag preserves optionality: gate-fire
+    # markets (the profitable subset) trade unchanged; gate-miss markets are
+    # skipped entirely instead of being fed to a negative-EV paired fallback.
+    # Inert when book_mid_gate_enabled=False (there is no gate signal to miss).
+    skip_on_gate_miss: bool = False
+
     def get_ladder_params(self, timeframe_sec: int, current_bankroll: float | None = None) -> LadderParams:
         """Return ladder parameters tuned for the given timeframe.
 
@@ -508,6 +518,7 @@ def load_bot_config() -> BotConfig:
         book_mid_gate_enabled=os.getenv("BOOK_MID_GATE_ENABLED", "false").lower() in ("true", "1", "yes"),
         book_mid_gate_certainty_threshold=float(os.getenv("BOOK_MID_GATE_CERTAINTY_THRESHOLD", "0.65")),
         book_mid_gate_max_spread=float(os.getenv("BOOK_MID_GATE_MAX_SPREAD", "0.05")),
+        skip_on_gate_miss=os.getenv("SKIP_ON_GATE_MISS", "false").lower() in ("true", "1", "yes"),
     )
 
 
