@@ -1,5 +1,74 @@
 # Manager Calibration Notes
 
+## Cycle 28 — Rollback Guard Fired: POSITION_SIZE_FRACTION 0.05 → 0.01 (2026-04-18)
+
+**Trigger**: rolling-10 = -$48.45 (cycle-14 guard at -$30 fired). 45 settlements total, post-H0-ship
+n=4 sum = -$27.93. Settled bankroll $551.13 (was $579.06 at H0 ship). Bot was on a losing streak
+3 consecutive.
+
+**Evidence gathered before decision**:
+Decomposed last 4 post-H0 settlements by `BOOK MID GATE` log lines + `up_qty`/`dn_qty`:
+
+| market    | gate_posted | book_mid_up | outcome | correct? | up_qty | dn_qty | pnl    |
+|-----------|------------:|------------:|--------:|---------:|-------:|-------:|-------:|
+| ...74900  | DN (winner) | 0.205       | DOWN    | YES      | 198.3  | 8.9    | -15.38 |
+| ...75800  | DN (winner) | 0.215       | DOWN    | YES      | 131.6  | 11.1   |  -8.45 |
+| ...76700  | UP (winner) | 0.795       | UP      | YES      |   0.0  | 12.0   |  -4.92 |
+| ...74000  | UP (winner) | ~0.79       | UP      | YES      |  10.2  |  0.0   |  +0.82 |
+
+Gate direction: **4/4 CORRECT**. But 3/4 lost because the LOSER side filled heavily
+(198 UP shares when gate said "skip UP and post DN-only").
+
+**Root cause (new discovery, cycle 29 plan target)**: the book-mid gate only
+suppresses the FIRST `LADDER POSTED` call. Subsequent `REPRICE` events (every
+10s for 15 minutes = ~90 per market) call `post_orders` on BOTH sides without
+consulting `book_mid_gate_fired` or `skip_on_gate_miss`. The gate's decision
+is not persisted to the ladder state. Evidence: market 74900 posted `0 UP
+rungs + 10 DN rungs` at 04:26:27, then `REPRICE` at 04:26:37 placed a full
+UP ladder (9.3 + 10.4 + ... + 18.7 = 140 UP shares).
+
+Cycle-14 rollback-guard's thesis was "size was amplifying losses" — that is
+correct in a narrow sense: the reprice-path bug's bleed scales linearly with
+position_size_fraction. Reverting to 0.01 cuts the bleed 5x while a proper
+fix (persist gate decision across reprices) is planned for cycle 29.
+
+**Action taken**:
+- `.env`: `POSITION_SIZE_FRACTION 0.05 → 0.01`, `BANKROLL 563.05 → 551.13`
+- Kept `SKIP_ON_GATE_MISS=true` (gate-miss skip is working correctly — the
+  issue is specifically the gate-FIRE path on reprice)
+- Kept `FV_GATE_ENABLED=false`
+- No code changes. 1010/1010 tests green.
+- Bot restarted new PIDs 35808/38420, `/api/start` called successfully.
+
+**New rollback guards** (for the size-revert + H0 combo):
+1. Revert SKIP_ON_GATE_MISS to false if next 20 settlements sum PnL < -$10
+   (at 0.01 position size, the -$20 previous floor scales to ~-$4, but widen
+   to -$10 to account for variance on small-n).
+2. Revert BANKROLL/session-level: if bankroll < $500, STOP and escalate.
+3. Original cycle-14 guard is now re-armed at -$30 rolling-10 (but at 0.01
+   size the expected drawdown is 5x smaller, so this should not fire under
+   normal conditions).
+
+**Cycle 29 queue (HIGHEST PRIORITY)**:
+Plan + ship a fix for the reprice-path gate-persistence bug. Options:
+  A. Store `book_mid_gate_fired` + `gate_side` on the ladder state for the
+     window; reprices honor the one-sided budget.
+  B. On reprice, re-run the book-mid gate and skip the loser side same as
+     initial post. Risk: gate may not fire later in window (certainty shifts)
+     leading to belated two-sided ladder.
+Preferred: (A) — decision is sticky per window. Requires ladder state
+extension + reprice path gate-aware.
+
+**What to watch next 10 settlements**:
+- Session PnL on 0.01 size should stay within [-$15, +$15] range
+- Rolling-10 should climb back above -$10 within 10 settlements if random
+- Per-market mean PnL target: ≥ -$0.50 (equivalent to pre-cycle-14 baseline
+  at 0.01 size, based on cycle 15 holdout $-3.74/mkt × 0.01/0.05 size = -$0.75)
+- If rolling-10 climbs above $0 → reprice-path bug hypothesis confirmed:
+  the losses were size × reprice-path leakage
+- If rolling-10 stays below -$10 → bigger regime issue, consider Option B
+  (SKIP_ON_GATE_MISS revert) next cycle
+
 ## Cycle 24 — H0 Gate-Miss Skip Shipped (2026-04-18)
 
 **What shipped**: `skip_on_gate_miss` flag in `BotConfig` + early-return in
