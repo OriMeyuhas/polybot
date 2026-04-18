@@ -1487,6 +1487,7 @@ class DomeMarketData:
     outcome: str | None        # "UP" or "DOWN" from winning_side.label
 
     # Book state at window open (median of all snapshots, which are all at open)
+    # Used for fill simulation — covers the full collection window.
     up_best_bid: float
     up_best_ask: float
     dn_best_bid: float
@@ -1510,6 +1511,15 @@ class DomeMarketData:
     # Full orderbook time series: list of (ts_sec, best_bid, best_ask) sorted by ts
     ob_up_series: list[tuple[float, float, float]] = field(default_factory=list)
     ob_dn_series: list[tuple[float, float, float]] = field(default_factory=list)
+
+    # Entry-window book state (median of snapshots within first 30s of window_start).
+    # Used for FV-gate and ladder-construction decisions to avoid look-ahead leakage
+    # from late-window snapshots.  Falls back to the full-window median when no
+    # early snapshots exist (legacy files without sub-30s data).
+    entry_up_best_bid: float = 0.0
+    entry_up_best_ask: float = 1.0
+    entry_dn_best_bid: float = 0.0
+    entry_dn_best_ask: float = 1.0
 
 
 def load_dome_snapshot(path: pathlib.Path) -> DomeMarketData | None:
@@ -1648,6 +1658,25 @@ def load_dome_snapshot(path: pathlib.Path) -> DomeMarketData | None:
     dn_best_bid = _median(ob_dn_bids) if ob_dn_bids else 0.0
     dn_best_ask = _median(ob_dn_asks) if ob_dn_asks else 1.0
 
+    # Entry-window medians: restrict to snapshots within first 30s of window_start.
+    # This prevents late-window book state from leaking into the gate decision at t=0.
+    # The 30s cutoff is a generous bound — real dome snapshots are clustered in the
+    # first ~16s, so any threshold in [20, 60] gives the same result on real data.
+    _ENTRY_WINDOW_SECS = 30.0
+    entry_cutoff_sec = window_start + _ENTRY_WINDOW_SECS
+
+    entry_up_bids = [bid for (ts, bid, _ask) in ob_up_series_raw if ts < entry_cutoff_sec]
+    entry_up_asks = [ask for (ts, _bid, ask) in ob_up_series_raw if ts < entry_cutoff_sec]
+    entry_dn_bids = [bid for (ts, bid, _ask) in ob_dn_series_raw if ts < entry_cutoff_sec]
+    entry_dn_asks = [ask for (ts, _bid, ask) in ob_dn_series_raw if ts < entry_cutoff_sec]
+
+    # Fall back to full-window median when no entry-window snapshots exist
+    # (e.g. legacy files with only late-window data).
+    entry_up_best_bid = _median(entry_up_bids) if entry_up_bids else up_best_bid
+    entry_up_best_ask = _median(entry_up_asks) if entry_up_asks else up_best_ask
+    entry_dn_best_bid = _median(entry_dn_bids) if entry_dn_bids else dn_best_bid
+    entry_dn_best_ask = _median(entry_dn_asks) if entry_dn_asks else dn_best_ask
+
     binance_series.sort(key=lambda x: x[0])
 
     # Sort orderbook series by timestamp
@@ -1666,6 +1695,10 @@ def load_dome_snapshot(path: pathlib.Path) -> DomeMarketData | None:
         up_best_ask=up_best_ask,
         dn_best_bid=dn_best_bid,
         dn_best_ask=dn_best_ask,
+        entry_up_best_bid=entry_up_best_bid,
+        entry_up_best_ask=entry_up_best_ask,
+        entry_dn_best_bid=entry_dn_best_bid,
+        entry_dn_best_ask=entry_dn_best_ask,
         ptb=ptb,
         binance_at_close=binance_at_close,
         chainlink_at_close=chainlink_at_close,
@@ -1724,9 +1757,11 @@ def simulate_market_dome(
     # This is valid because we could have retrieved price data during the window
     # from Binance WS (which is available in real trading).
     # -------------------------------------------------------------------
-    # FV at entry: use market-implied probability from book mid-price
-    up_mid = (dome.up_best_bid + dome.up_best_ask) / 2.0
-    dn_mid = (dome.dn_best_bid + dome.dn_best_ask) / 2.0
+    # FV at entry: use market-implied probability from entry-window book mid-price.
+    # We use entry_up_best_bid/ask (first-30s snapshots only) to avoid look-ahead
+    # leakage from late-window orderbook state into the t=0 gate decision.
+    up_mid = (dome.entry_up_best_bid + dome.entry_up_best_ask) / 2.0
+    dn_mid = (dome.entry_dn_best_bid + dome.entry_dn_best_ask) / 2.0
     # Normalize: market-implied P(UP) = UP_mid / (UP_mid + DN_mid)
     # But simpler: use UP_mid directly as proxy for P(UP)
     fv_up_entry = max(0.01, min(0.99, up_mid))
@@ -1756,10 +1791,12 @@ def simulate_market_dome(
             f"cert={cert:.3f} >= threshold={cfg.fv_gate_certainty_threshold}"))
 
     # -------------------------------------------------------------------
-    # Build ladders from book state at open
+    # Build ladders from entry-window book state at open.
+    # Use entry_up_best_ask (first-30s snapshots) so ladder pricing reflects
+    # the actual book state the bot would have seen at t=0, not end-of-window state.
     # -------------------------------------------------------------------
-    up_ask_initial = dome.up_best_ask
-    dn_ask_initial = dome.dn_best_ask
+    up_ask_initial = dome.entry_up_best_ask
+    dn_ask_initial = dome.entry_dn_best_ask
 
     if fv_blocked:
         winning_side = "UP" if fv_up >= 0.5 else "DN"

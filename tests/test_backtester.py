@@ -1008,6 +1008,20 @@ class TestSimulateMarketDome:
             ob_dn_series = [
                 (float(ws + i * 9), dn_ask - 0.02, dn_ask) for i in range(100)
             ]
+        # Entry-window values: use the same as full-window (series is constant in tests)
+        # ob_*_series entries start at ws=1_000_000 with step=9s, so first 30s has indices 0..3
+        entry_up_asks = [ask for (ts, _bid, ask) in ob_up_series if ts < ws + 30]
+        entry_up_bids = [bid for (ts, bid, _ask) in ob_up_series if ts < ws + 30]
+        entry_dn_asks = [ask for (ts, _bid, ask) in ob_dn_series if ts < ws + 30]
+        entry_dn_bids = [bid for (ts, bid, _ask) in ob_dn_series if ts < ws + 30]
+
+        def _med(vals: list, default: float) -> float:
+            if not vals:
+                return default
+            s = sorted(vals)
+            mid = len(s) // 2
+            return s[mid] if len(s) % 2 else (s[mid - 1] + s[mid]) / 2
+
         return DomeMarketData(
             market_slug="btc-updown-15m-1000000",
             condition_id="0xABCD",
@@ -1032,6 +1046,10 @@ class TestSimulateMarketDome:
             ob_dn_count=len(ob_dn_series),
             ob_up_series=ob_up_series,
             ob_dn_series=ob_dn_series,
+            entry_up_best_bid=_med(entry_up_bids, up_ask - 0.02),
+            entry_up_best_ask=_med(entry_up_asks, up_ask),
+            entry_dn_best_bid=_med(entry_dn_bids, dn_ask - 0.02),
+            entry_dn_best_ask=_med(entry_dn_asks, dn_ask),
         )
 
     def test_paired_fill_both_sides(self):
