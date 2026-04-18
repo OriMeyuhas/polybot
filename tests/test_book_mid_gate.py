@@ -329,3 +329,170 @@ class TestBookMidGateInstrumentation:
         crossed_msg = [m for m in skip_msgs if "reason=crossed_book" in m][0]
         assert "spread_up=-0.4000" in crossed_msg, f"Expected spread_up=-0.4000 in: {crossed_msg}"
         assert "spread_dn=-0.4000" in crossed_msg, f"Expected spread_dn=-0.4000 in: {crossed_msg}"
+
+
+class TestRepriceGatePersistence:
+    """Cycle 29 — reprice path must honor the book-mid gate's one-sided decision.
+
+    Root cause of cycle 28 losses: gate fired "post DN only $18" on the initial
+    ladder post, but the reprice path (triggered ~10s later when the book moves
+    more than reprice_threshold) rebuilt the ladder bilaterally, negating the gate.
+    These tests pin the persistence behavior so the fix doesn't regress.
+    """
+
+    def _reset_batch(self, lm):
+        """Clear executor call history — we only care about reprice-posted orders."""
+        lm.executor.place_batch_limit_buys.reset_mock()
+        lm.executor.place_batch_limit_buys.return_value = []
+
+    def _force_reprice_trigger(self, lm, market, new_up_ask=None, new_dn_ask=None):
+        """Move the ask past the reprice_threshold so reprice_if_needed fires.
+
+        Bypasses MIN_REPRICE_INTERVAL by zeroing last_reprice_at on the state.
+        """
+        state = lm.ladders[market.market_id]
+        state.last_reprice_at = 0.0
+        if new_up_ask is not None:
+            state.anchor_up = max(0.0, new_up_ask - lm.cfg.reprice_threshold - 0.05)
+        if new_dn_ask is not None:
+            state.anchor_dn = max(0.0, new_dn_ask - lm.cfg.reprice_threshold - 0.05)
+
+    def test_reprice_honors_gate_fired_up_winner_no_dn_orders(self):
+        """Gate fires UP (up_mid=0.85/dn_mid=0.15). Force a reprice after both asks
+        move past threshold. The reprice path must NOT post any DN rungs — only UP."""
+        lm = _make_manager(up_mid=0.85, dn_mid=0.15,
+                           up_bid=0.84, up_ask=0.86,
+                           dn_bid=0.14, dn_ask=0.16)
+        market = _market()
+        lm.post_ladder(market, spot_delta=0.0, fair_up=0.50)
+
+        state = lm.ladders[market.market_id]
+        assert state.gate_fired is True
+        assert state.gate_winner_side is not None and state.gate_winner_side.value == "UP"
+
+        self._reset_batch(lm)
+        # Move asks so reprice triggers on both sides
+        lm.executor.get_best_ask.side_effect = lambda t: 0.92 if t == "tok_up" else 0.22
+        self._force_reprice_trigger(lm, market, new_up_ask=0.92, new_dn_ask=0.22)
+
+        lm.reprice_if_needed({market.market_id: market})
+
+        # Assert: only UP orders posted on reprice, NO DN orders
+        reprice_tokens = []
+        for call in lm.executor.place_batch_limit_buys.call_args_list:
+            orders = call.args[0] if call.args else call.kwargs.get("orders", [])
+            for o in orders:
+                reprice_tokens.append(o.get("token_id"))
+        assert "tok_dn" not in reprice_tokens, (
+            f"REPRICE posted DN on a gate-UP market: {reprice_tokens}"
+        )
+
+    def test_reprice_honors_gate_fired_dn_winner_no_up_orders(self):
+        """Mirror: gate fires DN. Reprice must not post any UP rungs."""
+        lm = _make_manager(up_mid=0.15, dn_mid=0.85,
+                           up_bid=0.14, up_ask=0.16,
+                           dn_bid=0.84, dn_ask=0.86)
+        market = _market()
+        lm.post_ladder(market, spot_delta=0.0, fair_up=0.50)
+
+        state = lm.ladders[market.market_id]
+        assert state.gate_fired is True
+        assert state.gate_winner_side is not None and state.gate_winner_side.value == "DOWN"
+
+        self._reset_batch(lm)
+        lm.executor.get_best_ask.side_effect = lambda t: 0.22 if t == "tok_up" else 0.92
+        self._force_reprice_trigger(lm, market, new_up_ask=0.22, new_dn_ask=0.92)
+
+        lm.reprice_if_needed({market.market_id: market})
+
+        reprice_tokens = []
+        for call in lm.executor.place_batch_limit_buys.call_args_list:
+            orders = call.args[0] if call.args else call.kwargs.get("orders", [])
+            for o in orders:
+                reprice_tokens.append(o.get("token_id"))
+        assert "tok_up" not in reprice_tokens, (
+            f"REPRICE posted UP on a gate-DN market: {reprice_tokens}"
+        )
+
+    def test_reprice_budget_capped_at_gate_cap(self):
+        """Gate caps budget at directional_budget_cap ($20). Reprice's UP-side
+        notional must stay at or below that cap even if half_budget would be larger.
+        Uses position_size_fraction=0.40 on $500 bankroll to make uncapped half_budget ~$100."""
+        lm = _make_manager(
+            _cfg(directional_budget_cap=20.0, position_size_fraction=0.40),
+            up_mid=0.90, dn_mid=0.10,
+            up_bid=0.89, up_ask=0.91,
+            dn_bid=0.09, dn_ask=0.11,
+        )
+        market = _market()
+        lm.post_ladder(market, spot_delta=0.0, fair_up=0.50)
+
+        state = lm.ladders[market.market_id]
+        assert state.gate_fired is True
+        assert state.gate_budget_cap == 20.0
+
+        self._reset_batch(lm)
+        lm.executor.get_best_ask.side_effect = lambda t: 0.95 if t == "tok_up" else 0.14
+        self._force_reprice_trigger(lm, market, new_up_ask=0.95, new_dn_ask=0.14)
+
+        lm.reprice_if_needed({market.market_id: market})
+
+        up_notional = 0.0
+        for call in lm.executor.place_batch_limit_buys.call_args_list:
+            orders = call.args[0] if call.args else call.kwargs.get("orders", [])
+            for o in orders:
+                if o.get("token_id") == "tok_up":
+                    up_notional += float(o.get("price", 0.0)) * float(o.get("size", 0.0))
+        # Integer-share rounding — allow 5% tolerance over the cap.
+        assert up_notional <= 20.0 * 1.05, (
+            f"REPRICE UP notional ${up_notional:.2f} exceeded gate cap $20 (+5%)"
+        )
+
+    def test_reprice_no_gate_keeps_bilateral_behavior(self):
+        """When the gate did NOT fire (low certainty), reprice behaves as before —
+        posts BOTH sides using inventory-skew/half-budget logic."""
+        lm = _make_manager(up_mid=0.55, dn_mid=0.45,
+                           up_bid=0.54, up_ask=0.56,
+                           dn_bid=0.44, dn_ask=0.46)
+        market = _market()
+        lm.post_ladder(market, spot_delta=0.0, fair_up=0.50)
+
+        state = lm.ladders[market.market_id]
+        assert state.gate_fired is False
+        assert state.gate_winner_side is None
+
+        self._reset_batch(lm)
+        lm.executor.get_best_ask.side_effect = lambda t: 0.62 if t == "tok_up" else 0.52
+        self._force_reprice_trigger(lm, market, new_up_ask=0.62, new_dn_ask=0.52)
+
+        lm.reprice_if_needed({market.market_id: market})
+
+        reprice_tokens = set()
+        for call in lm.executor.place_batch_limit_buys.call_args_list:
+            orders = call.args[0] if call.args else call.kwargs.get("orders", [])
+            for o in orders:
+                reprice_tokens.add(o.get("token_id"))
+        assert "tok_up" in reprice_tokens and "tok_dn" in reprice_tokens, (
+            f"No-gate reprice must post both sides, got: {reprice_tokens}"
+        )
+
+    def test_reprice_skip_on_gate_miss_no_state_no_orders(self):
+        """When skip_on_gate_miss=true and the gate misses (wide spread), post_ladder
+        returns without creating any LadderState. Therefore reprice finds no ladder
+        and posts nothing. This pins the cycle 24 SKIP_ON_GATE_MISS contract."""
+        cfg = _cfg(skip_on_gate_miss=True)
+        lm = _make_manager(cfg,
+                           up_mid=0.90, dn_mid=0.10,
+                           up_bid=0.85, up_ask=0.95,  # wide spread — gate misses
+                           dn_bid=0.09, dn_ask=0.11)
+        market = _market()
+        lm.post_ladder(market, spot_delta=0.0, fair_up=0.50)
+
+        # No ladder state created
+        assert market.market_id not in lm.ladders
+
+        self._reset_batch(lm)
+        lm.reprice_if_needed({market.market_id: market})
+
+        # Nothing to reprice — no orders placed
+        assert lm.executor.place_batch_limit_buys.call_count == 0

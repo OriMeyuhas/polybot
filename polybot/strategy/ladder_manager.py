@@ -48,6 +48,12 @@ class LadderState:
     throttle_heavy_side: Side | None = None  # Set when imbalance > 0.30 but both sides have fills
     fv_cancel_history: list = field(default_factory=list)  # epoch timestamps of recent FV cancels
     is_directional: bool = False  # True if ladder was posted intentionally one-sided (FV gate, spot skip)
+    # Cycle 29 — persist book-mid gate decision so reprice_if_needed() honors it.
+    # Without this, reprice rebuilds bilateral ladders and nullifies the gate's
+    # one-sided budget choice (cycle 28 root cause).
+    gate_fired: bool = False
+    gate_winner_side: Side | None = None  # side to post when gate fired
+    gate_budget_cap: float = 0.0  # $ cap from book-mid gate's directional_budget_cap
 
 
 MIN_ORDER_SIZE = 5.0  # Polymarket minimum for GTC orders
@@ -1302,6 +1308,14 @@ class LadderManager:
             # This prevents #50 one-sided abort from killing intentional directional ladders.
             _is_directional = (budget_up <= 0.0 or budget_dn <= 0.0)
 
+            # Cycle 29 — persist gate decision so reprice honors one-sided intent.
+            if book_mid_gate_fired:
+                _gate_winner = Side.UP if budget_dn <= 0.0 else Side.DOWN
+                _gate_cap = _capped_bmg
+            else:
+                _gate_winner = None
+                _gate_cap = 0.0
+
             self.ladders[market.market_id] = LadderState(
                 market_id=market.market_id,
                 asset=market.asset,
@@ -1314,6 +1328,9 @@ class LadderManager:
                 current_ask_dn=best_ask_dn,
                 timeframe_sec=market.timeframe_sec,
                 is_directional=_is_directional,
+                gate_fired=book_mid_gate_fired,
+                gate_winner_side=_gate_winner,
+                gate_budget_cap=_gate_cap,
             )
 
             # Skip if no rungs could be built on either side
@@ -1484,8 +1501,23 @@ class LadderManager:
                 up_filled_vwap = up_filled_cost / up_filled_qty if up_filled_qty > 0 else 0
                 dn_filled_vwap = dn_filled_cost / dn_filled_qty if dn_filled_qty > 0 else 0
 
+                # Cycle 29 — gate persistence: if the book-mid gate fired when this
+                # ladder was initially posted, reprice MUST honor the one-sided decision.
+                # Otherwise reprice rebuilds a bilateral ladder and negates the gate's
+                # loser-side suppression (root cause of cycle 28 losses).
+                if state.gate_fired and state.gate_winner_side is not None:
+                    if state.gate_winner_side == Side.UP:
+                        budget_up_side = min(half_budget, state.gate_budget_cap)
+                        budget_dn_side = 0.0
+                    else:
+                        budget_up_side = 0.0
+                        budget_dn_side = min(half_budget, state.gate_budget_cap)
+                    logger.debug(
+                        "REPRICE gate-persist: %s winner=%s cap=$%.2f",
+                        mid, state.gate_winner_side.value, state.gate_budget_cap,
+                    )
                 # Inventory-aware: skew budget toward the lighter side
-                if self.cfg.inventory_skew_enabled and up_filled_qty != dn_filled_qty:
+                elif self.cfg.inventory_skew_enabled and up_filled_qty != dn_filled_qty:
                     skew_max = self.cfg.inventory_skew_max
                     if up_filled_qty > dn_filled_qty:
                         budget_up_side = half_budget * (1.0 - skew_max) / 0.5
