@@ -327,7 +327,11 @@ class TestLadderManagerGateInstrumentation:
             assert r["book_mid"] is not None
 
     def test_reprice_emits_persisted_gate_state(self, tmp_path):
-        """Reprice events emit persisted LadderState.gate_fired, not a re-evaluated gate."""
+        """Reprice events emit gate_persisted (LadderState.gate_fired), not a re-evaluated gate.
+
+        Updated cycle 28: reprice POST events now carry gate_persisted + gate_reevaluated
+        instead of gate_fired, to let analyzers distinguish persisted from live decisions.
+        """
         mgr, _, tmpdir = _make_ladder_manager(tmp_path, book_mid_gate_enabled=False)
         market = _make_market()
         # Initial post
@@ -349,9 +353,11 @@ class TestLadderManagerGateInstrumentation:
         reprice_posts = [r for r in posts if r.get("origin") == "reprice"]
         assert len(reprice_posts) > 0, "Expected at least one reprice POST event"
         for r in reprice_posts:
-            for field in GATE_FIELDS:
-                assert field in r, f"Reprice POST missing gate field: {field}"
-            assert r["gate_fired"] is True
+            # Reprice events carry gate_persisted, NOT gate_fired
+            assert "gate_persisted" in r, f"Reprice POST missing 'gate_persisted': {r}"
+            assert "gate_fired" not in r, f"Reprice POST must NOT carry 'gate_fired': {r}"
+            assert r["gate_persisted"] is True
+            assert r["gate_reevaluated"] is False
             assert r["gate_reason"] == "fired"
             assert r["origin"] == "reprice"
             # Reprice does NOT re-evaluate live book data for gate
@@ -359,7 +365,7 @@ class TestLadderManagerGateInstrumentation:
             assert r["fv_price"] is None
 
     def test_reprice_gate_not_fired_emits_no_eval(self, tmp_path):
-        """Reprice of a non-gate-fired ladder emits gate_reason='no_eval'."""
+        """Reprice of a non-gate-fired ladder emits gate_persisted=False, gate_reason='no_eval'."""
         mgr, _, tmpdir = _make_ladder_manager(tmp_path, book_mid_gate_enabled=False)
         market = _make_market()
         mgr.post_ladder(market, spot_delta=0.0, fair_up=0.5)
@@ -375,7 +381,10 @@ class TestLadderManagerGateInstrumentation:
         posts = _read_post_records(tmpdir)
         reprice_posts = [r for r in posts if r.get("origin") == "reprice"]
         for r in reprice_posts:
-            assert r["gate_fired"] is False
+            assert "gate_persisted" in r, f"Reprice POST missing 'gate_persisted': {r}"
+            assert "gate_fired" not in r, f"Reprice POST must NOT carry 'gate_fired': {r}"
+            assert r["gate_persisted"] is False
+            assert r["gate_reevaluated"] is False
             assert r["gate_reason"] == "no_eval"
 
     def test_all_7_fields_present_on_every_post_event(self, tmp_path):
@@ -401,3 +410,63 @@ class TestLadderManagerGateInstrumentation:
         for r in cancel_records:
             for field in GATE_FIELDS:
                 assert field not in r, f"CANCEL event has unexpected gate field: {field}"
+
+    # -----------------------------------------------------------------------
+    # Cycle 28 telemetry: reprice events emit gate_persisted + gate_reevaluated
+    # -----------------------------------------------------------------------
+
+    def test_reprice_post_carries_gate_persisted_not_gate_fired(self, tmp_path):
+        """Reprice-origin POST events must carry 'gate_persisted', NOT 'gate_fired'."""
+        mgr, _, tmpdir = _make_ladder_manager(tmp_path, book_mid_gate_enabled=False)
+        market = _make_market()
+        mgr.post_ladder(market, spot_delta=0.0, fair_up=0.5)
+        state = mgr.ladders[market.market_id]
+        state.gate_fired = True
+        state.gate_winner_side = Side.UP
+        state.gate_budget_cap = 18.0
+        mgr.executor.client.get_order_book.return_value = MagicMock(
+            bids=[MagicMock(price="0.54", size="5000")],
+            asks=[MagicMock(price="0.56", size="5000")],
+        )
+        state.last_reprice_at = 0
+        mgr.reprice_if_needed({market.market_id: market})
+        posts = _read_post_records(tmpdir)
+        reprice_posts = [r for r in posts if r.get("origin") == "reprice"]
+        assert len(reprice_posts) > 0, "Expected at least one reprice POST event"
+        for r in reprice_posts:
+            assert "gate_persisted" in r, f"Reprice POST missing 'gate_persisted': {r}"
+            assert "gate_fired" not in r, f"Reprice POST must NOT carry 'gate_fired': {r}"
+
+    def test_reprice_post_carries_gate_reevaluated_false(self, tmp_path):
+        """Reprice-origin POST events must carry gate_reevaluated=False."""
+        mgr, _, tmpdir = _make_ladder_manager(tmp_path, book_mid_gate_enabled=False)
+        market = _make_market()
+        mgr.post_ladder(market, spot_delta=0.0, fair_up=0.5)
+        state = mgr.ladders[market.market_id]
+        state.last_reprice_at = 0
+        mgr.executor.client.get_order_book.return_value = MagicMock(
+            bids=[MagicMock(price="0.54", size="5000")],
+            asks=[MagicMock(price="0.56", size="5000")],
+        )
+        mgr.reprice_if_needed({market.market_id: market})
+        posts = _read_post_records(tmpdir)
+        reprice_posts = [r for r in posts if r.get("origin") == "reprice"]
+        assert len(reprice_posts) > 0, "Expected at least one reprice POST event"
+        for r in reprice_posts:
+            assert r.get("gate_reevaluated") is False, (
+                f"Reprice POST 'gate_reevaluated' must be False, got: {r.get('gate_reevaluated')!r}"
+            )
+
+    def test_initial_post_still_carries_gate_fired_not_gate_persisted(self, tmp_path):
+        """Initial_post events must still carry 'gate_fired' (not broken by reprice rename)."""
+        mgr, _, tmpdir = _make_ladder_manager(tmp_path, book_mid_gate_enabled=False)
+        market = _make_market()
+        mgr.post_ladder(market, spot_delta=0.0, fair_up=0.5)
+        posts = _read_post_records(tmpdir)
+        initial_posts = [r for r in posts if r.get("origin") == "initial_post"]
+        assert len(initial_posts) > 0, "Expected at least one initial_post POST event"
+        for r in initial_posts:
+            assert "gate_fired" in r, f"Initial_post must carry 'gate_fired': {r}"
+            assert "gate_persisted" not in r, (
+                f"Initial_post must NOT carry 'gate_persisted': {r}"
+            )

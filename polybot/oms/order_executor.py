@@ -123,6 +123,9 @@ class OrderExecutor:
         fv_certainty: float | None = None,
         spread: float | None = None,
         origin: str | None = None,
+        # Reprice-path telemetry (cycle 28)
+        gate_persisted: bool | None = None,
+        gate_reevaluated: bool | None = None,
     ) -> OrderRecord:
         """Place a single limit buy and return an OrderRecord.
 
@@ -188,6 +191,8 @@ class OrderExecutor:
                 fv_certainty=fv_certainty,
                 spread=spread,
                 origin=origin,
+                gate_persisted=gate_persisted,
+                gate_reevaluated=gate_reevaluated,
             )
         return record
 
@@ -455,6 +460,7 @@ class OrderExecutor:
 
         Each order dict may optionally include gate-context keys:
         gate_fired, gate_reason, book_mid, fv_price, fv_certainty, spread, origin.
+        Reprice-origin orders use gate_persisted + gate_reevaluated instead of gate_fired.
         These are forwarded to place_limit_buy unchanged.
         """
         if not orders:
@@ -481,6 +487,8 @@ class OrderExecutor:
                         fv_certainty=order.get("fv_certainty"),
                         spread=order.get("spread"),
                         origin=order.get("origin"),
+                        gate_persisted=order.get("gate_persisted"),
+                        gate_reevaluated=order.get("gate_reevaluated"),
                     )
                     results.append(record)
                 except ClobApiError as exc:

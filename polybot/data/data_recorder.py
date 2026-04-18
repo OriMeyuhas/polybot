@@ -107,13 +107,20 @@ class DataRecorder:
                   fv_price: float | None = None,
                   fv_certainty: float | None = None,
                   spread: float | None = None,
-                  origin: str | None = None):
+                  origin: str | None = None,
+                  # Reprice-path telemetry (cycle 28): persisted gate state, never re-evaluated live
+                  gate_persisted: bool | None = None,
+                  gate_reevaluated: bool | None = None):
         """Log an order lifecycle event (post, reprice, cancel, fill).
 
         Gate context fields (gate_fired, gate_reason, book_mid, fv_price,
         fv_certainty, spread, origin) are written only when event == 'post'
         and gate_fired is not None.  Older log entries without these fields
         will not break analyzers that use .get() with defaults.
+
+        Reprice-path orders use gate_persisted/gate_reevaluated instead of
+        gate_fired to distinguish persisted decisions from live evaluations.
+        When gate_persisted is not None, it is written instead of gate_fired.
         """
         record: dict = {
             "ts": round(ts, 3),
@@ -125,14 +132,26 @@ class DataRecorder:
             "order_id": order_id[:16] if order_id else "",
             "reason": reason,
         }
-        if event == "post" and gate_fired is not None:
-            record["gate_fired"] = gate_fired
-            record["gate_reason"] = gate_reason if gate_reason is not None else "no_eval"
-            record["book_mid"] = book_mid
-            record["fv_price"] = fv_price
-            record["fv_certainty"] = fv_certainty
-            record["spread"] = spread
-            record["origin"] = origin if origin is not None else "initial_post"
+        if event == "post":
+            if gate_persisted is not None:
+                # Reprice-origin: emit persisted decision, not a live gate fire
+                record["gate_persisted"] = gate_persisted
+                record["gate_reevaluated"] = False if gate_reevaluated is None else gate_reevaluated
+                record["gate_reason"] = gate_reason if gate_reason is not None else "no_eval"
+                record["book_mid"] = book_mid
+                record["fv_price"] = fv_price
+                record["fv_certainty"] = fv_certainty
+                record["spread"] = spread
+                record["origin"] = origin if origin is not None else "reprice"
+            elif gate_fired is not None:
+                # Initial-post: live gate evaluation result
+                record["gate_fired"] = gate_fired
+                record["gate_reason"] = gate_reason if gate_reason is not None else "no_eval"
+                record["book_mid"] = book_mid
+                record["fv_price"] = fv_price
+                record["fv_certainty"] = fv_certainty
+                record["spread"] = spread
+                record["origin"] = origin if origin is not None else "initial_post"
         self._append("order_log", record, ts)
 
     # --- Stream 4: Polymarket trades ---

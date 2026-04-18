@@ -1610,8 +1610,11 @@ class LadderManager:
 
                 # Gate instrumentation for reprice: emit persisted state, not re-evaluated gate.
                 # (gate was evaluated once at post_ladder time; reprice logs what was decided then)
+                # gate_persisted = the decision carried over from initial_post LadderState.
+                # gate_reevaluated = False signals analyzers this is NOT a live gate evaluation.
                 _reprice_gate_ctx = {
-                    "gate_fired": state.gate_fired,
+                    "gate_persisted": state.gate_fired,
+                    "gate_reevaluated": False,
                     "gate_reason": "fired" if state.gate_fired else "no_eval",
                     "book_mid": None,      # gate was evaluated at initial-post; no re-eval at reprice
                     "fv_price": None,
