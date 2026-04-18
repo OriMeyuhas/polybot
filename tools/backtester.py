@@ -207,6 +207,13 @@ class BacktestConfig:
     vol_fallback_annual: float = 0.50
     vol_min_samples: int = 30
 
+    # Directional FV from pre-window Binance drift
+    # When True, simulate_market_dome uses pre_window_binance klines to compute
+    # a drift-based fv_up at window open (like the live bot does).
+    # When False (default), falls back to current book_mid behavior.
+    # Default is False for safety; flip to True once the pipeline is proven.
+    use_binance_drift: bool = False
+
     # Name (auto-set from config file, not loaded from YAML)
     name: str = "unnamed"
 
@@ -927,6 +934,7 @@ class MarketResult:
     cert_bucket: str
     market_hour: int
     has_book_data: bool  # True if we had local book data for this market
+    fv_source: str = "book_mid_fallback"  # "binance_drift" or "book_mid_fallback"
 
 
 # ---------------------------------------------------------------------------
@@ -1446,6 +1454,12 @@ def aggregate_results(results: list[MarketResult], cfg: BacktestConfig) -> dict:
     fv_correct = [r for r in results if r.outcome_correct is not None]
     fv_accuracy = sum(1 for r in fv_correct if r.outcome_correct) / len(fv_correct) if fv_correct else None
 
+    # Per-market fv_source breakdown (users can slice by whether pre-window backfill existed)
+    fv_source_counts: dict[str, int] = {}
+    for r in results:
+        src = getattr(r, "fv_source", "book_mid_fallback")
+        fv_source_counts[src] = fv_source_counts.get(src, 0) + 1
+
     return {
         "config_name": cfg.name,
         "config": cfg.to_dict(),
@@ -1468,6 +1482,7 @@ def aggregate_results(results: list[MarketResult], cfg: BacktestConfig) -> dict:
         "per_hour_pnl": per_hour_pnl,
         "per_hour_count": per_hour_count,
         "worst_markets": worst_markets,
+        "fv_source_counts": fv_source_counts,
     }
 
 
@@ -1520,6 +1535,11 @@ class DomeMarketData:
     entry_up_best_ask: float = 1.0
     entry_dn_best_bid: float = 0.0
     entry_dn_best_ask: float = 1.0
+
+    # Pre-window Binance klines: (ts_ms, close_price) loaded from
+    # data/dome_snapshots_binance_prewindow/{market_id}.jsonl.
+    # Empty list when the sibling file does not exist.
+    pre_window_binance: list[tuple[int, float]] = field(default_factory=list)
 
 
 def load_dome_snapshot(path: pathlib.Path) -> DomeMarketData | None:
@@ -1683,6 +1703,31 @@ def load_dome_snapshot(path: pathlib.Path) -> DomeMarketData | None:
     ob_up_series_raw.sort(key=lambda x: x[0])
     ob_dn_series_raw.sort(key=lambda x: x[0])
 
+    # Load pre-window Binance klines from sibling directory.
+    # Path convention: dome_snapshots_binance_prewindow/ sits next to dome_snapshots/
+    # under the same parent.  E.g.:
+    #   data/dome_snapshots/btc-updown-15m-<epoch>.jsonl  (this file: path)
+    #   data/dome_snapshots_binance_prewindow/btc-updown-15m-<epoch>.jsonl (sibling)
+    pre_window_binance: list[tuple[int, float]] = []
+    prewindow_dir = path.parent.parent / "dome_snapshots_binance_prewindow"
+    prewindow_file = prewindow_dir / path.name
+    if prewindow_file.exists():
+        try:
+            with open(prewindow_file, encoding="utf-8") as _f:
+                for _line in _f:
+                    _line = _line.strip()
+                    if not _line:
+                        continue
+                    try:
+                        _obj = json.loads(_line)
+                        _ts_ms = int(_obj["ts_ms"])
+                        _close = float(_obj["close_price"])
+                        pre_window_binance.append((_ts_ms, _close))
+                    except (KeyError, ValueError, TypeError):
+                        continue
+        except OSError as _e:
+            logger.debug("Cannot open prewindow file %s: %s", prewindow_file, _e)
+
     return DomeMarketData(
         market_slug=market_slug,
         condition_id=condition_id,
@@ -1708,6 +1753,7 @@ def load_dome_snapshot(path: pathlib.Path) -> DomeMarketData | None:
         ob_dn_count=len(ob_dn_asks),
         ob_up_series=ob_up_series_raw,
         ob_dn_series=ob_dn_series_raw,
+        pre_window_binance=pre_window_binance,
     )
 
 
@@ -1747,25 +1793,76 @@ def simulate_market_dome(
     # -------------------------------------------------------------------
     # FV computation
     #
-    # At entry (window open): We have the book state (UP ask, DN ask).
-    # Market-implied probability for UP ≈ mid-price of UP token.
-    # If UP ask=0.55 and UP bid=0.50, UP mid ≈ 0.525 → FV_up ≈ 0.525.
-    # This is the correct "no-look-ahead" entry FV.
+    # Path A (use_binance_drift=True AND pre_window_binance has data):
+    #   Compute drift-based FV at window open using the live bot's exact formula
+    #   (polybot.strategy.fair_value.p_fair_up).  Mirrors what the live bot does:
+    #     1. Sample Binance price at window_open - 60s  (p_lookback)
+    #     2. Sample Binance price at window_open         (p_open)
+    #     3. PTB (price-to-beat / start_price) = dome.ptb
+    #     4. Treat PTB as the barrier K; current price = p_open.
+    #     5. secs_remaining = full window duration.
+    #   This gives the FV the live bot would have computed right at window open.
+    #   fv_source → "binance_drift"
     #
-    # Near window close (~100s before end): Dome has Binance/Chainlink prices.
-    # We compute FV from PTB vs binance_at_close to simulate fv_cancel.
-    # This is valid because we could have retrieved price data during the window
-    # from Binance WS (which is available in real trading).
+    # Path B (fallback / legacy):
+    #   Use market-implied probability from entry-window book mid-price.
+    #   (up_mid of the first-30s orderbook snapshots ≈ P(UP).)
+    #   fv_source → "book_mid_fallback"
+    #
+    # Close-window FV (both paths): use Binance drift from PTB to simulate
+    # fv_cancel at ~100s before window_end.  This is valid because we could
+    # have retrieved price data during the window from Binance WS.
     # -------------------------------------------------------------------
-    # FV at entry: use market-implied probability from entry-window book mid-price.
-    # We use entry_up_best_bid/ask (first-30s snapshots only) to avoid look-ahead
-    # leakage from late-window orderbook state into the t=0 gate decision.
-    up_mid = (dome.entry_up_best_bid + dome.entry_up_best_ask) / 2.0
-    dn_mid = (dome.entry_dn_best_bid + dome.entry_dn_best_ask) / 2.0
-    # Normalize: market-implied P(UP) = UP_mid / (UP_mid + DN_mid)
-    # But simpler: use UP_mid directly as proxy for P(UP)
-    fv_up_entry = max(0.01, min(0.99, up_mid))
-    cert_entry = _fv_certainty(fv_up_entry)
+
+    fv_source = "book_mid_fallback"  # default
+
+    # --- Path A: pre-window Binance drift ---
+    fv_up_entry: float
+    cert_entry: float
+
+    if cfg.use_binance_drift and dome.pre_window_binance:
+        # Binary-search for price at window_open - 60s and window_open
+        # pre_window_binance is sorted ascending by ts_ms
+        pw = dome.pre_window_binance
+        pw_ts = [t for t, _ in pw]
+        target_lookback_ms = (dome.window_start - 60) * 1000
+        target_open_ms = dome.window_start * 1000
+
+        import bisect as _bisect_pw
+        idx_lookback = max(0, _bisect_pw.bisect_right(pw_ts, target_lookback_ms) - 1)
+        idx_open = max(0, _bisect_pw.bisect_right(pw_ts, target_open_ms) - 1)
+
+        p_lookback = pw[idx_lookback][1]
+        p_open = pw[idx_open][1]
+        ptb = dome.ptb  # barrier / price-to-beat at window open
+
+        if ptb and ptb > 0 and p_lookback > 0 and p_open > 0:
+            # Use the same p_fair_up function the live bot uses.
+            # start_price = PTB (the barrier); current_price = p_open (spot at t=0).
+            # secs_remaining = full window duration (we're at t=0).
+            fv_up_entry = _p_fair_up(
+                ptb, p_open,
+                float(dome.window_end - dome.window_start),
+                cfg.vol_fallback_annual,
+            )
+            cert_entry = _fv_certainty(fv_up_entry)
+            fv_source = "binance_drift"
+        else:
+            # Insufficient data — fall back to book-mid
+            up_mid = (dome.entry_up_best_bid + dome.entry_up_best_ask) / 2.0
+            fv_up_entry = max(0.01, min(0.99, up_mid))
+            cert_entry = _fv_certainty(fv_up_entry)
+
+    else:
+        # --- Path B: book-mid fallback ---
+        # FV at entry: use market-implied probability from entry-window book mid-price.
+        # We use entry_up_best_bid/ask (first-30s snapshots only) to avoid look-ahead
+        # leakage from late-window orderbook state into the t=0 gate decision.
+        up_mid = (dome.entry_up_best_bid + dome.entry_up_best_ask) / 2.0
+        # Normalize: market-implied P(UP) = UP_mid / (UP_mid + DN_mid)
+        # But simpler: use UP_mid directly as proxy for P(UP)
+        fv_up_entry = max(0.01, min(0.99, up_mid))
+        cert_entry = _fv_certainty(fv_up_entry)
 
     # FV near window close: use Binance drift from PTB
     start_price = dome.ptb
@@ -2050,6 +2147,7 @@ def simulate_market_dome(
         cert_bucket=cert_bucket,
         market_hour=market_hour,
         has_book_data=has_book_data,
+        fv_source=fv_source,
     )
 
 
@@ -2337,6 +2435,13 @@ def _print_results(agg: dict, cfg_name: str, data_source: str) -> None:
     print(f"No-fill rate      : {agg.get('no_fill_rate', 0):.1%}")
     if agg.get("fv_accuracy") is not None:
         print(f"FV accuracy       : {agg.get('fv_accuracy', 0):.1%}")
+    fv_src = agg.get("fv_source_counts", {})
+    if fv_src:
+        drift_n = fv_src.get("binance_drift", 0)
+        fallback_n = fv_src.get("book_mid_fallback", 0)
+        total_n = drift_n + fallback_n
+        if total_n > 0:
+            print(f"FV source drift   : {drift_n}/{total_n} ({drift_n/total_n:.1%}) markets used binance_drift")
     print(f"Max loss          : ${agg.get('max_loss', 0):.2f}")
     print(f"Max drawdown      : {agg.get('max_drawdown_pct', 0):.1%}")
     print(f"Sharpe-like       : {agg.get('sharpe_like', 0):.3f}")
@@ -2397,6 +2502,17 @@ def main() -> None:
         help="Directory for index caches (default: data_dir) [local mode only]")
     parser.add_argument("--limit", type=int, default=None,
         help="Limit number of markets to simulate (for testing)")
+    parser.add_argument(
+        "--use-binance-drift",
+        action="store_true",
+        default=False,
+        help=(
+            "Use pre-window Binance drift to compute FV at window open in dome mode. "
+            "Requires data/dome_snapshots_binance_prewindow/ to be populated via "
+            "tools/dome_binance_backfill.py. Markets without pre-window data degrade "
+            "gracefully to book-mid fallback. Default: False (current paired-MM behavior)."
+        ),
+    )
     args = parser.parse_args()
 
     data_dir = pathlib.Path(args.data_dir)
@@ -2409,6 +2525,12 @@ def main() -> None:
     else:
         cfg = BacktestConfig()
         cfg.name = "default"
+
+    # Apply CLI flag override (higher priority than YAML config)
+    if args.use_binance_drift:
+        cfg = BacktestConfig(
+            **{**cfg.to_dict(), "use_binance_drift": True, "name": cfg.name}
+        )
 
     # Resolve dome directory
     dome_dir = pathlib.Path(args.dome_dir) if args.dome_dir else data_dir / "dome_snapshots"
