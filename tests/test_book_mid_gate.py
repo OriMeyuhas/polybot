@@ -258,3 +258,34 @@ class TestBookMidGateInstrumentation:
         # Ensure cert value is present (not "None")
         cert_msg = [m for m in skip_msgs if "reason=certainty_too_low" in m][0]
         assert "cert=0.2000" in cert_msg, f"Expected cert=0.2000 in: {cert_msg}"
+
+    def test_non_fire_crossed_book_logged(self, caplog):
+        """Cycle 20/21: crossed book (bid > ask) -> reason=crossed_book, gate does not fire.
+
+        Construct a book where UP has bid=0.90 > ask=0.50 (spread=-0.40), which
+        mirrors into DN as bid=0.50, ask=0.10 (spread=-0.40). Even though
+        book_mid_up=0.90 would yield cert=0.80 (above the 0.65 threshold), the
+        crossed-book guard must short-circuit the fire decision.
+        """
+        lm = _make_manager(up_mid=0.90, dn_mid=0.10,
+                           up_bid=0.90, up_ask=0.50,   # crossed: bid > ask
+                           dn_bid=0.50, dn_ask=0.10)   # crossed: bid > ask
+
+        with caplog.at_level(logging.DEBUG, logger=self.LOGGER_NAME):
+            lm.post_ladder(_market(), spot_delta=0.0, fair_up=0.50)
+
+        skip_msgs = [r.getMessage() for r in caplog.records if "BOOK MID GATE SKIP" in r.getMessage()]
+        assert any("reason=crossed_book" in m for m in skip_msgs), \
+            f"Expected reason=crossed_book in logs, got: {skip_msgs}"
+        # Must NOT have fired the gate — no BOOK MID GATE (fire) message and
+        # no other reason bucket was emitted (branches are mutually exclusive).
+        fire_msgs = [
+            r.getMessage() for r in caplog.records
+            if "BOOK MID GATE:" in r.getMessage()
+            and "SKIP" not in r.getMessage()
+        ]
+        assert not fire_msgs, f"Gate fired on crossed book: {fire_msgs}"
+        # Verify spread values are logged (negative spreads surface the crossing)
+        crossed_msg = [m for m in skip_msgs if "reason=crossed_book" in m][0]
+        assert "spread_up=-0.4000" in crossed_msg, f"Expected spread_up=-0.4000 in: {crossed_msg}"
+        assert "spread_dn=-0.4000" in crossed_msg, f"Expected spread_dn=-0.4000 in: {crossed_msg}"

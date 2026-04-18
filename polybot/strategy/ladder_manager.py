@@ -1017,7 +1017,27 @@ class LadderManager:
                     (_dn_ask_bmg - _dn_bid)
                     if (_dn_ask_bmg is not None and _dn_bid is not None) else None
                 )
-                if (
+                # Cycle 20/21: defensive guard against crossed books (bid > ask)
+                # produced by stale/partial WS snapshots at window-open. Check
+                # this FIRST so a crossed book never falls through into the
+                # wide-spread or certainty branches.
+                _is_crossed = (
+                    (_spread_up is not None and _spread_up < 0)
+                    or (_spread_dn is not None and _spread_dn < 0)
+                )
+                if _has_all_data and _is_crossed:
+                    _spread_up_str = (
+                        "%.4f" % _spread_up if _spread_up is not None else "None"
+                    )
+                    _spread_dn_str = (
+                        "%.4f" % _spread_dn if _spread_dn is not None else "None"
+                    )
+                    logger.debug(
+                        "BOOK MID GATE SKIP: %s reason=crossed_book "
+                        "spread_up=%s spread_dn=%s cert=None",
+                        market.market_id, _spread_up_str, _spread_dn_str,
+                    )
+                elif (
                     _has_all_data
                     and _spread_up is not None and _spread_up <= _max_spread
                     and _spread_dn is not None and _spread_dn <= _max_spread
