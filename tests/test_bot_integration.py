@@ -185,6 +185,18 @@ class TestSettlement:
         asyncio.run(bot._settle_expired_windows(now_epoch=1400))
         assert market.market_id not in bot.position_manager.get_pending_settlements()
 
+    def test_expired_unfilled_logged(self, cfg, market, mock_clob, caplog):
+        """Expired windows with no position emit EXPIRED_UNFILLED observability log."""
+        bot = _make_bot(cfg, mock_clob)
+        bot._active_markets = {market.market_id: market}
+        # No position — should log observability line
+        with caplog.at_level("INFO", logger="polybot.bot"):
+            asyncio.run(bot._settle_expired_windows(now_epoch=1400))
+        assert any(
+            "EXPIRED_UNFILLED" in rec.message and market.market_id in rec.message
+            for rec in caplog.records
+        )
+
 
 class TestConnectionLost:
     def test_on_connection_lost_preserves_state(self, cfg, mock_clob):

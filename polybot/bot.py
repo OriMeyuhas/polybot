@@ -1068,6 +1068,10 @@ class Bot:
             mid = market.market_id
             pos = self.position_manager.positions.get(mid)
             if pos is None:
+                logger.info(
+                    "EXPIRED_UNFILLED: %s closed with no position (no fills in window)",
+                    mid,
+                )
                 continue
             if mid in self.position_manager.get_pending_settlements():
                 continue
