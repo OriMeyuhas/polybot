@@ -1,4 +1,6 @@
-py-clob-client>=0.34.0
+py-clob-client-v2==1.0.0
+web3>=6.0.0,<7.0.0
+setuptools<68  # web3 6.x uses pkg_resources which was removed in setuptools 68+
 websockets>=12.0
 httpx>=0.27.0
 python-dotenv>=1.0.0
