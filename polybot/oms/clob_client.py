@@ -300,24 +300,34 @@ class PaperClobClient:
 
 
 def create_clob_client(cfg, book_manager=None):
-    """Factory: returns PaperClobClient for dry_run, LiveClobClient otherwise."""
+    """Factory: returns PaperClobClient for dry_run, LiveClobClient otherwise.
+
+    Live path imports V2 SDK and runs a pUSD balance gate before returning.
+    """
     if cfg.dry_run or not cfg.private_key:
         logger.info("Creating PaperClobClient (dry_run=%s)", cfg.dry_run)
         return PaperClobClient(book_manager=book_manager)
 
-    # Live mode — import and create real client
-    from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import ApiCreds
+    # Live mode — V2 SDK
+    from py_clob_client_v2.client import ClobClient
+    from py_clob_client_v2.clob_types import ApiCreds
 
     client = ClobClient(
         host=cfg.polymarket_host,
         key=cfg.private_key,
-        chain_id=cfg.chain,
+        chain=cfg.chain,
         creds=ApiCreds(
             api_key=cfg.api_key,
             api_secret=cfg.api_secret,
             api_passphrase=cfg.api_passphrase,
         ),
     )
-    logger.info("Created live ClobClient at %s", cfg.polymarket_host)
+    logger.info("Created live V2 ClobClient at %s", cfg.polymarket_host)
+
+    _ensure_collateral(cfg)
     return client
+
+
+def _ensure_collateral(cfg):
+    """Placeholder — Task 7 implements the actual pUSD balance gate."""
+    return None
