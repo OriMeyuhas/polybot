@@ -20,21 +20,19 @@ from dataclasses import dataclass, field
 from typing import Any
 
 try:
-    from py_clob_client.clob_types import OrderArgs
-    from py_clob_client.order_builder.constants import BUY
+    from py_clob_client_v2.clob_types import OrderArgs
+    from py_clob_client_v2.order_builder.constants import BUY
 except ImportError:
-    # Fallback when py-clob-client is not installed (tests / paper-only envs).
-    # Must mirror the real OrderArgs fields so attribute-presence checks pass.
+    # Fallback when py-clob-client-v2 is not installed (paper-only envs / CI).
+    # Mirrors V2 OrderArgs: fee_rate_bps and nonce are gone (protocol-managed fees,
+    # timestamp-based uniqueness). expiration is kept — V2 still supports GTD.
     @dataclass
     class OrderArgs:  # type: ignore[no-redef]
         token_id: str = ""
         price: float = 0.0
         size: float = 0.0
         side: str = "BUY"
-        fee_rate_bps: str = ""
-        nonce: int = 0
         expiration: int = 0
-        taker: str = "0x0000000000000000000000000000000000000000"
 
     BUY = "BUY"
 

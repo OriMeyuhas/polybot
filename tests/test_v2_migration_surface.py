@@ -49,3 +49,17 @@ def test_live_factory_uses_v2_package():
         assert "chain_id" not in kwargs
         assert kwargs["chain"] == 137
         assert kwargs["host"] == "https://clob-v2.polymarket.com"
+
+
+def test_orderargs_fallback_has_no_v1_fields():
+    """Fallback OrderArgs dataclass matches V2 field set (no nonce, fee_rate_bps, taker)."""
+    from polybot.oms import order_executor
+
+    args = order_executor.OrderArgs(
+        token_id="t", price=0.5, size=10.0, side="BUY", expiration=0
+    )
+    # V2-stripped fields must not exist or must default to a "neutral" absent value.
+    assert not hasattr(args, "fee_rate_bps"), \
+        "fee_rate_bps removed in V2 — protocol-managed"
+    assert not hasattr(args, "nonce"), "nonce removed in V2 — timestamp-based"
+    # taker in V2 defaults to zero address — allowed to exist but must not be user-set
