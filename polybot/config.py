@@ -25,7 +25,7 @@ class TradingRules(NamedTuple):
 @dataclass(frozen=True)
 class TrackerConfig:
     # Polymarket
-    polymarket_host: str = "https://clob.polymarket.com"
+    polymarket_host: str = "https://clob-v2.polymarket.com"
     polymarket_data_api: str = "https://data-api.polymarket.com"
     chain_id: int = 137
 
@@ -60,12 +60,19 @@ class TrackerConfig:
 @dataclass(frozen=True)
 class BotConfig:
     # Polymarket CLOB
-    polymarket_host: str = "https://clob.polymarket.com"
-    chain_id: int = 137
+    polymarket_host: str = "https://clob-v2.polymarket.com"
+    chain: int = 137
     private_key: str = ""
     api_key: str = ""
     api_secret: str = ""
     api_passphrase: str = ""
+    # V2 collateral — pUSD is the new collateral token (replaces USDC.e)
+    # Addresses from https://docs.polymarket.com/contracts (V2 section, Polygon mainnet)
+    pusd_address: str = "0x0000000000000000000000000000000000000000"  # TODO set from V2 contracts ref before live
+    usdc_address: str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"  # USDC.e on Polygon
+    collateral_onramp_address: str = "0x0000000000000000000000000000000000000000"  # TODO set from V2 contracts ref before live
+    # Opt-in: if true, live startup will auto-call wrap() to convert USDC→pUSD before trading
+    wrap_on_startup: bool = False
 
     # Binance
     binance_ws_url: str = "wss://stream.binance.com:9443/ws"
@@ -413,6 +420,22 @@ def effective_assets(enabled_assets: tuple[str, ...], bankroll: float) -> tuple[
     return get_trading_rules(enabled_assets, bankroll).assets
 
 
+def _load_chain_env() -> int:
+    """Read CHAIN (V2 naming) with legacy CHAIN_ID fallback + deprecation warning."""
+    import logging
+    chain = os.getenv("CHAIN")
+    if chain is not None:
+        return int(chain)
+    legacy = os.getenv("CHAIN_ID")
+    if legacy is not None:
+        logging.getLogger(__name__).warning(
+            "Using legacy CHAIN_ID env var; rename to CHAIN for V2 migration "
+            "(see docs/superpowers/specs/2026-04-19-polymarket-v2-migration-design.md)"
+        )
+        return int(legacy)
+    return 137
+
+
 def load_bot_config() -> BotConfig:
     load_dotenv()
 
@@ -427,8 +450,8 @@ def load_bot_config() -> BotConfig:
 
     return BotConfig(
         assets=assets,
-        polymarket_host=os.getenv("POLYMARKET_HOST", "https://clob.polymarket.com"),
-        chain_id=int(os.getenv("CHAIN_ID", "137")),
+        polymarket_host=os.getenv("POLYMARKET_HOST", "https://clob-v2.polymarket.com"),
+        chain=_load_chain_env(),
         private_key=os.getenv("PRIVATE_KEY", ""),
         api_key=os.getenv("API_KEY", ""),
         api_secret=os.getenv("API_SECRET", ""),
@@ -517,6 +540,10 @@ def load_bot_config() -> BotConfig:
         book_mid_gate_certainty_threshold=float(os.getenv("BOOK_MID_GATE_CERTAINTY_THRESHOLD", "0.65")),
         book_mid_gate_max_spread=float(os.getenv("BOOK_MID_GATE_MAX_SPREAD", "0.05")),
         skip_on_gate_miss=os.getenv("SKIP_ON_GATE_MISS", "false").lower() in ("true", "1", "yes"),
+        pusd_address=os.getenv("PUSD_ADDRESS", "0x0000000000000000000000000000000000000000"),
+        usdc_address=os.getenv("USDC_ADDRESS", "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"),
+        collateral_onramp_address=os.getenv("COLLATERAL_ONRAMP_ADDRESS", "0x0000000000000000000000000000000000000000"),
+        wrap_on_startup=os.getenv("WRAP_ON_STARTUP", "false").lower() in ("true", "1", "yes"),
     )
 
 
