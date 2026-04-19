@@ -160,28 +160,10 @@ def test_paper_tick_one_fill_per_token_per_tick():
 # -------------------------------------------------------------------
 
 
-def test_order_args_has_fee_rate_bps():
-    """OrderArgs must have fee_rate_bps for live SDK signing."""
-    args = OrderArgs(token_id="abc", price=0.50, size=10.0, side=BUY)
-    assert hasattr(args, "fee_rate_bps")
-
-
-def test_order_args_has_nonce():
-    """OrderArgs must have nonce for live SDK signing."""
-    args = OrderArgs(token_id="abc", price=0.50, size=10.0, side=BUY)
-    assert hasattr(args, "nonce")
-
-
 def test_order_args_has_expiration():
     """OrderArgs must have expiration for live SDK signing."""
     args = OrderArgs(token_id="abc", price=0.50, size=10.0, side=BUY)
     assert hasattr(args, "expiration")
-
-
-def test_order_args_has_taker():
-    """OrderArgs must have taker for live SDK signing."""
-    args = OrderArgs(token_id="abc", price=0.50, size=10.0, side=BUY)
-    assert hasattr(args, "taker")
 
 
 def test_order_args_through_paper_client():
@@ -196,7 +178,7 @@ def test_order_args_through_paper_client():
 
 
 def test_adhoc_order_args_fails_field_check():
-    """A minimal 4-field class must NOT pass the fee_rate_bps check."""
+    """A minimal 4-field class must NOT pass the expiration check."""
 
     class _AdHocOrderArgs:
         def __init__(self, token_id, price, size, side):
@@ -206,14 +188,13 @@ def test_adhoc_order_args_fails_field_check():
             self.side = side
 
     bad = _AdHocOrderArgs("abc", 0.50, 10.0, "BUY")
-    assert not hasattr(bad, "fee_rate_bps")
+    assert not hasattr(bad, "expiration")
 
 
-def test_order_args_fallback_has_all_fields():
-    """Fallback OrderArgs (no SDK installed) must have all 7 fields."""
+def test_order_args_fallback_has_v2_fields():
+    """Fallback OrderArgs (no SDK installed) must have all V2 fields."""
     args = OrderArgs(token_id="t", price=0.5, size=1.0, side=BUY)
-    for field in ("token_id", "price", "size", "side", "fee_rate_bps",
-                  "nonce", "expiration", "taker"):
+    for field in ("token_id", "price", "size", "side", "expiration"):
         assert hasattr(args, field), f"Missing field: {field}"
 
 
