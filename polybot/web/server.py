@@ -177,15 +177,15 @@ def _validate_credentials_sync(
     in the local scope and are never logged or returned.
     """
     try:
-        from py_clob_client.client import ClobClient
-        from py_clob_client.clob_types import BalanceAllowanceParams
+        from py_clob_client_v2.client import ClobClient
+        from py_clob_client_v2.clob_types import BalanceAllowanceParams
 
-        host = "https://clob.polymarket.com"
-        chain_id = 137
+        host = "https://clob-v2.polymarket.com"
+        chain = 137
         client = ClobClient(
             host,
             key=private_key,
-            chain_id=chain_id,
+            chain=chain,
             creds={
                 "apiKey": api_key,
                 "secret": api_secret,
