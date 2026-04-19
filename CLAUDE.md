@@ -107,3 +107,13 @@ The manager orchestrates the others. For small fixes (1-5 lines), it can skip th
 - Platform: Windows 10, Python 3.14, bash shell
 - Polymarket V2 migration blocks live deployment
 - Use this time to validate strategy in paper mode
+
+## V2 Migration Status (2026-04-19)
+
+- Codebase migrated to `py-clob-client-v2==1.0.0` (host: `clob-v2.polymarket.com`)
+- Paper mode unchanged; live mode requires:
+  1. `.env`: rename `CHAIN_ID` → `CHAIN` (legacy still works with warning)
+  2. `.env`: set `PUSD_ADDRESS` and `COLLATERAL_ONRAMP_ADDRESS` from Polymarket V2 contracts reference
+  3. `.env`: `WRAP_ON_STARTUP=true` to auto-wrap USDC→pUSD at launch
+  4. Deposit USDC to the bot wallet on Polygon before flipping `DRY_RUN=false`
+- April 28 forced cutover: no action required — already on V2 endpoint
