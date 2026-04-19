@@ -63,7 +63,7 @@ class TestValidateCredentialsSync:
             def get_balance_allowance(self, params):
                 return {"balance": "5000000"}
 
-        import py_clob_client.client as cc
+        import py_clob_client_v2.client as cc
         monkeypatch.setattr(cc, "ClobClient", _FakeClobClient)
 
         ok, balance, err = _validate_credentials_sync("0xkey", "ak", "as", "ap")
@@ -79,7 +79,7 @@ class TestValidateCredentialsSync:
             def get_balance_allowance(self, params):
                 return {}  # no balance field
 
-        import py_clob_client.client as cc
+        import py_clob_client_v2.client as cc
         monkeypatch.setattr(cc, "ClobClient", _FakeClobClient)
 
         ok, balance, err = _validate_credentials_sync("0xkey", "ak", "as", "ap")
@@ -92,7 +92,7 @@ class TestValidateCredentialsSync:
             def __init__(self, *args, **kwargs):
                 raise RuntimeError("bad key")
 
-        import py_clob_client.client as cc
+        import py_clob_client_v2.client as cc
         monkeypatch.setattr(cc, "ClobClient", _FakeClobClient)
 
         ok, balance, err = _validate_credentials_sync("0xkey", "ak", "as", "ap")
@@ -107,7 +107,7 @@ class TestValidateCredentialsSync:
             def __init__(self, *args, **kwargs):
                 raise RuntimeError(f"unauthorized: creds were {secret}")
 
-        import py_clob_client.client as cc
+        import py_clob_client_v2.client as cc
         monkeypatch.setattr(cc, "ClobClient", _FakeClobClient)
 
         ok, balance, err = _validate_credentials_sync("0xkey", "ak", secret, "ap")
@@ -126,7 +126,7 @@ class TestValidateCredentialsAsync:
             def get_balance_allowance(self, params):
                 return {"balance": "2500000"}
 
-        import py_clob_client.client as cc
+        import py_clob_client_v2.client as cc
         monkeypatch.setattr(cc, "ClobClient", _FakeClobClient)
 
         ok, balance, err = await _validate_credentials("0xkey", "ak", "as", "ap", timeout=5)

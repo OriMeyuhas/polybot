@@ -45,9 +45,9 @@ def test_live_factory_uses_v2_package():
 
         mock_cls.assert_called_once()
         kwargs = mock_cls.call_args.kwargs
-        assert "chain" in kwargs, "V2 expects `chain`, not `chain_id`"
-        assert "chain_id" not in kwargs
-        assert kwargs["chain"] == 137
+        assert "chain_id" in kwargs, "V2 SDK uses `chain_id`, not `chain`"
+        assert "chain" not in kwargs
+        assert kwargs["chain_id"] == 137
         assert kwargs["host"] == "https://clob-v2.polymarket.com"
 
 

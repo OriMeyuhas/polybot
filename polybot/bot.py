@@ -199,7 +199,7 @@ class Bot:
         """Call get_balance_allowance with correct params for paper vs live."""
         if hasattr(self.clob_client, '_resting'):  # PaperClobClient
             return self.clob_client.get_balance_allowance()
-        from py_clob_client.clob_types import BalanceAllowanceParams
+        from py_clob_client_v2.clob_types import BalanceAllowanceParams
         return self.clob_client.get_balance_allowance(BalanceAllowanceParams())
 
     # ------------------------------------------------------------------

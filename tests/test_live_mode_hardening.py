@@ -35,7 +35,7 @@ def test_balance_fetch_uses_params_for_live():
     mock_client.get_balance_allowance = MagicMock(return_value={"balance": "500000000"})
     bot.clob_client = mock_client
 
-    with patch("py_clob_client.clob_types.BalanceAllowanceParams") as mock_params_cls:
+    with patch("py_clob_client_v2.clob_types.BalanceAllowanceParams") as mock_params_cls:
         mock_params_cls.return_value = "fake_params"
         result = bot._fetch_live_balance()
 
