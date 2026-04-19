@@ -1,6 +1,10 @@
 """Custom exceptions for Polymarket CLOB API interactions."""
 
 
+class LiveStartupError(RuntimeError):
+    """Raised at startup when the live-mode preconditions are not met."""
+
+
 class ClobApiError(Exception):
     """Raised when a CLOB API call fails (timeout, 429, 5xx, network error).
 

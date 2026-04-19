@@ -342,6 +342,14 @@ def validate_live_config(cfg: BotConfig) -> list[str]:
         )
     if not (0 < cfg.spot_loss_cap_multiplier <= 1.0):
         errors.append(f"spot_loss_cap_multiplier={cfg.spot_loss_cap_multiplier} must be in (0, 1.0]")
+    # V2 collateral contracts must be set (non-zero) for live mode
+    ZERO_ADDR = "0x0000000000000000000000000000000000000000"
+    if cfg.pusd_address == ZERO_ADDR:
+        errors.append("pusd_address is zero — set PUSD_ADDRESS in .env from V2 contracts reference")
+    if cfg.collateral_onramp_address == ZERO_ADDR:
+        errors.append("collateral_onramp_address is zero — set COLLATERAL_ONRAMP_ADDRESS in .env")
+    if not cfg.usdc_address.startswith("0x") or len(cfg.usdc_address) != 42:
+        errors.append(f"usdc_address invalid: {cfg.usdc_address}")
     return errors
 
 

@@ -37,6 +37,10 @@ def live_cfg_base():
         api_passphrase="p",
         max_daily_drawdown_pct=0.05,  # within live bounds
         bankroll=100.0,
+        # V2 collateral addresses — non-zero so validate_live_config passes
+        pusd_address="0x" + "a" * 40,
+        usdc_address="0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
+        collateral_onramp_address="0x" + "c" * 40,
     )
 
 

@@ -329,5 +329,55 @@ def create_clob_client(cfg, book_manager=None):
 
 
 def _ensure_collateral(cfg):
-    """Placeholder — Task 7 implements the actual pUSD balance gate."""
-    return None
+    """Live-mode startup gate: verify pUSD collateral or wrap USDC→pUSD.
+
+    Rules:
+      - No pUSD and no USDC → LiveStartupError("No collateral")
+      - No pUSD, has USDC, wrap_on_startup=false → LiveStartupError("USDC present but wrap_on_startup disabled")
+      - No pUSD, has USDC, wrap_on_startup=true → wrap(usdc_balance)
+      - Has pUSD → no action
+    """
+    from decimal import Decimal
+
+    from web3 import Web3
+    from polybot.errors import LiveStartupError
+    from polybot.oms.collateral import PUsdWrapper
+
+    import os
+    rpc_url = os.getenv("POLYGON_RPC_URL", "https://polygon-rpc.com")
+    w3 = Web3(Web3.HTTPProvider(rpc_url))
+
+    wrapper = PUsdWrapper(
+        w3=w3,
+        private_key=cfg.private_key,
+        onramp_address=cfg.collateral_onramp_address,
+        usdc_address=cfg.usdc_address,
+        pusd_address=cfg.pusd_address,
+    )
+
+    pusd = wrapper.pusd_balance()
+    if pusd > 0:
+        logger.info("pUSD balance: %s — trading with existing collateral", pusd)
+        return
+
+    usdc = wrapper.usdc_balance()
+    if usdc == 0:
+        raise LiveStartupError(
+            "No collateral. Deposit USDC on Polygon, then restart with "
+            "WRAP_ON_STARTUP=true to convert USDC → pUSD at launch."
+        )
+
+    if not cfg.wrap_on_startup:
+        raise LiveStartupError(
+            f"USDC present (${usdc}) but pUSD is zero and WRAP_ON_STARTUP=false. "
+            "Set WRAP_ON_STARTUP=true to convert at launch, or call wrap() manually."
+        )
+
+    logger.warning("Auto-wrapping %s USDC → pUSD (WRAP_ON_STARTUP=true)", usdc)
+    tx_hash = wrapper.wrap(usdc)
+    logger.info("wrap() tx: %s", tx_hash)
+    new_pusd = wrapper.pusd_balance()
+    if new_pusd == 0:
+        raise LiveStartupError(
+            f"wrap() tx {tx_hash} succeeded but pUSD balance is still zero — investigate on-chain"
+        )
